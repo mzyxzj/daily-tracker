@@ -3,7 +3,7 @@ import 'dart:io';
 import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
+import 'package:intl/intl.dart' hide TextDirection;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
@@ -55,69 +55,217 @@ class FamilyPage extends StatefulWidget {
 }
 
 class _FamilyPageState extends State<FamilyPage> {
+  final Set<int> _collapsedMods = {};
+
+  Future<List<Map<String, dynamic>>> _loadMods() async {
+    return widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
+  }
+
+  String _buildFullPath(int id, Map<int, Map<String, dynamic>> map) {
+    final parts = <String>[];
+    int? cur = id;
+    int guard = 0;
+    while (cur != null && map.containsKey(cur) && guard++ < 20) {
+      parts.insert(0, '${map[cur]!['title']}');
+      cur = map[cur]!['parent_id'] as int?;
+    }
+    return parts.join(' > ');
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('🏠 家庭'),
-        actions: [TextButton.icon(onPressed: _createMod, icon: const Icon(Icons.add), label: const Text('新建大标题'))],
+        actions: [
+          TextButton.icon(
+            onPressed: () => _createOrEditMod(),
+            icon: const Icon(Icons.add),
+            label: const Text('新建大标题'),
+          ),
+        ],
       ),
       body: FutureBuilder<List<Map<String, dynamic>>>(
-        future: widget.db.query('modules', orderBy: 'id DESC'),
+        future: _loadMods(),
         builder: (_, snap) {
-          final mods = snap.data ?? [];
-          if (mods.isEmpty) return const Center(child: Text('暂无大标题，点击右上角新建'));
-          return ListView.builder(
+          final all = snap.data ?? [];
+          if (all.isEmpty) return const Center(child: Text('暂无大标题，点击右上角新建'));
+          final map = {for (final m in all) m['id'] as int: m};
+          return SingleChildScrollView(
             padding: const EdgeInsets.all(16),
-            itemCount: mods.length,
-            itemBuilder: (_, i) {
-              final m = mods[i];
-              return Card(
-                child: ListTile(
-                  leading: const Icon(Icons.folder_outlined, color: Colors.indigo),
-                  title: Text('${m['title']}', style: const TextStyle(fontWeight: FontWeight.bold)),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.delete_outline, color: Colors.red),
-                    onPressed: () async {
-                      await widget.db.delete('module_entries', where: 'module_id = ?', whereArgs: [m['id']]);
-                      await widget.db.delete('modules', where: 'id = ?', whereArgs: [m['id']]);
-                      setState(() {});
-                    },
-                  ),
-                  onTap: () => _openEntries(m['id'] as int, '${m['title']}'),
-                ),
-              );
-            },
+            child: _buildModLevel(null, 0, all, map),
           );
         },
       ),
     );
   }
 
-  void _createMod() {
-    final ctrl = TextEditingController();
+  Widget _buildModLevel(int? parentId, int depth, List<Map<String, dynamic>> all, Map<int, Map<String, dynamic>> map) {
+    final items = all.where((m) => m['parent_id'] == parentId).toList();
+    if (items.isEmpty) return const SizedBox.shrink();
+
+    return ReorderableListView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      buildDefaultDragHandles: false,
+      itemCount: items.length,
+      onReorder: (oldIdx, newIdx) async {
+        if (newIdx > oldIdx) newIdx -= 1;
+        final moved = items.removeAt(oldIdx);
+        items.insert(newIdx, moved);
+        for (int i = 0; i < items.length; i++) {
+          await widget.db.update('modules', {'sort_order': i}, where: 'id = ?', whereArgs: [items[i]['id']]);
+        }
+        setState(() {});
+      },
+      itemBuilder: (ctx, i) {
+        final m = items[i];
+        final id = m['id'] as int;
+        final hasSub = all.any((x) => x['parent_id'] == id);
+        final isCol = _collapsedMods.contains(id);
+
+        return Column(
+          key: ValueKey('mod_$id'),
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Card(
+              margin: EdgeInsets.only(left: depth * 18.0, bottom: 8),
+              color: depth == 0 ? null : const Color(0xFFF8FAFC),
+              child: ListTile(
+                contentPadding: const EdgeInsets.only(left: 10, right: 4),
+                leading: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (hasSub)
+                      GestureDetector(
+                        onTap: () => setState(() => isCol ? _collapsedMods.remove(id) : _collapsedMods.add(id)),
+                        child: Icon(isCol ? Icons.chevron_right : Icons.expand_more, size: 20, color: Colors.grey[700]),
+                      )
+                    else
+                      const SizedBox(width: 4),
+                    Icon(depth == 0 ? Icons.folder_outlined : Icons.subdirectory_arrow_right, color: Colors.indigo, size: 20),
+                  ],
+                ),
+                title: Text(
+                  '${m['title']}',
+                  style: TextStyle(fontWeight: depth == 0 ? FontWeight.bold : FontWeight.w600, fontSize: depth == 0 ? 15 : 14),
+                ),
+                onTap: () => _openEntries(id, _buildFullPath(id, map)),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: '添加内部小标题',
+                      icon: const Icon(Icons.create_new_folder_outlined, size: 19, color: Colors.indigo),
+                      onPressed: () => _createOrEditMod(parentId: id, parentTitle: '${m['title']}'),
+                    ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: '编辑标题名称',
+                      icon: const Icon(Icons.edit_outlined, size: 19, color: Colors.blueGrey),
+                      onPressed: () => _createOrEditMod(editMod: m),
+                    ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: '删除',
+                      icon: const Icon(Icons.delete_outline, size: 19, color: Colors.red),
+                      onPressed: () => _deleteModCascade(id, all),
+                    ),
+                    ReorderableDragStartListener(
+                      index: i,
+                      child: const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 6),
+                        child: Icon(Icons.drag_handle, color: Colors.grey, size: 20),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            if (hasSub && !isCol) _buildModLevel(id, depth + 1, all, map),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _deleteModCascade(int rootId, List<Map<String, dynamic>> all) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('确认删除'),
+        content: const Text('删除该标题及其下属的所有子标题和内容？'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('删除')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    final toDel = <int>[];
+    void collect(int pid) {
+      toDel.add(pid);
+      for (final m in all.where((x) => x['parent_id'] == pid)) {
+        collect(m['id'] as int);
+      }
+    }
+    collect(rootId);
+    for (final did in toDel) {
+      await widget.db.delete('module_entries', where: 'module_id = ?', whereArgs: [did]);
+      await widget.db.delete('modules', where: 'id = ?', whereArgs: [did]);
+    }
+    setState(() {});
+  }
+
+  void _createOrEditMod({int? parentId, String? parentTitle, Map<String, dynamic>? editMod}) {
+    final isEdit = editMod != null;
+    final ctrl = TextEditingController(text: isEdit ? '${editMod['title']}' : '');
+    final dlgTitle = isEdit ? '修改标题名称' : (parentId == null ? '新建大标题' : '在「$parentTitle」下新建小标题');
+
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('新建大标题'),
-        content: TextField(controller: ctrl, autofocus: true, decoration: const InputDecoration(hintText: '如：吃饭、近日目标')),
+        title: Text(dlgTitle, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(hintText: '输入标题名称'),
+        ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
           FilledButton(
             onPressed: () async {
-              if (ctrl.text.trim().isEmpty) return;
-              await widget.db.insert('modules', {'title': ctrl.text.trim(), 'created_at': DateTime.now().toIso8601String()});
+              final txt = ctrl.text.trim();
+              if (txt.isEmpty) return;
+              if (isEdit) {
+                await widget.db.update('modules', {'title': txt}, where: 'id = ?', whereArgs: [editMod['id']]);
+              } else {
+                final siblings = await widget.db.query(
+                  'modules',
+                  where: parentId == null ? 'parent_id IS NULL' : 'parent_id = ?',
+                  whereArgs: parentId == null ? null : [parentId],
+                );
+                await widget.db.insert('modules', {
+                  'title': txt,
+                  'parent_id': parentId,
+                  'sort_order': siblings.length,
+                  'created_at': DateTime.now().toIso8601String(),
+                });
+                if (parentId != null) _collapsedMods.remove(parentId);
+              }
               if (mounted) Navigator.pop(ctx);
               setState(() {});
             },
-            child: const Text('创建'),
+            child: Text(isEdit ? '保存' : '创建'),
           ),
         ],
       ),
     );
   }
 
-  void _openEntries(int modId, String title) {
+  void _openEntries(int modId, String fullPath) {
     final ctrl = TextEditingController();
     showModalBottomSheet(
       context: context,
@@ -125,15 +273,58 @@ class _FamilyPageState extends State<FamilyPage> {
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setS) => DraggableScrollableSheet(
           expand: false,
-          initialChildSize: 0.85,
+          initialChildSize: 0.88,
+          maxChildSize: 0.95,
           builder: (_, sc) => Padding(
             padding: EdgeInsets.fromLTRB(16, 16, 16, MediaQuery.of(ctx).viewInsets.bottom + 16),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('📁 $title', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                const SizedBox(height: 10),
-                TextField(controller: ctrl, maxLines: 3, decoration: const InputDecoration(border: OutlineInputBorder(), hintText: '支持序号自动拆分：1. / 1、 / (1) / ①')),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(child: Text('📁 $fullPath', style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold))),
+                    TextButton.icon(
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        _createOrEditMod(parentId: modId, parentTitle: fullPath.split(' > ').last);
+                      },
+                      icon: const Icon(Icons.create_new_folder_outlined, size: 16),
+                      label: const Text('加小标题', style: TextStyle(fontSize: 12)),
+                    ),
+                  ],
+                ),
+                // 展示下属小标题快捷入口
+                FutureBuilder<List<Map<String, dynamic>>>(
+                  future: widget.db.query('modules', where: 'parent_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, id ASC'),
+                  builder: (_, subSnap) {
+                    final subs = subSnap.data ?? [];
+                    if (subs.isEmpty) return const SizedBox.shrink();
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Wrap(
+                        spacing: 6,
+                        runSpacing: 4,
+                        children: subs.map((s) => ActionChip(
+                          avatar: const Icon(Icons.folder_open, size: 15, color: Colors.indigo),
+                          label: Text('${s['title']}', style: const TextStyle(fontSize: 12)),
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            _openEntries(s['id'] as int, '$fullPath > ${s['title']}');
+                          },
+                        )).toList(),
+                      ),
+                    );
+                  },
+                ),
+                TextField(
+                  controller: ctrl,
+                  maxLines: 3,
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    hintText: '支持序号自动拆分：1. / 1、 / (1) / ①\n长按下方条目右侧手柄可上下拖动排序，点击文字可编辑',
+                  ),
+                ),
                 const SizedBox(height: 8),
                 SizedBox(
                   width: double.infinity,
@@ -142,8 +333,15 @@ class _FamilyPageState extends State<FamilyPage> {
                       if (ctrl.text.trim().isEmpty) return;
                       final ex = await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [modId]);
                       final maxS = ex.isEmpty ? 0 : ex.map((e) => e['seq'] as int).reduce((a, b) => a > b ? a : b);
+                      int nextOrder = ex.length;
                       for (final it in SequenceParser.parse(ctrl.text, maxS)) {
-                        await widget.db.insert('module_entries', {'module_id': modId, 'seq': it.seq, 'content': it.text, 'created_at': DateTime.now().toIso8601String()});
+                        await widget.db.insert('module_entries', {
+                          'module_id': modId,
+                          'seq': it.seq,
+                          'content': it.text,
+                          'sort_order': nextOrder++,
+                          'created_at': DateTime.now().toIso8601String(),
+                        });
                       }
                       ctrl.clear();
                       setS(() {});
@@ -154,23 +352,61 @@ class _FamilyPageState extends State<FamilyPage> {
                 const Divider(),
                 Expanded(
                   child: FutureBuilder<List<Map<String, dynamic>>>(
-                    future: widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'seq ASC, created_at ASC'),
+                    future: widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC'),
                     builder: (_, snap) {
-                      final list = snap.data ?? [];
-                      return ListView.builder(
-                        controller: sc,
+                      final list = List<Map<String, dynamic>>.from(snap.data ?? []);
+                      if (list.isEmpty) return const Center(child: Text('暂无内容', style: TextStyle(color: Colors.grey)));
+                      return ReorderableListView.builder(
+                        scrollController: sc,
+                        buildDefaultDragHandles: false,
                         itemCount: list.length,
+                        onReorder: (oldIdx, newIdx) async {
+                          if (newIdx > oldIdx) newIdx -= 1;
+                          final item = list.removeAt(oldIdx);
+                          list.insert(newIdx, item);
+                          // 拖动后自动按新顺序更新 sort_order 与序号 seq
+                          for (int i = 0; i < list.length; i++) {
+                            await widget.db.update(
+                              'module_entries',
+                              {'sort_order': i, 'seq': i + 1},
+                              where: 'id = ?',
+                              whereArgs: [list[i]['id']],
+                            );
+                          }
+                          setS(() {});
+                        },
                         itemBuilder: (_, i) {
                           final e = list[i];
                           return ListTile(
+                            key: ValueKey('entry_${e['id']}'),
+                            contentPadding: EdgeInsets.zero,
                             leading: CircleAvatar(radius: 13, child: Text('${e['seq']}', style: const TextStyle(fontSize: 12))),
                             title: Text('${e['content']}'),
-                            trailing: IconButton(
-                              icon: const Icon(Icons.close, size: 18),
-                              onPressed: () async {
-                                await widget.db.delete('module_entries', where: 'id = ?', whereArgs: [e['id']]);
-                                setS(() {});
-                              },
+                            onTap: () => _editEntryDialog(e, () => setS(() {})),
+                            trailing: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                IconButton(
+                                  visualDensity: VisualDensity.compact,
+                                  icon: const Icon(Icons.edit_outlined, size: 18, color: Colors.blueGrey),
+                                  onPressed: () => _editEntryDialog(e, () => setS(() {})),
+                                ),
+                                IconButton(
+                                  visualDensity: VisualDensity.compact,
+                                  icon: const Icon(Icons.close, size: 18, color: Colors.red),
+                                  onPressed: () async {
+                                    await widget.db.delete('module_entries', where: 'id = ?', whereArgs: [e['id']]);
+                                    setS(() {});
+                                  },
+                                ),
+                                ReorderableDragStartListener(
+                                  index: i,
+                                  child: const Padding(
+                                    padding: EdgeInsets.symmetric(horizontal: 6),
+                                    child: Icon(Icons.drag_handle, size: 20, color: Colors.grey),
+                                  ),
+                                ),
+                              ],
                             ),
                           );
                         },
@@ -185,6 +421,53 @@ class _FamilyPageState extends State<FamilyPage> {
       ),
     );
   }
+
+  void _editEntryDialog(Map<String, dynamic> entry, VoidCallback onSaved) {
+    final seqCtrl = TextEditingController(text: '${entry['seq']}');
+    final txtCtrl = TextEditingController(text: '${entry['content']}');
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('编辑内容', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: seqCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: '序号'),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: txtCtrl,
+              maxLines: 4,
+              autofocus: true,
+              decoration: const InputDecoration(labelText: '内容文本', border: OutlineInputBorder()),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          FilledButton(
+            onPressed: () async {
+              final newTxt = txtCtrl.text.trim();
+              if (newTxt.isEmpty) return;
+              final newSeq = int.tryParse(seqCtrl.text.trim()) ?? (entry['seq'] as int);
+              await widget.db.update(
+                'module_entries',
+                {'seq': newSeq, 'content': newTxt},
+                where: 'id = ?',
+                whereArgs: [entry['id']],
+              );
+              if (mounted) Navigator.pop(ctx);
+              onSaved();
+            },
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class SearchPage extends StatefulWidget {
@@ -195,6 +478,17 @@ class SearchPage extends StatefulWidget {
 }
 
 class _SearchPageState extends State<SearchPage> {
+  String _modPath(int id, Map<int, Map<String, dynamic>> map) {
+    final parts = <String>[];
+    int? cur = id;
+    int guard = 0;
+    while (cur != null && map.containsKey(cur) && guard++ < 20) {
+      parts.insert(0, '${map[cur]!['title']}');
+      cur = map[cur]!['parent_id'] as int?;
+    }
+    return parts.join(' > ');
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -254,8 +548,9 @@ class _SearchPageState extends State<SearchPage> {
   }
 
   Future<void> _createGroup() async {
-    final mods = await widget.db.query('modules');
+    final mods = await widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
     if (!mounted || mods.isEmpty) return;
+    final map = {for (final m in mods) m['id'] as int: m};
     final ctrl = TextEditingController();
     final sel = <int>{};
     showDialog(
@@ -274,7 +569,11 @@ class _SearchPageState extends State<SearchPage> {
                     shrinkWrap: true,
                     children: mods.map((m) {
                       final id = m['id'] as int;
-                      return CheckboxListTile(value: sel.contains(id), title: Text('${m['title']}'), onChanged: (v) => setS(() => v! ? sel.add(id) : sel.remove(id)));
+                      return CheckboxListTile(
+                        value: sel.contains(id),
+                        title: Text(_modPath(id, map), style: const TextStyle(fontSize: 14)),
+                        onChanged: (v) => setS(() => v! ? sel.add(id) : sel.remove(id)),
+                      );
                     }).toList(),
                   ),
                 ),
@@ -299,8 +598,9 @@ class _SearchPageState extends State<SearchPage> {
   }
 
   Future<void> _tempView() async {
-    final mods = await widget.db.query('modules');
+    final mods = await widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
     if (!mounted || mods.isEmpty) return;
+    final map = {for (final m in mods) m['id'] as int: m};
     final sel = <int>{};
     showDialog(
       context: context,
@@ -313,7 +613,11 @@ class _SearchPageState extends State<SearchPage> {
               shrinkWrap: true,
               children: mods.map((m) {
                 final id = m['id'] as int;
-                return CheckboxListTile(value: sel.contains(id), title: Text('${m['title']}'), onChanged: (v) => setS(() => v! ? sel.add(id) : sel.remove(id)));
+                return CheckboxListTile(
+                  value: sel.contains(id),
+                  title: Text(_modPath(id, map), style: const TextStyle(fontSize: 14)),
+                  onChanged: (v) => setS(() => v! ? sel.add(id) : sel.remove(id)),
+                );
               }).toList(),
             ),
           ),
@@ -327,11 +631,24 @@ class _SearchPageState extends State<SearchPage> {
   }
 
   Future<void> _showAgg(String title, List<int> ids) async {
-    final blocks = <Widget>[];
+    final allMods = await widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
+    final map = {for (final m in allMods) m['id'] as int: m};
+
+    // 自动包含所选标题及其下属子标题
+    final expandedIds = <int>[];
+    void addWithChildren(int pid) {
+      if (!expandedIds.contains(pid)) expandedIds.add(pid);
+      for (final m in allMods.where((x) => x['parent_id'] == pid)) {
+        addWithChildren(m['id'] as int);
+      }
+    }
     for (final id in ids) {
-      final m = await widget.db.query('modules', where: 'id = ?', whereArgs: [id]);
-      if (m.isEmpty) continue;
-      final es = await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [id], orderBy: 'seq ASC, created_at ASC');
+      if (map.containsKey(id)) addWithChildren(id);
+    }
+
+    final blocks = <Widget>[];
+    for (final id in expandedIds) {
+      final es = await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [id], orderBy: 'sort_order ASC, seq ASC, id ASC');
       blocks.add(Card(
         margin: const EdgeInsets.only(bottom: 12),
         child: Padding(
@@ -339,9 +656,12 @@ class _SearchPageState extends State<SearchPage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('📁 ${m.first['title']}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+              Text('📁 ${_modPath(id, map)}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
               const Divider(),
-              if (es.isEmpty) const Text('（暂无内容）', style: TextStyle(color: Colors.grey)) else ...es.map((e) => Text('${e['seq']}. ${e['content']}')),
+              if (es.isEmpty)
+                const Text('（暂无内容）', style: TextStyle(color: Colors.grey))
+              else
+                ...es.map((e) => Padding(padding: const EdgeInsets.symmetric(vertical: 2), child: Text('${e['seq']}. ${e['content']}'))),
             ],
           ),
         ),
@@ -355,7 +675,7 @@ class _SearchPageState extends State<SearchPage> {
     final appDir = await getApplicationDocumentsDirectory();
     final data = {
       'app': 'daily_tracker',
-      'version': '2.0.0',
+      'version': '3.0.0',
       'data': {
         for (final t in ['status_items', 'status_records', 'status_images', 'schedule_items', 'schedule_records', 'modules', 'module_entries', 'module_groups', 'mindmaps'])
           t: await widget.db.query(t),
@@ -463,7 +783,12 @@ class _PlanPageState extends State<PlanPage> {
         Row(
           children: [
             if (ch.isNotEmpty) IconButton(icon: Icon(col ? Icons.chevron_right : Icons.expand_more, size: 18), onPressed: () => setState(() => col ? _col.remove(id) : _col.add(id))) else const SizedBox(width: 32),
-            Expanded(child: Text('${node['text']}', style: TextStyle(fontSize: d == 0 ? 16 : 14, fontWeight: d <= 1 ? FontWeight.bold : FontWeight.normal))),
+            Expanded(
+              child: GestureDetector(
+                onTap: () => _editNode(mmId, root, node),
+                child: Text('${node['text']}', style: TextStyle(fontSize: d == 0 ? 16 : 14, fontWeight: d <= 1 ? FontWeight.bold : FontWeight.normal)),
+              ),
+            ),
             IconButton(icon: const Icon(Icons.add_circle_outline, size: 18), onPressed: () => _addNode(mmId, root, node)),
             if (d > 0) IconButton(icon: const Icon(Icons.close, size: 16, color: Colors.red), onPressed: () async { _rm(root, id); await _save(mmId, root); }),
           ],
@@ -487,7 +812,7 @@ class _PlanPageState extends State<PlanPage> {
   }
 
   Future<void> _save(int mmId, Map<String, dynamic> root) async {
-    await widget.db.update('mindmaps', {'root_json': jsonEncode(root), 'updated_at': DateTime.now().toIso8601String()}, where: 'id = ?', whereArgs: [mmId]);
+    await widget.db.update('mindmaps', {'title': root['text'], 'root_json': jsonEncode(root), 'updated_at': DateTime.now().toIso8601String()}, where: 'id = ?', whereArgs: [mmId]);
     setState(() {});
   }
 
@@ -532,6 +857,29 @@ class _PlanPageState extends State<PlanPage> {
               await _save(mmId, root);
             },
             child: const Text('添加'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _editNode(int mmId, Map<String, dynamic> root, Map<String, dynamic> node) {
+    final ctrl = TextEditingController(text: '${node['text']}');
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('修改节点内容'),
+        content: TextField(controller: ctrl, autofocus: true),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          FilledButton(
+            onPressed: () async {
+              if (ctrl.text.trim().isEmpty) return;
+              node['text'] = ctrl.text.trim();
+              if (mounted) Navigator.pop(ctx);
+              await _save(mmId, root);
+            },
+            child: const Text('保存'),
           ),
         ],
       ),
