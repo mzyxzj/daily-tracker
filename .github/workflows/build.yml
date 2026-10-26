@@ -9,6 +9,10 @@ jobs:
         with:
           channel: 'stable'
       - run: flutter create . --project-name daily_tracker --platforms android
+      # 下面这两行是新增的，用于强制将编译版本提升到 36
+      - run: |
+          sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/g' android/app/build.gradle
+          sed -i 's/compileSdk flutter.compileSdkVersion/compileSdk 36/g' android/app/build.gradle
       - run: flutter pub get
       - run: flutter build apk --release
       - uses: actions/upload-artifact@v4
