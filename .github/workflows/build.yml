@@ -5,22 +5,55 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
-      - run: flutter create . --project-name daily_tracker --platforms android
-      - run: flutter pub get
-      - run: |
-          # 1. 替换自身 App 的编译版本
-          sed -i 's/flutter.compileSdkVersion/36/g' android/app/build.gradle.kts || true
+
+      - name: Initialize Android project safely
+        run: |
+          # 1. 先备份你写好的核心文件，防止被 flutter create 覆盖
+          cp pubspec.yaml pubspec.yaml.bak
+          cp lib/main.dart main.dart.bak
           
-          # 2. 写入全局配置文件
-          echo "flutter.compileSdkVersion=36" >> android/local.properties
+          # 2. 生成完整的 Android 原生工程结构
+          flutter create . --project-name daily_tracker --platforms android
           
-          # 3. 终极暴力手段：遍历所有第三方插件库，把它们底层的 34 强行改成 36
-          find ~/.pub-cache/hosted/pub.dev -name "build.gradle" -type f -exec sed -i 's/flutter.compileSdkVersion/36/g' {} +
-      - run: flutter build apk --release
-      - uses: actions/upload-artifact@v4
+          # 3. 还原你的核心代码
+          mv pubspec.yaml.bak pubspec.yaml
+          mv main.dart.bak lib/main.dart
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Force all plugins and app to compileSdk 36
+        run: |
+          # 1. 修改 App 自身的 build.gradle / build.gradle.kts
+          if [ -f android/app/build.gradle.kts ]; then
+            sed -i 's/compileSdk = .*/compileSdk = 36/g' android/app/build.gradle.kts
+            sed -i 's/minSdk = .*/minSdk = 24/g' android/app/build.gradle.kts
+            sed -i 's/targetSdk = .*/targetSdk = 36/g' android/app/build.gradle.kts
+          fi
+          if [ -f android/app/build.gradle ]; then
+            sed -i 's/compileSdk .*/compileSdk 36/g' android/app/build.gradle
+            sed -i 's/compileSdkVersion .*/compileSdkVersion 36/g' android/app/build.gradle
+            sed -i 's/minSdkVersion .*/minSdkVersion 24/g' android/app/build.gradle
+            sed -i 's/targetSdkVersion .*/targetSdkVersion 36/g' android/app/build.gradle
+          fi
+
+          # 2. 直接把所有第三方插件（包括 file_picker）里的 33/34/35 和变量全部替换为 36
+          find ~/.pub-cache/ -name "build.gradle" -type f -exec sed -i -E 's/compileSdkVersion [0-9]+/compileSdkVersion 36/g' {} + || true
+          find ~/.pub-cache/ -name "build.gradle" -type f -exec sed -i -E 's/compileSdk [0-9]+/compileSdk 36/g' {} + || true
+          find ~/.pub-cache/ -name "build.gradle" -type f -exec sed -i -E 's/compileSdk = [0-9]+/compileSdk = 36/g' {} + || true
+          find ~/.pub-cache/ -name "build.gradle" -type f -exec sed -i 's/flutter.compileSdkVersion/36/g' {} + || true
+          find ~/.pub-cache/ -name "build.gradle.kts" -type f -exec sed -i -E 's/compileSdk = [0-9]+/compileSdk = 36/g' {} + || true
+          find ~/.pub-cache/ -name "build.gradle.kts" -type f -exec sed -i 's/flutter.compileSdkVersion/36/g' {} + || true
+
+      - name: Build Release APK
+        run: flutter build apk --release --no-tree-shake-icons
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
           name: daily-tracker-apk
           path: build/app/outputs/flutter-apk/app-release.apk
