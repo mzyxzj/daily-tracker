@@ -9,15 +9,18 @@ jobs:
         with:
           channel: 'stable'
       - run: flutter create . --project-name daily_tracker --platforms android
-      - run: |
-          sed -i 's/flutter.compileSdkVersion/36/g' android/app/build.gradle.kts || true
-          sed -i 's/flutter.compileSdkVersion/36/g' android/app/build.gradle || true
-          sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/g' android/app/build.gradle || true
-          sed -i 's/compileSdk flutter.compileSdkVersion/compileSdk 36/g' android/app/build.gradle || true
       - run: flutter pub get
+      - run: |
+          # 1. 替换自身 App 的编译版本
+          sed -i 's/flutter.compileSdkVersion/36/g' android/app/build.gradle.kts || true
+          
+          # 2. 写入全局配置文件
+          echo "flutter.compileSdkVersion=36" >> android/local.properties
+          
+          # 3. 终极暴力手段：遍历所有第三方插件库，把它们底层的 34 强行改成 36
+          find ~/.pub-cache/hosted/pub.dev -name "build.gradle" -type f -exec sed -i 's/flutter.compileSdkVersion/36/g' {} +
       - run: flutter build apk --release
       - uses: actions/upload-artifact@v4
         with:
           name: daily-tracker-apk
           path: build/app/outputs/flutter-apk/app-release.apk
-          
