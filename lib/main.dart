@@ -62,7 +62,7 @@ class TrendLineChart extends StatelessWidget {
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: const Color(0xFFE2E8F0)),
       ),
-      child: CustomPaint(painter: _TrendChartPainter(points)),
+      child: CustomPainter(painter: _TrendChartPainter(points)),
     );
   }
 }
