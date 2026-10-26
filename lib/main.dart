@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -18,7 +19,7 @@ void main() async {
   runApp(DailyTrackerApp(db: db));
 }
 
-// ==================== 数据库层 (SQLite) ====================
+// ==================== 数据库层 (SQLite v2 含平滑迁移) ====================
 class AppDatabase {
   static final AppDatabase instance = AppDatabase._();
   static Database? _db;
@@ -31,7 +32,7 @@ class AppDatabase {
     final path = p.join(dir.path, 'daily_tracker.db');
     return openDatabase(
       path,
-      version: 1,
+      version: 2,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE status_items (
@@ -62,6 +63,7 @@ class AppDatabase {
           CREATE TABLE schedule_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
+            plan_info TEXT DEFAULT '',
             sort_order INTEGER DEFAULT 0
           )
         ''');
@@ -108,6 +110,14 @@ class AppDatabase {
           )
         ''');
       },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          // 为旧版数据库平滑增加规划关联字段
+          try {
+            await db.execute("ALTER TABLE schedule_items ADD COLUMN plan_info TEXT DEFAULT ''");
+          } catch (_) {}
+        }
+      },
     );
   }
 }
@@ -151,6 +161,167 @@ class SequenceParser {
   }
 }
 
+// ==================== 折线图绘制组件 (CustomPainter) ====================
+class TrendLineChart extends StatelessWidget {
+  final List<({String date, double value})> points;
+  const TrendLineChart({super.key, required this.points});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 220,
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(12, 24, 20, 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFC),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFE2E8F0)),
+      ),
+      child: CustomPaint(
+        painter: _TrendChartPainter(points: points),
+      ),
+    );
+  }
+}
+
+class _TrendChartPainter extends CustomPainter {
+  final List<({String date, double value})> points;
+  _TrendChartPainter({required this.points});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (points.isEmpty) return;
+
+    const leftPad = 36.0;
+    const bottomPad = 26.0;
+    const topPad = 16.0;
+    const rightPad = 14.0;
+
+    final chartW = size.width - leftPad - rightPad;
+    final chartH = size.height - topPad - bottomPad;
+
+    final values = points.map((e) => e.value).toList();
+    double minV = values.reduce(math.min);
+    double maxV = values.reduce(math.max);
+    if (minV == maxV) {
+      minV -= 5;
+      maxV += 5;
+    }
+    final range = maxV - minV;
+
+    final gridPaint = Paint()
+      ..color = const Color(0xFFE2E8F0)
+      ..strokeWidth = 1;
+
+    // 1. 绘制 3 条水平网格线与纵轴刻度
+    for (int i = 0; i <= 2; i++) {
+      final ratio = i / 2.0;
+      final y = topPad + chartH * (1 - ratio);
+      canvas.drawLine(Offset(leftPad, y), Offset(size.width - rightPad, y), gridPaint);
+
+      final labelVal = minV + range * ratio;
+      final tp = TextPainter(
+        text: TextSpan(
+          text: labelVal == labelVal.roundToDouble()
+              ? labelVal.toInt().toString()
+              : labelVal.toStringAsFixed(1),
+          style: const TextStyle(color: Color(0xFF64748B), fontSize: 10),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      tp.paint(canvas, Offset(math.max(0, leftPad - tp.width - 6), y - tp.height / 2));
+    }
+
+    // 2. 计算坐标点
+    final coords = <Offset>[];
+    for (int i = 0; i < points.length; i++) {
+      final x = points.length == 1
+          ? leftPad + chartW / 2
+          : leftPad + (i / (points.length - 1)) * chartW;
+      final y = topPad + chartH - ((points[i].value - minV) / range) * chartH;
+      coords.add(Offset(x, y));
+    }
+
+    // 3. 绘制折线与底部渐变阴影
+    if (coords.length > 1) {
+      final fillPath = Path()..moveTo(coords.first.dx, topPad + chartH);
+      for (final c in coords) {
+        fillPath.lineTo(c.dx, c.dy);
+      }
+      fillPath.lineTo(coords.last.dx, topPad + chartH);
+      fillPath.close();
+
+      final fillPaint = Paint()
+        ..shader = LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            const Color(0xFF4F46E5).withOpacity(0.25),
+            const Color(0xFF4F46E5).withOpacity(0.0),
+          ],
+        ).createShader(Rect.fromLTWH(leftPad, topPad, chartW, chartH));
+      canvas.drawPath(fillPath, fillPaint);
+
+      final linePath = Path()..moveTo(coords.first.dx, coords.first.dy);
+      for (int i = 1; i < coords.length; i++) {
+        linePath.lineTo(coords[i].dx, coords[i].dy);
+      }
+      final linePaint = Paint()
+        ..color = const Color(0xFF4F46E5)
+        ..strokeWidth = 2.5
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round;
+      canvas.drawPath(linePath, linePaint);
+    }
+
+    // 4. 绘制数据点、数值标签与底部日期（自动抽样防重叠）
+    final step = math.max(1, (points.length / 6).ceil());
+    for (int i = 0; i < coords.length; i++) {
+      final isLast = i == coords.length - 1;
+      final c = coords[i];
+
+      // 外圈白底 + 内圈颜色（最新值高亮为红色）
+      canvas.drawCircle(c, isLast ? 6 : 4.5, Paint()..color = Colors.white);
+      canvas.drawCircle(
+        c,
+        isLast ? 4.5 : 3.2,
+        Paint()..color = isLast ? const Color(0xFFEF4444) : const Color(0xFF4F46E5),
+      );
+
+      if (i % step == 0 || isLast || i == 0) {
+        final v = points[i].value;
+        final valStr = v == v.roundToDouble() ? v.toInt().toString() : v.toStringAsFixed(1);
+        final valTp = TextPainter(
+          text: TextSpan(
+            text: valStr,
+            style: TextStyle(
+              color: isLast ? const Color(0xFFEF4444) : const Color(0xFF1E293B),
+              fontSize: 10,
+              fontWeight: isLast ? FontWeight.bold : FontWeight.w500,
+            ),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        valTp.paint(canvas, Offset(c.dx - valTp.width / 2, c.dy - valTp.height - 6));
+
+        final dateShort = points[i].date.length >= 10 ? points[i].date.substring(5) : points[i].date;
+        final dateTp = TextPainter(
+          text: TextSpan(
+            text: dateShort,
+            style: const TextStyle(color: Color(0xFF64748B), fontSize: 9.5),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        dateTp.paint(canvas, Offset(c.dx - dateTp.width / 2, topPad + chartH + 6));
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _TrendChartPainter oldDelegate) => true;
+}
+
 // ==================== 主应用入口 ====================
 class DailyTrackerApp extends StatelessWidget {
   final Database db;
@@ -179,7 +350,7 @@ class MainShell extends StatefulWidget {
 }
 
 class _MainShellState extends State<MainShell> {
-  int _tabIndex = 0; // 0:查找, 1:家庭, 2:今日, 3:规划
+  int _tabIndex = 2; // 默认打开「今日」页更顺手，0:查找, 1:家庭, 2:今日, 3:规划
 
   @override
   Widget build(BuildContext context) {
@@ -282,6 +453,31 @@ class _TodayPageState extends State<TodayPage> {
     return {'items': items, 'display': displayMap, 'schedules': schedules, 'schedDone': schedDone};
   }
 
+  /// 提取「规划」模块中所有思维导图的节点路径，供新建日程关联
+  Future<List<({String path, String nodeName})>> _loadAllPlanNodes() async {
+    final mms = await widget.db.query('mindmaps', orderBy: 'id DESC');
+    final result = <({String path, String nodeName})>[];
+
+    void traverse(Map<String, dynamic> node, String prefix) {
+      final text = (node['text'] as String? ?? '').trim();
+      if (text.isEmpty) return;
+      final currentPath = prefix.isEmpty ? text : '$prefix > $text';
+      result.add((path: currentPath, nodeName: text));
+      final children = (node['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+      for (final child in children) {
+        traverse(child, currentPath);
+      }
+    }
+
+    for (final mm in mms) {
+      try {
+        final root = jsonDecode(mm['root_json'] as String) as Map<String, dynamic>;
+        traverse(root, '');
+      } catch (_) {}
+    }
+    return result;
+  }
+
   @override
   Widget build(BuildContext context) {
     final isToday = _selectedDate == _todayStr;
@@ -345,6 +541,7 @@ class _TodayPageState extends State<TodayPage> {
               ...schedules.map((s) {
                 final sid = s['id'] as int;
                 final done = schedDone[sid] ?? false;
+                final planInfo = (s['plan_info'] as String? ?? '').trim();
                 return CheckboxListTile(
                   value: done,
                   controlAffinity: ListTileControlAffinity.leading,
@@ -352,6 +549,23 @@ class _TodayPageState extends State<TodayPage> {
                     s['title'] as String,
                     style: TextStyle(decoration: done ? TextDecoration.lineThrough : null),
                   ),
+                  subtitle: planInfo.isNotEmpty
+                      ? Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Row(
+                            children: [
+                              const Icon(Icons.account_tree_outlined, size: 13, color: Color(0xFF4F46E5)),
+                              const SizedBox(width: 4),
+                              Expanded(
+                                child: Text(
+                                  '规划：$planInfo',
+                                  style: const TextStyle(fontSize: 12, color: Color(0xFF4F46E5)),
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      : null,
                   secondary: IconButton(
                     icon: const Icon(Icons.delete_outline, color: Colors.red),
                     onPressed: () async {
@@ -386,6 +600,12 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
+  String _formatScheduleForSummary(Map<String, dynamic> s) {
+    final title = s['title'] as String;
+    final plan = (s['plan_info'] as String? ?? '').trim();
+    return plan.isEmpty ? title : '$title（$plan）';
+  }
+
   Widget _buildSummaryCard(
     List<Map<String, dynamic>> items,
     Map<int, Map<String, dynamic>> display,
@@ -403,11 +623,14 @@ class _TodayPageState extends State<TodayPage> {
         lines.add('${item['name']}：${d['value']}');
       }
     }
-    if (lines.isEmpty) return const SizedBox.shrink();
+    if (lines.isEmpty && schedules.isEmpty) return const SizedBox.shrink();
 
-    final doneList = schedules.where((s) => schedDone[s['id']] == true).map((s) => s['title']).join('、');
-    final todoList = schedules.where((s) => schedDone[s['id']] != true).map((s) => s['title']).join('、');
-    var summary = '📋 $_selectedDate 状态记录\n${lines.join('\n')}';
+    final doneList = schedules.where((s) => schedDone[s['id']] == true).map(_formatScheduleForSummary).join('、');
+    final todoList = schedules.where((s) => schedDone[s['id']] != true).map(_formatScheduleForSummary).join('、');
+    var summary = '📋 $_selectedDate 状态记录';
+    if (lines.isNotEmpty) {
+      summary += '\n${lines.join('\n')}';
+    }
     if (schedules.isNotEmpty) {
       summary += '\n\n✅ 已完成日程：${doneList.isEmpty ? "无" : doneList}';
       summary += '\n⬜ 未完成日程：${todoList.isEmpty ? "无" : todoList}';
@@ -467,6 +690,7 @@ class _TodayPageState extends State<TodayPage> {
                     if (type == 'number')
                       IconButton(
                         icon: const Icon(Icons.show_chart, color: Colors.indigo),
+                        tooltip: '查看趋势折线图',
                         onPressed: () => _showTrendSheet(id, name),
                       ),
                     if (type == 'image')
@@ -604,7 +828,7 @@ class _TodayPageState extends State<TodayPage> {
 
   Future<void> _pickImages(int itemId) async {
     final picker = ImagePicker();
-    final picked = await picker.pickMultiImage(imageQuality: 100); // 100 = 原图不压缩
+    final picked = await picker.pickMultiImage(imageQuality: 100);
     if (picked.isEmpty) return;
 
     await widget.db.insert(
@@ -683,7 +907,7 @@ class _TodayPageState extends State<TodayPage> {
         title: Text('填写：$name'),
         content: TextField(
           controller: ctrl,
-          keyboardType: type == 'number' ? TextInputType.number : TextInputType.text,
+          keyboardType: type == 'number' ? const TextInputType.numberWithOptions(decimal: true) : TextInputType.text,
           autofocus: true,
         ),
         actions: [
@@ -705,29 +929,97 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  void _addScheduleDialog() {
+  /// 添加日程弹窗（支持关联「规划」页中的具体规划节点）
+  Future<void> _addScheduleDialog() async {
+    final planNodes = await _loadAllPlanNodes();
+    if (!mounted) return;
+
     final ctrl = TextEditingController();
+    String selectedPlanPath = '';
+
     showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('添加日程'),
-        content: TextField(controller: ctrl, autofocus: true, decoration: const InputDecoration(hintText: '如：晨跑30分钟')),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-          FilledButton(
-            onPressed: () async {
-              if (ctrl.text.trim().isEmpty) return;
-              await widget.db.insert('schedule_items', {'title': ctrl.text.trim()});
-              if (mounted) Navigator.pop(ctx);
-              setState(() {});
-            },
-            child: const Text('添加'),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text('添加日程'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: ctrl,
+                  autofocus: true,
+                  decoration: const InputDecoration(
+                    labelText: '日程内容',
+                    hintText: '如：晨跑30分钟',
+                  ),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  '关联具体规划（确保日程符合规划）：',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 6),
+                if (planNodes.isEmpty)
+                  const Text(
+                    '暂无规划可关联，可先前往底部「规划」页创建思维导图',
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  )
+                else
+                  DropdownButtonFormField<String>(
+                    value: selectedPlanPath,
+                    isExpanded: true,
+                    decoration: const InputDecoration(
+                      border: OutlineInputBorder(),
+                      contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    ),
+                    items: [
+                      const DropdownMenuItem(value: '', child: Text('不关联规划')),
+                      ...planNodes.map(
+                        (n) => DropdownMenuItem(
+                          value: n.path,
+                          child: Text(n.path, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13)),
+                        ),
+                      ),
+                    ],
+                    onChanged: (val) {
+                      setDialogState(() {
+                        selectedPlanPath = val ?? '';
+                        // 如果用户还没填日程名，选中规划节点时自动用节点名填充，省去打字
+                        if (selectedPlanPath.isNotEmpty && ctrl.text.trim().isEmpty) {
+                          final matched = planNodes.where((e) => e.path == selectedPlanPath);
+                          if (matched.isNotEmpty) {
+                            ctrl.text = matched.first.nodeName;
+                          }
+                        }
+                      });
+                    },
+                  ),
+              ],
+            ),
           ),
-        ],
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+            FilledButton(
+              onPressed: () async {
+                if (ctrl.text.trim().isEmpty) return;
+                await widget.db.insert('schedule_items', {
+                  'title': ctrl.text.trim(),
+                  'plan_info': selectedPlanPath,
+                });
+                if (mounted) Navigator.pop(ctx);
+                setState(() {});
+              },
+              child: const Text('添加'),
+            ),
+          ],
+        ),
       ),
     );
   }
 
+  /// 弹出趋势折线图 + 历史数据明细
   Future<void> _showTrendSheet(int itemId, String name) async {
     final recs = await widget.db.query(
       'status_records',
@@ -735,25 +1027,56 @@ class _TodayPageState extends State<TodayPage> {
       whereArgs: [itemId],
       orderBy: 'date ASC',
     );
+    final points = <({String date, double value})>[];
+    for (final r in recs) {
+      final v = double.tryParse(r['value'] as String? ?? '');
+      if (v != null) {
+        points.add((date: r['date'] as String, value: v));
+      }
+    }
+
     if (!mounted) return;
     showModalBottomSheet(
       context: context,
-      builder: (_) => Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
+      isScrollControlled: true,
+      builder: (_) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.65,
+        maxChildSize: 0.9,
+        builder: (_, scrollCtrl) => ListView(
+          controller: scrollCtrl,
+          padding: const EdgeInsets.all(16),
           children: [
-            Text('$name · 历史趋势', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            if (recs.isEmpty)
-              const Padding(padding: EdgeInsets.all(24), child: Center(child: Text('暂无历史数值')))
-            else
-              ...recs.map((r) => ListTile(
-                    dense: true,
-                    title: Text(r['date'] as String),
-                    trailing: Text(r['value'] as String, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                  )),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text('$name · 历史趋势折线图', style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+                Text('共 ${points.length} 条记录', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+              ],
+            ),
+            const SizedBox(height: 14),
+            if (points.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(32),
+                child: Center(child: Text('暂无有效数值记录')),
+              )
+            else ...[
+              TrendLineChart(points: points),
+              const SizedBox(height: 16),
+              const Text('历史数值明细', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+              const Divider(),
+              ...points.reversed.map(
+                (p) => ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(p.date),
+                  trailing: Text(
+                    p.value == p.value.roundToDouble() ? p.value.toInt().toString() : p.value.toString(),
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -1200,7 +1523,7 @@ class _SearchPageState extends State<SearchPage> {
     final appDir = await getApplicationDocumentsDirectory();
     final data = {
       'app': 'daily_tracker',
-      'version': '1.0.0',
+      'version': '2.0.0',
       'exportTime': DateTime.now().toIso8601String(),
       'data': {
         'status_items': await widget.db.query('status_items'),
@@ -1362,11 +1685,24 @@ class _PlanPageState extends State<PlanPage> {
             else
               const SizedBox(width: 32),
             Expanded(
-              child: Text(
-                text,
-                style: TextStyle(
-                  fontSize: depth == 0 ? 16 : (depth == 1 ? 15 : 14),
-                  fontWeight: depth <= 1 ? FontWeight.bold : FontWeight.normal,
+              child: GestureDetector(
+                onTap: () => _editNodeDialog(mmId, root, node),
+                child: Container(
+                  padding: depth == 0 ? const EdgeInsets.symmetric(horizontal: 10, vertical: 4) : null,
+                  decoration: depth == 0
+                      ? BoxDecoration(
+                          color: const Color(0xFFEEF2FF),
+                          borderRadius: BorderRadius.circular(6),
+                        )
+                      : null,
+                  child: Text(
+                    text,
+                    style: TextStyle(
+                      fontSize: depth == 0 ? 16 : (depth == 1 ? 15 : 14),
+                      fontWeight: depth <= 1 ? FontWeight.bold : FontWeight.normal,
+                      color: depth == 0 ? const Color(0xFF4F46E5) : Colors.black87,
+                    ),
+                  ),
                 ),
               ),
             ),
@@ -1413,7 +1749,11 @@ class _PlanPageState extends State<PlanPage> {
   Future<void> _saveRoot(int mmId, Map<String, dynamic> root) async {
     await widget.db.update(
       'mindmaps',
-      {'root_json': jsonEncode(root), 'updated_at': DateTime.now().toIso8601String()},
+      {
+        'title': root['text'],
+        'root_json': jsonEncode(root),
+        'updated_at': DateTime.now().toIso8601String(),
+      },
       where: 'id = ?',
       whereArgs: [mmId],
     );
@@ -1467,6 +1807,29 @@ class _PlanPageState extends State<PlanPage> {
               await _saveRoot(mmId, root);
             },
             child: const Text('添加'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _editNodeDialog(int mmId, Map<String, dynamic> root, Map<String, dynamic> node) {
+    final ctrl = TextEditingController(text: node['text'] as String);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('修改节点内容'),
+        content: TextField(controller: ctrl, autofocus: true),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          FilledButton(
+            onPressed: () async {
+              if (ctrl.text.trim().isEmpty) return;
+              node['text'] = ctrl.text.trim();
+              if (mounted) Navigator.pop(ctx);
+              await _saveRoot(mmId, root);
+            },
+            child: const Text('保存'),
           ),
         ],
       ),
