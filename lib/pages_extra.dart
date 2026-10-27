@@ -187,195 +187,6 @@ class _ModuleTreeSelectorState extends State<ModuleTreeSelector> {
                       value: isChecked,
                       materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
                       visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
- import 'dart:convert';
-import 'dart:io';
-import 'dart:math' as math;
-import 'package:archive/archive_io.dart';
-import 'package:file_picker/file_picker.dart';
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:intl/intl.dart' hide TextDirection;
-import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
-import 'package:sqflite/sqflite.dart';
-import 'package:uuid/uuid.dart';
-import 'main.dart' show AppDatabase;
-
-class SequenceParser {
-  static List<({int seq, String text})> parse(String raw, int currentMaxSeq) {
-    final lines = raw.split('\n');
-    final results = <({int seq, String text})>[];
-    final circledMap = <String, int>{};
-    for (int i = 0; i < 20; i++) circledMap[String.fromCharCode(0x2460 + i)] = i + 1;
-    for (int i = 0; i < 30; i++) circledMap[String.fromCharCode(0x3251 + i)] = i + 21;
-    final arabic = RegExp(r'^(\d+)[\.、\)）\s]\s*(.*)$');
-    final paren = RegExp(r'^[\(（](\d+)[\)）]\s*(.*)$');
-    int autoSeq = currentMaxSeq;
-
-    for (final line in lines) {
-      final t = line.trim();
-      if (t.isEmpty) continue;
-      final fc = t.characters.first;
-      if (circledMap.containsKey(fc)) {
-        final c = t.substring(fc.length).trim();
-        if (c.isNotEmpty) results.add((seq: circledMap[fc]!, text: c));
-        continue;
-      }
-      final m1 = arabic.firstMatch(t);
-      if (m1 != null && m1.group(2)!.trim().isNotEmpty) {
-        results.add((seq: int.parse(m1.group(1)!), text: m1.group(2)!.trim()));
-        continue;
-      }
-      final m2 = paren.firstMatch(t);
-      if (m2 != null && m2.group(2)!.trim().isNotEmpty) {
-        results.add((seq: int.parse(m2.group(1)!), text: m2.group(2)!.trim()));
-        continue;
-      }
-      autoSeq++;
-      results.add((seq: autoSeq, text: t));
-    }
-    return results;
-  }
-}
-
-class ModuleTreeSelector extends StatefulWidget {
-  final List<Map<String, dynamic>> allMods;
-  final Set<int> selectedIds;
-  final VoidCallback onChanged;
-
-  const ModuleTreeSelector({
-    super.key,
-    required this.allMods,
-    required this.selectedIds,
-    required this.onChanged,
-  });
-
-  @override
-  State<ModuleTreeSelector> createState() => _ModuleTreeSelectorState();
-}
-
-class _ModuleTreeSelectorState extends State<ModuleTreeSelector> {
-  final Set<int> _expandedIds = {};
-
-  List<Map<String, dynamic>> _childrenOf(int? pid) {
-    return widget.allMods.where((m) => m['parent_id'] == pid).toList();
-  }
-
-  List<int> _descendantsOf(int pid) {
-    final res = <int>[];
-    void walk(int cur) {
-      for (final m in _childrenOf(cur)) {
-        final id = m['id'] as int;
-        res.add(id);
-        walk(id);
-      }
-    }
-    walk(pid);
-    return res;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final roots = _childrenOf(null);
-    if (roots.isEmpty) {
-      return const Padding(
-        padding: EdgeInsets.all(16),
-        child: Center(child: Text('暂无标题', style: TextStyle(color: Colors.grey))),
-      );
-    }
-    return ListView(
-      shrinkWrap: true,
-      children: roots.map((r) => _buildNode(r, 0)).toList(),
-    );
-  }
-
-  Widget _buildNode(Map<String, dynamic> m, int depth) {
-    final id = m['id'] as int;
-    final children = _childrenOf(id);
-    final hasChildren = children.isNotEmpty;
-    final isExpanded = _expandedIds.contains(id);
-    final isChecked = widget.selectedIds.contains(id);
-    final descIds = hasChildren ? _descendantsOf(id) : <int>[];
-    final selectedChildCount = descIds.where((cid) => widget.selectedIds.contains(cid)).length;
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        InkWell(
-          onTap: () {
-            setState(() {
-              if (isChecked) {
-                widget.selectedIds.remove(id);
-              } else {
-                widget.selectedIds.add(id);
-              }
-            });
-            widget.onChanged();
-          },
-          child: Padding(
-            padding: EdgeInsets.only(left: depth * 16.0, top: 2, bottom: 2),
-            child: SizedBox(
-              height: 32,
-              child: Row(
-                children: [
-                  if (hasChildren)
-                    GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: () => setState(() => isExpanded ? _expandedIds.remove(id) : _expandedIds.add(id)),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-                        child: Icon(
-                          isExpanded ? Icons.arrow_drop_down : Icons.arrow_right,
-                          size: 20,
-                          color: const Color(0xFF4F46E5),
-                        ),
-                      ),
-                    )
-                  else
-                    const SizedBox(width: 28),
-                  Icon(
-                    depth == 0 ? Icons.folder_outlined : Icons.subdirectory_arrow_right,
-                    size: 16,
-                    color: depth == 0 ? Colors.indigo : Colors.blueGrey,
-                  ),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      '${m['title']}',
-                      style: TextStyle(
-                        fontSize: 13.5,
-                        fontWeight: depth == 0 ? FontWeight.w600 : FontWeight.normal,
-                      ),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  if (hasChildren)
-                    GestureDetector(
-                      onTap: () => setState(() => isExpanded ? _expandedIds.remove(id) : _expandedIds.add(id)),
-                      child: Container(
-                        margin: const EdgeInsets.only(right: 4),
-                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                        decoration: BoxDecoration(
-                          color: selectedChildCount > 0 ? const Color(0xFFEEF2FF) : const Color(0xFFF1F5F9),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: Text(
-                          selectedChildCount > 0 ? '已选$selectedChildCount/${children.length}' : '细筛(${children.length})',
-                          style: TextStyle(
-                            fontSize: 10.5,
-                            color: selectedChildCount > 0 ? const Color(0xFF4F46E5) : Colors.grey[600],
-                          ),
-                        ),
-                      ),
-                    ),
-                  SizedBox(
-                    width: 28,
-                    height: 28,
-                    child: Checkbox(
-                      value: isChecked,
-                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
                       onChanged: (v) {
                         setState(() {
                           if (v == true) {
@@ -1695,8 +1506,177 @@ class _FamilyPageState extends State<FamilyPage> {
     );
   }
 }
-
 // ==================== Tab 1: 查找页 ====================
+class SearchPage extends StatefulWidget {
+  final Database db;
+  const SearchPage({super.key, required this.db});
+  @override
+  State<SearchPage> createState() => _SearchPageState();
+}
+
+class _SearchPageState extends State<SearchPage> {
+  String _modPath(int id, Map<int, Map<String, dynamic>> map) {
+    final parts = <String>[];
+    int? cur = id;
+    int guard = 0;
+    while (cur != null && map.containsKey(cur) && guard++ < 20) {
+      parts.insert(0, '${map[cur]!['title']}');
+      cur = map[cur]!['parent_id'] as int?;
+    }
+    return parts.join(' > ');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        toolbarHeight: 46,
+        title: const Text('🔍 查找', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+      ),
+      body: FutureBuilder<List<Map<String, dynamic>>>(
+        future: widget.db.query('module_groups', orderBy: 'id DESC'),
+        builder: (_, snap) {
+          final groups = snap.data ?? [];
+          return ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: () => _createOrEditGroup(),
+                      icon: const Icon(Icons.add),
+                      label: const Text('新建标题组'),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _tempView,
+                      icon: const Icon(Icons.visibility_outlined),
+                      label: const Text('临时查看'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              if (groups.isEmpty)
+                const Card(
+                  child: Padding(
+                    padding: EdgeInsets.all(20),
+                    child: Center(child: Text('暂无标题组，新建后可一键聚合查阅')),
+                  ),
+                ),
+              ...groups.map((g) {
+                final ids = '${g['module_ids']}'.split(',').where((s) => s.isNotEmpty).map(int.parse).toList();
+                return Card(
+                  child: ListTile(
+                    leading: const Icon(Icons.folder_special, color: Colors.indigo),
+                    title: Text('${g['name']}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                    subtitle: Text('已选 ${ids.length} 项 · 点击查看', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        IconButton(
+                          tooltip: '编辑标题组（增减大标题）',
+                          icon: const Icon(Icons.edit_outlined, color: Colors.blueGrey, size: 20),
+                          onPressed: () => _createOrEditGroup(existingGroup: g),
+                        ),
+                        IconButton(
+                          tooltip: '删除标题组',
+                          icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20),
+                          onPressed: () async {
+                            await widget.db.delete('module_groups', where: 'id = ?', whereArgs: [g['id']]);
+                            setState(() {});
+                          },
+                        ),
+                      ],
+                    ),
+                    onTap: () => _showAgg('${g['name']}', ids),
+                  ),
+                );
+              }),
+              const SizedBox(height: 24),
+              const Text('💾 数据备份与恢复', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+              const SizedBox(height: 8),
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Row(
+                    children: [
+                      Expanded(child: FilledButton.tonalIcon(onPressed: _exportZip, icon: const Icon(Icons.upload_file), label: const Text('导出备份'))),
+                      const SizedBox(width: 10),
+                      Expanded(child: OutlinedButton.icon(onPressed: _importZip, icon: const Icon(Icons.download), label: const Text('导入恢复'))),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _createOrEditGroup({Map<String, dynamic>? existingGroup}) async {
+    final mods = await widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
+    if (!mounted) return;
+    if (mods.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先在「家庭」页创建大标题')));
+      return;
+    }
+
+    final isEdit = existingGroup != null;
+    final ctrl = TextEditingController(text: isEdit ? '${existingGroup['name']}' : '');
+    final sel = <int>{};
+    if (isEdit) {
+      final rawIds = '${existingGroup['module_ids']}'.split(',').where((s) => s.isNotEmpty).map(int.parse);
+      sel.addAll(rawIds);
+    }
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setS) => AlertDialog(
+          insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+          titlePadding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
+          contentPadding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+          title: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(isEdit ? '编辑标题组' : '新建标题组', style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+              Text('已选 ${sel.length} 项', style: const TextStyle(fontSize: 12, color: Color(0xFF4F46E5))),
+            ],
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: MediaQuery.of(ctx).size.height * 0.62,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: ctrl,
+                  style: const TextStyle(fontSize: 14),
+                  decoration: const InputDecoration(
+                    labelText: '组名',
+                    isDense: true,
+                    contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  '💡 提示：直接勾选大标题将包含其全部内容; 点击左侧 ▶ 可展开精细化筛选内部小标题',
+                  style: TextStyle(fontSize: 11, color: Colors.grey),
+                ),
+                const Divider(height: 10),
+                Expanded(
+                  child: ModuleTreeSelector(
+                    allMods: mods,
+                    selectedIds: sel,
+                    onChanged: () => setS(() {}),
+                  ),
+        // ==================== Tab 1: 查找页 ====================
 class SearchPage extends StatefulWidget {
   final Database db;
   const SearchPage({super.key, required this.db});
