@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as math;
 import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -211,6 +210,7 @@ class _ModuleTreeSelectorState extends State<ModuleTreeSelector> {
   }
 }
 
+// ==================== 家庭模块（支持添加家庭成员如“梦雨” + 一键导入结构化 Word 文档） ====================
 class FamilyPage extends StatefulWidget {
   final Database db;
   const FamilyPage({super.key, required this.db});
@@ -228,7 +228,6 @@ class _FamilyPageState extends State<FamilyPage> {
     _restoreFamilyUiState();
   }
 
-  /// 恢复「家庭」页上次展开/折叠的大标题状态
   Future<void> _restoreFamilyUiState() async {
     final raw = await AppDatabase.getUiState(widget.db, 'family_expanded_mods');
     if (raw != null && raw.isNotEmpty) {
@@ -262,6 +261,156 @@ class _FamilyPageState extends State<FamilyPage> {
     return parts.join(' > ');
   }
 
+  String _unescapeXml(String s) {
+    return s
+        .replaceAll('&amp;', '&')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&apos;', "'");
+  }
+
+  /// 一键导入家庭 Word 文档（支持“梦雨”等成员分组，自动识别一二三级标题与带圈序号归类）
+  Future<void> _importFamilyDocx() async {
+    try {
+      final res = await FilePicker.platform.pickFiles(type: FileType.any);
+      if (res == null || res.files.single.path == null) return;
+      final filePath = res.files.single.path!;
+      final bytes = await File(filePath).readAsBytes();
+      final archive = ZipDecoder().decodeBytes(bytes);
+
+      ArchiveFile? docXmlFile;
+      for (final f in archive) {
+        if (f.isFile && f.name == 'word/document.xml') {
+          docXmlFile = f;
+          break;
+        }
+      }
+
+      if (docXmlFile == null) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('未识别到标准的 Word (.docx) 文件结构')));
+        return;
+      }
+
+      final docXml = utf8.decode(docXmlFile.content as List<int>, allowMalformed: true);
+      final pMatches = RegExp(r'<w:p\b[^>]*>([\s\S]*?)<\/w:p>').allMatches(docXml);
+
+      // 获取当前数据库已有模块，便于复用
+      final existingMods = await widget.db.query('modules');
+      int? currentMemberId; // 例如“梦雨”
+      int? currentMainId;   // 一级标题，如“一、安排”、“二、首要信息”
+      int? currentSubId;    // 二级标题，如“短期安排”、“胃炎”
+
+      // 自动寻找或创建根目录成员（如以文档名为成员名或默认“梦雨”）
+      String memberName = p.basenameWithoutExtension(filePath);
+      if (memberName.isEmpty || memberName == 'document') memberName = '梦雨';
+
+      var memberMatch = existingMods.firstWhere(
+        (m) => m['parent_id'] == null && m['title'].toString().toLowerCase() == memberName.toLowerCase(),
+        orElse: () => {},
+      );
+
+      if (memberMatch.isNotEmpty) {
+        currentMemberId = memberMatch['id'] as int;
+      } else {
+        final siblings = await widget.db.query('modules', where: 'parent_id IS NULL');
+        currentMemberId = await widget.db.insert('modules', {
+          'title': memberName,
+          'parent_id': null,
+          'sort_order': siblings.length,
+          'created_at': DateTime.now().toIso8601String(),
+        });
+        _expandedMods.add(currentMemberId!);
+      }
+
+      int importedSections = 0;
+      int importedEntries = 0;
+
+      for (final pm in pMatches) {
+        final pXml = pm.group(1)!;
+        final tMatches = RegExp(r'<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>').allMatches(pXml);
+        final rawText = _unescapeXml(tMatches.map((m) => m.group(1)!).join('')).trim();
+        if (rawText.isEmpty) continue;
+
+        // 识别一级大标题（如：“一、 安排：”、“二、 首要信息：”）
+        final level1Regex = RegExp(r'^[一二三四五六七八九十]+[、\.\s]+(.+)');
+        final l1Match = level1Regex.firstMatch(rawText);
+        if (l1Match != null) {
+          final titleText = l1Match.group(1)!.replaceAll(RegExp(r'[:：]'), '').trim();
+          final subs = await widget.db.query('modules', where: 'parent_id = ?', whereArgs: [currentMemberId]);
+          currentMainId = await widget.db.insert('modules', {
+            'title': titleText,
+            'parent_id': currentMemberId,
+            'sort_order': subs.length,
+            'created_at': DateTime.now().toIso8601String(),
+          });
+          _expandedMods.add(currentMemberId!);
+          currentSubId = null;
+          importedSections++;
+          continue;
+        }
+
+        // 识别二级带圈数字或小标题（如：“① 短期安排”、“② 胃炎”、“● 身体情况：”）
+        final level2Regex = RegExp(r'^([①②③④⑤⑥⑦⑧⑨⑩\u2460-\u2473\u3251-\u32BF\•\●\-\*])\s*(.+)');
+        final l2Match = level2Regex.firstMatch(rawText);
+        if (l2Match != null) {
+          final titleText = l2Match.group(2)!.replaceAll(RegExp(r'[:：]'), '').trim();
+          if (currentMainId == null) {
+            // 若没有一级标题，则直接挂在成员下
+            final subs = await widget.db.query('modules', where: 'parent_id = ?', whereArgs: [currentMemberId]);
+            currentMainId = await widget.db.insert('modules', {
+              'title': titleText,
+              'parent_id': currentMemberId,
+              'sort_order': subs.length,
+              'created_at': DateTime.now().toIso8601String(),
+            });
+            _expandedMods.add(currentMemberId!);
+            currentSubId = null;
+          } else {
+            final subs = await widget.db.query('modules', where: 'parent_id = ?', whereArgs: [currentMainId]);
+            currentSubId = await widget.db.insert('modules', {
+              'title': titleText,
+              'parent_id': currentMainId,
+              'sort_order': subs.length,
+              'created_at': DateTime.now().toIso8601String(),
+            });
+            _expandedMods.add(currentMainId!);
+          }
+          importedSections++;
+          continue;
+        }
+
+        // 普通正文内容：自动存入当前活跃的标题节点下
+        final targetModId = currentSubId ?? currentMainId ?? currentMemberId;
+        if (targetModId != null) {
+          final entries = await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [targetModId]);
+          // 自动识别段落内的带圈序号（如 ① 想要去玩水...）
+          final innerSeqMatch = RegExp(r'^([①②③④⑤⑥⑦⑧⑨⑩\u2460-\u2473])\s*(.+)').firstMatch(rawText);
+          final contentText = innerSeqMatch != null ? innerSeqMatch.group(2)!.trim() : rawText;
+
+          await widget.db.insert('module_entries', {
+            'module_id': targetModId,
+            'seq': entries.length + 1,
+            'content': contentText,
+            'sort_order': entries.length,
+            'created_at': DateTime.now().toIso8601String(),
+          });
+          importedEntries++;
+        }
+      }
+
+      await _saveFamilyUiState();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('🎉 成功导入「$memberName」：新增 $importedSections 个标题、$importedEntries 条内容！')),
+      );
+      setState(() {});
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('导入 Word 失败：$e')));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -270,9 +419,14 @@ class _FamilyPageState extends State<FamilyPage> {
         title: const Text('🏠 家庭', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
         actions: [
           TextButton.icon(
-            onPressed: () => _createOrEditMod(),
-            icon: const Icon(Icons.add, size: 18),
-            label: const Text('新建大标题'),
+            onPressed: _importFamilyDocx,
+            icon: const Icon(Icons.description_outlined, size: 17),
+            label: const Text('导入Word', style: TextStyle(fontSize: 13)),
+          ),
+          TextButton.icon(
+            onPressed: () => _createOrEditMod(isMember: true),
+            icon: const Icon(Icons.person_add_alt_1, size: 17),
+            label: const Text('添加成员', style: TextStyle(fontSize: 13)),
           ),
         ],
       ),
@@ -280,7 +434,25 @@ class _FamilyPageState extends State<FamilyPage> {
         future: _loadMods(),
         builder: (_, snap) {
           final all = snap.data ?? [];
-          if (all.isEmpty) return const Center(child: Text('暂无大标题，点击右上角新建'));
+          if (all.isEmpty) {
+            return Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text('暂无家庭成员或大标题', style: TextStyle(color: Colors.grey)),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      FilledButton.icon(onPressed: () => _createOrEditMod(isMember: true), icon: const Icon(Icons.person_add), label: const Text('添加家庭成员（如：梦雨）')),
+                      const SizedBox(width: 8),
+                      OutlinedButton.icon(onPressed: _importFamilyDocx, icon: const Icon(Icons.description_outlined), label: const Text('导入Word')),
+                    ],
+                  ),
+                ],
+              ),
+            );
+          }
           final map = {for (final m in all) m['id'] as int: m};
           return SingleChildScrollView(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -322,7 +494,7 @@ class _FamilyPageState extends State<FamilyPage> {
           children: [
             Card(
               margin: EdgeInsets.only(left: depth * 16.0, bottom: 6),
-              color: depth == 0 ? null : const Color(0xFFF8FAFC),
+              color: depth == 0 ? const Color(0xFFEEF2FF) : const Color(0xFFF8FAFC),
               child: InkWell(
                 borderRadius: BorderRadius.circular(12),
                 onTap: () => _openEntries(id, _buildFullPath(id, map)),
@@ -344,7 +516,11 @@ class _FamilyPageState extends State<FamilyPage> {
                         )
                       else
                         const SizedBox(width: 4),
-                      Icon(depth == 0 ? Icons.folder_outlined : Icons.subdirectory_arrow_right, color: Colors.indigo, size: 19),
+                      Icon(
+                        depth == 0 ? Icons.family_restroom : (depth == 1 ? Icons.folder_outlined : Icons.subdirectory_arrow_right),
+                        color: depth == 0 ? const Color(0xFF4F46E5) : Colors.indigo,
+                        size: 19,
+                      ),
                       const SizedBox(width: 8),
                       Expanded(
                         child: Row(
@@ -352,7 +528,11 @@ class _FamilyPageState extends State<FamilyPage> {
                             Flexible(
                               child: Text(
                                 '${m['title']}',
-                                style: TextStyle(fontWeight: depth == 0 ? FontWeight.bold : FontWeight.w600, fontSize: depth == 0 ? 15 : 14),
+                                style: TextStyle(
+                                  fontWeight: depth <= 1 ? FontWeight.bold : FontWeight.w600,
+                                  fontSize: depth == 0 ? 16 : (depth == 1 ? 15 : 14),
+                                  color: depth == 0 ? const Color(0xFF312E81) : Colors.black87,
+                                ),
                                 overflow: TextOverflow.ellipsis,
                               ),
                             ),
@@ -366,7 +546,7 @@ class _FamilyPageState extends State<FamilyPage> {
                                 child: Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
                                   decoration: BoxDecoration(
-                                    color: const Color(0xFFEEF2FF),
+                                    color: const Color(0xFFE0E7FF),
                                     borderRadius: BorderRadius.circular(4),
                                   ),
                                   child: Text(
@@ -381,13 +561,13 @@ class _FamilyPageState extends State<FamilyPage> {
                       ),
                       IconButton(
                         visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
-                        tooltip: '添加内部小标题',
+                        tooltip: '添加子标题',
                         icon: const Icon(Icons.create_new_folder_outlined, size: 18, color: Colors.indigo),
                         onPressed: () => _createOrEditMod(parentId: id, parentTitle: '${m['title']}'),
                       ),
                       IconButton(
                         visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
-                        tooltip: '修改标题名称',
+                        tooltip: '修改名称',
                         icon: const Icon(Icons.edit_outlined, size: 18, color: Colors.blueGrey),
                         onPressed: () => _createOrEditMod(editMod: m),
                       ),
@@ -447,10 +627,12 @@ class _FamilyPageState extends State<FamilyPage> {
     setState(() {});
   }
 
-  void _createOrEditMod({int? parentId, String? parentTitle, Map<String, dynamic>? editMod}) {
+  void _createOrEditMod({int? parentId, String? parentTitle, Map<String, dynamic>? editMod, bool isMember = false}) {
     final isEdit = editMod != null;
     final ctrl = TextEditingController(text: isEdit ? '${editMod['title']}' : '');
-    final dlgTitle = isEdit ? '修改标题名称' : (parentId == null ? '新建大标题' : '在「$parentTitle」下新建小标题');
+    final dlgTitle = isEdit
+        ? '修改标题名称'
+        : (isMember ? '添加家庭成员（如：梦雨）' : (parentId == null ? '新建主分类' : '在「$parentTitle」下新建子标题'));
 
     showDialog(
       context: context,
@@ -459,7 +641,7 @@ class _FamilyPageState extends State<FamilyPage> {
         content: TextField(
           controller: ctrl,
           autofocus: true,
-          decoration: const InputDecoration(hintText: '输入标题名称'),
+          decoration: InputDecoration(hintText: isMember ? '输入成员名字（如：梦雨）' : '输入标题名称'),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
@@ -475,7 +657,7 @@ class _FamilyPageState extends State<FamilyPage> {
                   where: parentId == null ? 'parent_id IS NULL' : 'parent_id = ?',
                   whereArgs: parentId == null ? null : [parentId],
                 );
-                await widget.db.insert('modules', {
+                final newId = await widget.db.insert('modules', {
                   'title': txt,
                   'parent_id': parentId,
                   'sort_order': siblings.length,
@@ -483,6 +665,9 @@ class _FamilyPageState extends State<FamilyPage> {
                 });
                 if (parentId != null) {
                   _expandedMods.add(parentId);
+                  await _saveFamilyUiState();
+                } else if (isMember) {
+                  _expandedMods.add(newId);
                   await _saveFamilyUiState();
                 }
               }
@@ -532,7 +717,7 @@ class _FamilyPageState extends State<FamilyPage> {
                         _createOrEditMod(parentId: modId, parentTitle: fullPath.split(' > ').last);
                       },
                       icon: const Icon(Icons.create_new_folder_outlined, size: 15),
-                      label: const Text('加小标题', style: TextStyle(fontSize: 12)),
+                      label: const Text('加子标题', style: TextStyle(fontSize: 12)),
                     ),
                     IconButton(
                       visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
@@ -886,7 +1071,7 @@ class _SearchPageState extends State<SearchPage> {
     final mods = await widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
     if (!mounted) return;
     if (mods.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先在「家庭」页创建大标题')));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先在「家庭」页创建大标题或成员')));
       return;
     }
 
@@ -930,7 +1115,7 @@ class _SearchPageState extends State<SearchPage> {
                 ),
                 const SizedBox(height: 6),
                 const Text(
-                  '💡 提示：直接勾选大标题将包含其全部内容；点击左侧 ▶ 可展开精细化筛选内部小标题',
+                  '💡 提示：直接勾选将包含其全部内容；点击左侧 ▶ 可精细化筛选小标题',
                   style: TextStyle(fontSize: 11, color: Colors.grey),
                 ),
                 const Divider(height: 10),
@@ -1165,626 +1350,6 @@ class _SearchPageState extends State<SearchPage> {
   }
 }
 
-// ==================== XMind 风格精准坐标树形布局与直角圆弧连接线绘制引擎 ====================
-class _XMindSubtreeLayout extends StatefulWidget {
-  final Widget parentWidget;
-  final List<Widget> childWidgets;
-  final Color lineColor;
-  final double hGap;
-  final double vGap;
-
-  const _XMindSubtreeLayout({
-    required this.parentWidget,
-    required this.childWidgets,
-    required this.lineColor,
-    this.hGap = 26.0,
-    this.vGap = 6.0,
-  });
-
-  @override
-  State<_XMindSubtreeLayout> createState() => _XMindSubtreeLayoutState();
-}
-
-class _XMindSubtreeLayoutState extends State<_XMindSubtreeLayout> {
-  final _ConnectorLayoutInfo _info = _ConnectorLayoutInfo();
-
-  @override
-  Widget build(BuildContext context) {
-    return CustomPaint(
-      painter: _XMindConnectorPainter(info: _info, color: widget.lineColor),
-      child: CustomMultiChildLayout(
-        delegate: _XMindSubtreeDelegate(
-          childCount: widget.childWidgets.length,
-          hGap: widget.hGap,
-          vGap: widget.vGap,
-          info: _info,
-        ),
-        children: [
-          LayoutId(id: 'p', child: widget.parentWidget),
-          for (int i = 0; i < widget.childWidgets.length; i++)
-            LayoutId(id: 'c_$i', child: widget.childWidgets[i]),
-        ],
-      ),
-    );
-  }
-}
-
-class _ConnectorLayoutInfo extends ChangeNotifier {
-  Offset parentRight = Offset.zero;
-  List<Offset> childLefts = [];
-
-  void update(Offset pr, List<Offset> cls) {
-    parentRight = pr;
-    childLefts = cls;
-  }
-}
-
-class _XMindSubtreeDelegate extends MultiChildLayoutDelegate {
-  final int childCount;
-  final double hGap;
-  final double vGap;
-  final _ConnectorLayoutInfo info;
-
-  _XMindSubtreeDelegate({
-    required this.childCount,
-    required this.hGap,
-    required this.vGap,
-    required this.info,
-  });
-
-  @override
-  Size getSize(BoxConstraints constraints) {
-    return Size(constraints.maxWidth, constraints.maxHeight);
-  }
-
-  @override
-  void performLayout(Size size) {
-    // 自定义测量：由于 CustomMultiChildLayout 默认使用传入 size，我们在外层通过 Intrinsic 配合测量
-  }
-
-  @override
-  bool shouldRelayout(covariant _XMindSubtreeDelegate oldDelegate) => true;
-}
-
-/// 采用 RenderBox 树精确测量每个子分支的高度与中心点，绘制永不出头的标准 XMind 括号连接线
-class XMindBranchNodeWidget extends StatelessWidget {
-  final Map<String, dynamic> node;
-  final int depth;
-  final int branchIdx;
-  final Set<String> collapsedIds;
-  final bool interactive;
-  final void Function(String nodeId)? onToggleCollapse;
-  final void Function(Map<String, dynamic> node, int depth)? onTapNode;
-
-  const XMindBranchNodeWidget({
-    super.key,
-    required this.node,
-    required this.depth,
-    required this.branchIdx,
-    required this.collapsedIds,
-    required this.interactive,
-    this.onToggleCollapse,
-    this.onTapNode,
-  });
-
-  // 复刻图2 XMind 经典珊瑚红/暖橘色系
-  static const List<Color> _branchColors = [
-    Color(0xFFF0564A), // 珊瑚红
-    Color(0xFFED8936), // 暖橙色
-    Color(0xFFDF5A49), // 朱砂红
-    Color(0xFF3B82F6), // 经典蓝
-    Color(0xFF10B981), // 翡翠绿
-    Color(0xFF8B5CF6), // 紫罗兰
-  ];
-
-  @override
-  Widget build(BuildContext context) {
-    final id = '${node['id']}';
-    final children = (node['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
-    final isCollapsed = collapsedIds.contains(id);
-    final hasChildren = children.isNotEmpty;
-    final color = _branchColors[branchIdx % _branchColors.length];
-
-    final card = _buildXMindCard(node, depth, color, hasChildren, isCollapsed, children.length);
-
-    if (!hasChildren || isCollapsed) {
-      return Padding(
-        padding: const EdgeInsets.symmetric(vertical: 3.5),
-        child: card,
-      );
-    }
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 3.5),
-      child: _XMindTreeRow(
-        parent: card,
-        lineColor: color,
-        children: List.generate(children.length, (i) {
-          final nextBranchIdx = depth == 0 ? i : branchIdx;
-          return XMindBranchNodeWidget(
-            node: children[i],
-            depth: depth + 1,
-            branchIdx: nextBranchIdx,
-            collapsedIds: collapsedIds,
-            interactive: interactive,
-            onToggleCollapse: onToggleCollapse,
-            onTapNode: onTapNode,
-          );
-        }),
-      ),
-    );
-  }
-
-  Widget _buildXMindCard(
-    Map<String, dynamic> n,
-    int d,
-    Color branchColor,
-    bool hasChildren,
-    bool isCollapsed,
-    int childCount,
-  ) {
-    final id = '${n['id']}';
-    Color bg;
-    Color fg;
-    Color borderCol;
-
-    if (d == 0) {
-      // 根节点：图2深藏青黑底白字
-      bg = const Color(0xFF111827);
-      fg = Colors.white;
-      borderCol = const Color(0xFF111827);
-    } else if (d == 1) {
-      // 一级分支：图2珊瑚红/暖橙实心底白字
-      bg = branchColor;
-      fg = Colors.white;
-      borderCol = branchColor;
-    } else {
-      // 二级及以下：图2浅暖粉底色 + 细边框 + 深色文字
-      bg = branchColor.withOpacity(0.11);
-      fg = const Color(0xFF1F2937);
-      borderCol = branchColor.withOpacity(0.45);
-    }
-
-    final pill = Container(
-      constraints: BoxConstraints(minWidth: 44, maxWidth: d == 0 ? 160 : (d == 1 ? 180 : 240)),
-      padding: EdgeInsets.symmetric(
-        horizontal: d == 0 ? 14 : (d == 1 ? 11 : 9),
-        vertical: d == 0 ? 8 : (d == 1 ? 6 : 4.5),
-      ),
-      decoration: BoxDecoration(
-        color: bg,
-        borderRadius: BorderRadius.circular(d <= 1 ? 7 : 5),
-        border: Border.all(color: borderCol, width: 1.1),
-      ),
-      child: Text(
-        '${n['text']}',
-        style: TextStyle(
-          fontSize: d == 0 ? 14 : (d == 1 ? 12.5 : 11.5),
-          fontWeight: d <= 1 ? FontWeight.bold : FontWeight.w500,
-          color: fg,
-          height: 1.25,
-        ),
-      ),
-    );
-
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        interactive && onTapNode != null
-            ? GestureDetector(onTap: () => onTapNode!(n, d), child: pill)
-            : pill,
-        if (hasChildren && (isCollapsed || interactive))
-          GestureDetector(
-            onTap: interactive && onToggleCollapse != null ? () => onToggleCollapse!(id) : null,
-            child: Container(
-              margin: const EdgeInsets.only(left: 3),
-              width: isCollapsed ? null : 16,
-              height: 16,
-              padding: EdgeInsets.symmetric(horizontal: isCollapsed ? 4.5 : 0),
-              decoration: BoxDecoration(
-                color: isCollapsed ? branchColor : Colors.white,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: branchColor, width: 1.1),
-              ),
-              alignment: Alignment.center,
-              child: Text(
-                isCollapsed ? '$childCount' : '−',
-                style: TextStyle(
-                  fontSize: 9.5,
-                  fontWeight: FontWeight.bold,
-                  color: isCollapsed ? Colors.white : branchColor,
-                  height: 1.0,
-                ),
-              ),
-            ),
-          ),
-      ],
-    );
-  }
-}
-
-/// 自定义测量行：实时获取父节点右侧中心点与每个子节点左侧中心点，画出图2样式的精准直角圆弧连接线
-class _XMindTreeRow extends StatefulWidget {
-  final Widget parent;
-  final List<Widget> children;
-  final Color lineColor;
-
-  const _XMindTreeRow({
-    required this.parent,
-    required this.children,
-    required this.lineColor,
-  });
-
-  @override
-  State<_XMindTreeRow> createState() => _XMindTreeRowState();
-}
-
-class _XMindTreeRowState extends State<_XMindTreeRow> {
-  final GlobalKey _rowKey = GlobalKey();
-  final GlobalKey _parentKey = GlobalKey();
-  late List<GlobalKey> _childKeys;
-  Offset? _parentAnchor;
-  List<Offset> _childAnchors = [];
-
-  @override
-  void initState() {
-    super.initState();
-    _initKeys();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _measure());
-  }
-
-  @override
-  void didUpdateWidget(covariant _XMindTreeRow oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    _initKeys();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _measure());
-  }
-
-  void _initKeys() {
-    _childKeys = List.generate(widget.children.length, (_) => GlobalKey());
-  }
-
-  void _measure() {
-    if (!mounted) return;
-    final rowBox = _rowKey.currentContext?.findRenderObject() as RenderBox?;
-    final pBox = _parentKey.currentContext?.findRenderObject() as RenderBox?;
-    if (rowBox == null || pBox == null || !rowBox.hasSize || !pBox.hasSize) return;
-
-    final pPos = pBox.localToGlobal(Offset(pBox.size.width, pBox.size.height / 2), ancestor: rowBox);
-    final cAnchors = <Offset>[];
-    for (final k in _childKeys) {
-      final cBox = k.currentContext?.findRenderObject() as RenderBox?;
-      if (cBox != null && cBox.hasSize) {
-        cAnchors.add(cBox.localToGlobal(Offset(0, cBox.size.height / 2), ancestor: rowBox));
-      }
-    }
-    if (cAnchors.isNotEmpty) {
-      setState(() {
-        _parentAnchor = pPos;
-        _childAnchors = cAnchors;
-      });
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return CustomPaint(
-      key: _rowKey,
-      painter: _XMindBracketPainter(
-        parentRight: _parentAnchor,
-        childLefts: _childAnchors,
-        color: widget.lineColor,
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          Container(key: _parentKey, child: widget.parent),
-          const SizedBox(width: 24),
-          Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: List.generate(widget.children.length, (i) {
-              return Container(
-                key: _childKeys[i],
-                child: widget.children[i],
-              );
-            }),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _XMindBracketPainter extends CustomPainter {
-  final Offset? parentRight;
-  final List<Offset> childLefts;
-  final Color color;
-
-  _XMindBracketPainter({
-    required this.parentRight,
-    required this.childLefts,
-    required this.color,
-  });
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (parentRight == null || childLefts.isEmpty) return;
-    final paint = Paint()
-      ..color = color.withOpacity(0.75)
-      ..strokeWidth = 1.4
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round
-      ..strokeJoin = StrokeJoin.round;
-
-    final pr = parentRight!;
-    final midX = pr.dx + (childLefts.first.dx - pr.dx) * 0.45;
-
-    // 1. 从父节点右侧中心引出水平主干线到 midX
-    canvas.drawLine(pr, Offset(midX, pr.dy), paint);
-
-    // 2. 垂直主干线：严格从第一个子节点的 Y 坐标画到最后一个子节点的 Y 坐标（绝不上下出头！）
-    final minY = math.min(pr.dy, childLefts.first.dy);
-    final maxY = math.max(pr.dy, childLefts.last.dy);
-    if ((maxY - minY).abs() > 0.5) {
-      canvas.drawLine(Offset(midX, minY), Offset(midX, maxY), paint);
-    }
-
-    // 3. 从垂直线向每个子节点左侧中心引出水平支线
-    for (final cl in childLefts) {
-      canvas.drawLine(Offset(midX, cl.dy), cl, paint);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _XMindBracketPainter oldDelegate) {
-    return oldDelegate.parentRight != parentRight ||
-        oldDelegate.childLefts.length != childLefts.length ||
-        oldDelegate.color != color;
-  }
-}
-
-class _XMindConnectorPainter extends CustomPainter {
-  final _ConnectorLayoutInfo info;
-  final Color color;
-  _XMindConnectorPainter({required this.info, required this.color}) : super(repaint: info);
-  @override
-  void paint(Canvas canvas, Size size) {}
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}
-
-// ==================== 全屏思维导图画布页 ====================
-class FullscreenMindmapPage extends StatefulWidget {
-  final int mmId;
-  final Map<String, dynamic> root;
-  final Set<String> collapsedIds;
-  final Future<void> Function(Map<String, dynamic> updatedRoot) onSave;
-  final Future<void> Function() onSaveCollapseState;
-
-  const FullscreenMindmapPage({
-    super.key,
-    required this.mmId,
-    required this.root,
-    required this.collapsedIds,
-    required this.onSave,
-    required this.onSaveCollapseState,
-  });
-
-  @override
-  State<FullscreenMindmapPage> createState() => _FullscreenMindmapPageState();
-}
-
-class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
-  final _uuid = const Uuid();
-  bool _isLandscape = false;
-
-  @override
-  void dispose() {
-    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
-    super.dispose();
-  }
-
-  void _toggleOrientation() {
-    setState(() {
-      _isLandscape = !_isLandscape;
-      if (_isLandscape) {
-        SystemChrome.setPreferredOrientations([
-          DeviceOrientation.landscapeLeft,
-          DeviceOrientation.landscapeRight,
-        ]);
-      } else {
-        SystemChrome.setPreferredOrientations([
-          DeviceOrientation.portraitUp,
-        ]);
-      }
-    });
-  }
-
-  bool _rm(Map<String, dynamic> p, String tid) {
-    final ch = (p['children'] as List).cast<Map<String, dynamic>>();
-    final idx = ch.indexWhere((c) => c['id'] == tid);
-    if (idx != -1) { ch.removeAt(idx); return true; }
-    return ch.any((c) => _rm(c, tid));
-  }
-
-  void _onNodeAction(Map<String, dynamic> node, int depth) {
-    final id = '${node['id']}';
-    final hasChildren = ((node['children'] as List?) ?? []).isNotEmpty;
-    final isCol = widget.collapsedIds.contains(id);
-
-    showModalBottomSheet(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            ListTile(
-              leading: const Icon(Icons.account_tree, color: Color(0xFFF0564A)),
-              title: Text('${node['text']}', style: const TextStyle(fontWeight: FontWeight.bold)),
-              subtitle: const Text('选择对该节点的操作'),
-            ),
-            const Divider(height: 1),
-            if (hasChildren)
-              ListTile(
-                leading: Icon(isCol ? Icons.unfold_more : Icons.unfold_less, color: const Color(0xFF4F46E5)),
-                title: Text(isCol ? '展开该节点分支' : '折叠收起该节点分支'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  setState(() {
-                    if (isCol) {
-                      widget.collapsedIds.remove(id);
-                    } else {
-                      widget.collapsedIds.add(id);
-                    }
-                  });
-                  widget.onSaveCollapseState();
-                },
-              ),
-            ListTile(
-              leading: const Icon(Icons.add_circle_outline, color: Colors.indigo),
-              title: const Text('添加子节点'),
-              onTap: () {
-                Navigator.pop(ctx);
-                final ctrl = TextEditingController();
-                showDialog(
-                  context: context,
-                  builder: (dCtx) => AlertDialog(
-                    title: const Text('添加子节点'),
-                    content: TextField(controller: ctrl, autofocus: true, minLines: 1, maxLines: 3),
-                    actions: [
-                      TextButton(onPressed: () => Navigator.pop(dCtx), child: const Text('取消')),
-                      FilledButton(
-                        onPressed: () async {
-                          if (ctrl.text.trim().isEmpty) return;
-                          (node['children'] as List).add({'id': _uuid.v4(), 'text': ctrl.text.trim(), 'children': []});
-                          widget.collapsedIds.remove(id);
-                          await widget.onSaveCollapseState();
-                          if (mounted) Navigator.pop(dCtx);
-                          await widget.onSave(widget.root);
-                          setState(() {});
-                        },
-                        child: const Text('添加'),
-                      ),
-                    ],
-                  ),
-                );
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.edit_outlined, color: Colors.blueGrey),
-              title: const Text('修改节点文字'),
-              onTap: () {
-                Navigator.pop(ctx);
-                final ctrl = TextEditingController(text: '${node['text']}');
-                showDialog(
-                  context: context,
-                  builder: (dCtx) => AlertDialog(
-                    title: const Text('修改节点文字'),
-                    content: TextField(controller: ctrl, autofocus: true, minLines: 1, maxLines: 4),
-                    actions: [
-                      TextButton(onPressed: () => Navigator.pop(dCtx), child: const Text('取消')),
-                      FilledButton(
-                        onPressed: () async {
-                          if (ctrl.text.trim().isEmpty) return;
-                          node['text'] = ctrl.text.trim();
-                          if (mounted) Navigator.pop(dCtx);
-                          await widget.onSave(widget.root);
-                          setState(() {});
-                        },
-                        child: const Text('保存'),
-                      ),
-                    ],
-                  ),
-                );
-              },
-            ),
-            if (depth > 0)
-              ListTile(
-                leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
-                title: const Text('删除该节点及下属分支', style: TextStyle(color: Colors.redAccent)),
-                onTap: () async {
-                  Navigator.pop(ctx);
-                  _rm(widget.root, id);
-                  await widget.onSave(widget.root);
-                  setState(() {});
-                },
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.white,
-      appBar: AppBar(
-        toolbarHeight: 44,
-        title: Text('${widget.root['text']}', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
-        actions: [
-          TextButton.icon(
-            onPressed: () {
-              setState(() {
-                if (widget.collapsedIds.isNotEmpty) {
-                  widget.collapsedIds.clear();
-                } else {
-                  void foldDeep(Map<String, dynamic> n, int d) {
-                    if (d >= 1 && ((n['children'] as List?) ?? []).isNotEmpty) {
-                      widget.collapsedIds.add('${n['id']}');
-                    }
-                    for (final c in ((n['children'] as List?)?.cast<Map<String, dynamic>>() ?? [])) {
-                      foldDeep(c, d + 1);
-                    }
-                  }
-                  foldDeep(widget.root, 0);
-                }
-              });
-              widget.onSaveCollapseState();
-            },
-            icon: const Icon(Icons.unfold_less, size: 17),
-            label: Text(widget.collapsedIds.isNotEmpty ? '全部展开' : '只看主干', style: const TextStyle(fontSize: 12.5)),
-          ),
-          TextButton.icon(
-            onPressed: _toggleOrientation,
-            icon: const Icon(Icons.screen_rotation, size: 16),
-            label: Text(_isLandscape ? '切回竖屏' : '切换横屏', style: const TextStyle(fontSize: 12.5)),
-          ),
-        ],
-      ),
-      body: InteractiveViewer(
-        constrained: false,
-        boundaryMargin: const EdgeInsets.all(800),
-        minScale: 0.1,
-        maxScale: 3.0,
-        child: Padding(
-          padding: const EdgeInsets.all(40),
-          child: XMindBranchNodeWidget(
-            node: widget.root,
-            depth: 0,
-            branchIdx: 0,
-            collapsedIds: widget.collapsedIds,
-            interactive: true,
-            onToggleCollapse: (id) {
-              setState(() {
-                if (widget.collapsedIds.contains(id)) {
-                  widget.collapsedIds.remove(id);
-                } else {
-                  widget.collapsedIds.add(id);
-                }
-              });
-              widget.onSaveCollapseState();
-            },
-            onTapNode: _onNodeAction,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ==================== Tab 4: 规划页（未全屏时自动缩小全景预览 + 点击直接进入全屏 + 状态持久化） ====================
 class PlanPage extends StatefulWidget {
   final Database db;
   const PlanPage({super.key, required this.db});
@@ -1803,7 +1368,6 @@ class _PlanPageState extends State<PlanPage> {
     _restorePlanUiState();
   }
 
-  /// 恢复「规划」页上次保存的导图节点折叠状态
   Future<void> _restorePlanUiState() async {
     final raw = await AppDatabase.getUiState(widget.db, 'plan_collapsed_nodes');
     if (raw != null && raw.isNotEmpty) {
@@ -2054,6 +1618,17 @@ class _PlanPageState extends State<PlanPage> {
                             },
                             child: const Text('收起/展开', style: TextStyle(fontSize: 11.5)),
                           ),
+                          const SizedBox(width: 4),
+                          FilledButton.tonalIcon(
+                            style: FilledButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              minimumSize: Size.zero,
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                            onPressed: () => _openFullscreen(mmId, root),
+                            icon: const Icon(Icons.screen_rotation, size: 13),
+                            label: const Text('全屏横屏', style: TextStyle(fontSize: 11.5)),
+                          ),
                           InkWell(
                             onTap: () => _confirmDeleteMindmap(mmId, '${root['text']}'),
                             child: const Padding(
@@ -2071,8 +1646,6 @@ class _PlanPageState extends State<PlanPage> {
                         ),
                       ),
                       const Divider(height: 1),
-                      // 未全屏前：通过 FittedBox 将整张思维导图（含字体和连接线）等比例缩小至一屏完整展示全景；
-                      // 点击一下导图立即进入全屏！
                       GestureDetector(
                         behavior: HitTestBehavior.opaque,
                         onTap: () => _openFullscreen(mmId, root),
