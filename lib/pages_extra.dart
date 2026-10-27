@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -10,6 +11,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
+import 'main.dart' show AppDatabase;
 
 class SequenceParser {
   static List<({int seq, String text})> parse(String raw, int currentMaxSeq) {
@@ -218,8 +220,34 @@ class FamilyPage extends StatefulWidget {
 
 class _FamilyPageState extends State<FamilyPage> {
   final Set<int> _expandedMods = {};
+  bool _uiLoaded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _restoreFamilyUiState();
+  }
+
+  /// 恢复「家庭」页上次展开/折叠的大标题状态
+  Future<void> _restoreFamilyUiState() async {
+    final raw = await AppDatabase.getUiState(widget.db, 'family_expanded_mods');
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final list = (jsonDecode(raw) as List).map((e) => e as int);
+        _expandedMods
+          ..clear()
+          ..addAll(list);
+      } catch (_) {}
+    }
+    if (mounted) setState(() => _uiLoaded = true);
+  }
+
+  Future<void> _saveFamilyUiState() async {
+    await AppDatabase.setUiState(widget.db, 'family_expanded_mods', jsonEncode(_expandedMods.toList()));
+  }
 
   Future<List<Map<String, dynamic>>> _loadMods() async {
+    if (!_uiLoaded) await _restoreFamilyUiState();
     return widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
   }
 
@@ -305,7 +333,10 @@ class _FamilyPageState extends State<FamilyPage> {
                       if (hasSub)
                         GestureDetector(
                           behavior: HitTestBehavior.opaque,
-                          onTap: () => setState(() => isExpanded ? _expandedMods.remove(id) : _expandedMods.add(id)),
+                          onTap: () {
+                            setState(() => isExpanded ? _expandedMods.remove(id) : _expandedMods.add(id));
+                            _saveFamilyUiState();
+                          },
                           child: Padding(
                             padding: const EdgeInsets.only(right: 4, top: 2, bottom: 2),
                             child: Icon(isExpanded ? Icons.expand_more : Icons.chevron_right, size: 20, color: const Color(0xFF4F46E5)),
@@ -328,7 +359,10 @@ class _FamilyPageState extends State<FamilyPage> {
                             if (hasSub) ...[
                               const SizedBox(width: 6),
                               GestureDetector(
-                                onTap: () => setState(() => isExpanded ? _expandedMods.remove(id) : _expandedMods.add(id)),
+                                onTap: () {
+                                  setState(() => isExpanded ? _expandedMods.remove(id) : _expandedMods.add(id));
+                                  _saveFamilyUiState();
+                                },
                                 child: Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
                                   decoration: BoxDecoration(
@@ -407,7 +441,9 @@ class _FamilyPageState extends State<FamilyPage> {
     for (final did in toDel) {
       await widget.db.delete('module_entries', where: 'module_id = ?', whereArgs: [did]);
       await widget.db.delete('modules', where: 'id = ?', whereArgs: [did]);
+      _expandedMods.remove(did);
     }
+    await _saveFamilyUiState();
     setState(() {});
   }
 
@@ -445,7 +481,10 @@ class _FamilyPageState extends State<FamilyPage> {
                   'sort_order': siblings.length,
                   'created_at': DateTime.now().toIso8601String(),
                 });
-                if (parentId != null) _expandedMods.add(parentId);
+                if (parentId != null) {
+                  _expandedMods.add(parentId);
+                  await _saveFamilyUiState();
+                }
               }
               if (mounted) Navigator.pop(ctx);
               setState(() {});
@@ -1075,9 +1114,9 @@ class _SearchPageState extends State<SearchPage> {
     final appDir = await getApplicationDocumentsDirectory();
     final data = {
       'app': 'daily_tracker',
-      'version': '4.0.0',
+      'version': '5.0.0',
       'data': {
-        for (final t in ['status_items', 'status_records', 'status_images', 'schedule_items', 'schedule_records', 'modules', 'module_entries', 'module_groups', 'mindmaps'])
+        for (final t in ['status_items', 'status_records', 'status_images', 'schedule_items', 'schedule_records', 'modules', 'module_entries', 'module_groups', 'mindmaps', 'ui_states'])
           t: await widget.db.query(t),
       },
     };
@@ -1117,190 +1156,244 @@ class _SearchPageState extends State<SearchPage> {
     final tables = bj['data'] as Map<String, dynamic>;
     for (final e in tables.entries) {
       for (final r in (e.value as List)) {
-        await widget.db.insert(e.key, Map<String, Object?>.from(r as Map), conflictAlgorithm: ConflictAlgorithm.replace);
+        try {
+          await widget.db.insert(e.key, Map<String, Object?>.from(r as Map), conflictAlgorithm: ConflictAlgorithm.replace);
+        } catch (_) {}
       }
     }
     if (mounted) { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('导入恢复成功！'))); setState(() {}); }
   }
 }
 
-// ==================== 二维连接线思维导图绘制器（支持从左向右树形连接线 + 折叠） ====================
-class _BranchLinePainter extends CustomPainter {
-  final int childCount;
-  final Color color;
-  _BranchLinePainter({required this.childCount, required this.color});
+// ==================== XMind 风格精准坐标树形布局与直角圆弧连接线绘制引擎 ====================
+class _XMindSubtreeLayout extends StatefulWidget {
+  final Widget parentWidget;
+  final List<Widget> childWidgets;
+  final Color lineColor;
+  final double hGap;
+  final double vGap;
+
+  const _XMindSubtreeLayout({
+    required this.parentWidget,
+    required this.childWidgets,
+    required this.lineColor,
+    this.hGap = 26.0,
+    this.vGap = 6.0,
+  });
 
   @override
-  void paint(Canvas canvas, Size size) {
-    final p = Paint()
-      ..color = color
-      ..strokeWidth = 1.8
-      ..style = PaintingStyle.stroke;
-    final midY = size.height / 2;
-    canvas.drawLine(Offset(0, midY), Offset(size.width, midY), p);
+  State<_XMindSubtreeLayout> createState() => _XMindSubtreeLayoutState();
+}
+
+class _XMindSubtreeLayoutState extends State<_XMindSubtreeLayout> {
+  final _ConnectorLayoutInfo _info = _ConnectorLayoutInfo();
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      painter: _XMindConnectorPainter(info: _info, color: widget.lineColor),
+      child: CustomMultiChildLayout(
+        delegate: _XMindSubtreeDelegate(
+          childCount: widget.childWidgets.length,
+          hGap: widget.hGap,
+          vGap: widget.vGap,
+          info: _info,
+        ),
+        children: [
+          LayoutId(id: 'p', child: widget.parentWidget),
+          for (int i = 0; i < widget.childWidgets.length; i++)
+            LayoutId(id: 'c_$i', child: widget.childWidgets[i]),
+        ],
+      ),
+    );
+  }
+}
+
+class _ConnectorLayoutInfo extends ChangeNotifier {
+  Offset parentRight = Offset.zero;
+  List<Offset> childLefts = [];
+
+  void update(Offset pr, List<Offset> cls) {
+    parentRight = pr;
+    childLefts = cls;
+  }
+}
+
+class _XMindSubtreeDelegate extends MultiChildLayoutDelegate {
+  final int childCount;
+  final double hGap;
+  final double vGap;
+  final _ConnectorLayoutInfo info;
+
+  _XMindSubtreeDelegate({
+    required this.childCount,
+    required this.hGap,
+    required this.vGap,
+    required this.info,
+  });
+
+  @override
+  Size getSize(BoxConstraints constraints) {
+    return Size(constraints.maxWidth, constraints.maxHeight);
   }
 
   @override
-  bool shouldRepaint(covariant _BranchLinePainter oldDelegate) => false;
+  void performLayout(Size size) {
+    // 自定义测量：由于 CustomMultiChildLayout 默认使用传入 size，我们在外层通过 Intrinsic 配合测量
+  }
+
+  @override
+  bool shouldRelayout(covariant _XMindSubtreeDelegate oldDelegate) => true;
 }
 
-class MindmapGraphView extends StatelessWidget {
-  final Map<String, dynamic> root;
+/// 采用 RenderBox 树精确测量每个子分支的高度与中心点，绘制永不出头的标准 XMind 括号连接线
+class XMindBranchNodeWidget extends StatelessWidget {
+  final Map<String, dynamic> node;
+  final int depth;
+  final int branchIdx;
   final Set<String> collapsedIds;
-  final void Function(String nodeId) onToggleCollapse;
-  final void Function(Map<String, dynamic> node, int depth) onTapNode;
+  final bool interactive;
+  final void Function(String nodeId)? onToggleCollapse;
+  final void Function(Map<String, dynamic> node, int depth)? onTapNode;
 
-  const MindmapGraphView({
+  const XMindBranchNodeWidget({
     super.key,
-    required this.root,
+    required this.node,
+    required this.depth,
+    required this.branchIdx,
     required this.collapsedIds,
-    required this.onToggleCollapse,
-    required this.onTapNode,
+    required this.interactive,
+    this.onToggleCollapse,
+    this.onTapNode,
   });
 
-  static const List<Color> _palette = [
-    Color(0xFF4F46E5),
-    Color(0xFF0EA5E9),
-    Color(0xFF10B981),
-    Color(0xFFF59E0B),
-    Color(0xFFEC4899),
-    Color(0xFF8B5CF6),
+  // 复刻图2 XMind 经典珊瑚红/暖橘色系
+  static const List<Color> _branchColors = [
+    Color(0xFFF0564A), // 珊瑚红
+    Color(0xFFED8936), // 暖橙色
+    Color(0xFFDF5A49), // 朱砂红
+    Color(0xFF3B82F6), // 经典蓝
+    Color(0xFF10B981), // 翡翠绿
+    Color(0xFF8B5CF6), // 紫罗兰
   ];
 
   @override
   Widget build(BuildContext context) {
-    return _buildSubtree(root, 0, 0);
-  }
-
-  Widget _buildSubtree(Map<String, dynamic> node, int depth, int branchIndex) {
     final id = '${node['id']}';
     final children = (node['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
     final isCollapsed = collapsedIds.contains(id);
     final hasChildren = children.isNotEmpty;
-    final accent = _palette[branchIndex % _palette.length];
+    final color = _branchColors[branchIdx % _branchColors.length];
 
-    final nodeCard = _buildNodeCard(node, depth, accent, hasChildren, isCollapsed, children.length);
+    final card = _buildXMindCard(node, depth, color, hasChildren, isCollapsed, children.length);
 
     if (!hasChildren || isCollapsed) {
       return Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        child: nodeCard,
+        padding: const EdgeInsets.symmetric(vertical: 3.5),
+        child: card,
       );
     }
 
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: IntrinsicHeight(
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            nodeCard,
-            // 父节点右侧引出水平连接线
-            SizedBox(
-              width: 18,
-              height: 20,
-              child: CustomPaint(painter: _BranchLinePainter(childCount: children.length, color: accent.withOpacity(0.55))),
-            ),
-            // 子节点列（左侧带垂直汇流树枝线）
-            Container(
-              decoration: children.length > 1
-                  ? BoxDecoration(
-                      border: Border(left: BorderSide(color: accent.withOpacity(0.45), width: 2)),
-                    )
-                  : null,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: List.generate(children.length, (idx) {
-                  final subBranchIdx = depth == 0 ? idx : branchIndex;
-                  final subColor = _palette[subBranchIdx % _palette.length];
-                  return Row(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      Container(width: 14, height: 1.8, color: subColor.withOpacity(0.55)),
-                      _buildSubtree(children[idx], depth + 1, subBranchIdx),
-                    ],
-                  );
-                }),
-              ),
-            ),
-          ],
-        ),
+      padding: const EdgeInsets.symmetric(vertical: 3.5),
+      child: _XMindTreeRow(
+        parent: card,
+        lineColor: color,
+        children: List.generate(children.length, (i) {
+          final nextBranchIdx = depth == 0 ? i : branchIdx;
+          return XMindBranchNodeWidget(
+            node: children[i],
+            depth: depth + 1,
+            branchIdx: nextBranchIdx,
+            collapsedIds: collapsedIds,
+            interactive: interactive,
+            onToggleCollapse: onToggleCollapse,
+            onTapNode: onTapNode,
+          );
+        }),
       ),
     );
   }
 
-  Widget _buildNodeCard(
-    Map<String, dynamic> node,
-    int depth,
-    Color accent,
+  Widget _buildXMindCard(
+    Map<String, dynamic> n,
+    int d,
+    Color branchColor,
     bool hasChildren,
     bool isCollapsed,
     int childCount,
   ) {
-    final id = '${node['id']}';
+    final id = '${n['id']}';
     Color bg;
     Color fg;
     Color borderCol;
-    if (depth == 0) {
-      bg = const Color(0xFF4F46E5);
+
+    if (d == 0) {
+      // 根节点：图2深藏青黑底白字
+      bg = const Color(0xFF111827);
       fg = Colors.white;
-      borderCol = const Color(0xFF4F46E5);
-    } else if (depth == 1) {
-      bg = accent.withOpacity(0.12);
-      fg = const Color(0xFF0F172A);
-      borderCol = accent.withOpacity(0.6);
+      borderCol = const Color(0xFF111827);
+    } else if (d == 1) {
+      // 一级分支：图2珊瑚红/暖橙实心底白字
+      bg = branchColor;
+      fg = Colors.white;
+      borderCol = branchColor;
     } else {
-      bg = Colors.white;
-      fg = const Color(0xFF1E293B);
-      borderCol = accent.withOpacity(0.35);
+      // 二级及以下：图2浅暖粉底色 + 细边框 + 深色文字
+      bg = branchColor.withOpacity(0.11);
+      fg = const Color(0xFF1F2937);
+      borderCol = branchColor.withOpacity(0.45);
     }
+
+    final pill = Container(
+      constraints: BoxConstraints(minWidth: 44, maxWidth: d == 0 ? 160 : (d == 1 ? 180 : 240)),
+      padding: EdgeInsets.symmetric(
+        horizontal: d == 0 ? 14 : (d == 1 ? 11 : 9),
+        vertical: d == 0 ? 8 : (d == 1 ? 6 : 4.5),
+      ),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(d <= 1 ? 7 : 5),
+        border: Border.all(color: borderCol, width: 1.1),
+      ),
+      child: Text(
+        '${n['text']}',
+        style: TextStyle(
+          fontSize: d == 0 ? 14 : (d == 1 ? 12.5 : 11.5),
+          fontWeight: d <= 1 ? FontWeight.bold : FontWeight.w500,
+          color: fg,
+          height: 1.25,
+        ),
+      ),
+    );
 
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        GestureDetector(
-          onTap: () => onTapNode(node, depth),
-          child: Container(
-            constraints: BoxConstraints(minWidth: 56, maxWidth: depth == 0 ? 180 : 210),
-            padding: EdgeInsets.symmetric(horizontal: depth == 0 ? 12 : 10, vertical: depth == 0 ? 8 : 6),
-            decoration: BoxDecoration(
-              color: bg,
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: borderCol, width: depth <= 1 ? 1.5 : 1.0),
-              boxShadow: const [BoxShadow(color: Color(0x0A000000), blurRadius: 3, offset: Offset(0, 1))],
-            ),
-            child: Text(
-              '${node['text']}',
-              style: TextStyle(
-                fontSize: depth == 0 ? 14 : (depth == 1 ? 13 : 12.5),
-                fontWeight: depth <= 1 ? FontWeight.bold : FontWeight.w500,
-                color: fg,
-                height: 1.3,
-              ),
-            ),
-          ),
-        ),
-        if (hasChildren)
+        interactive && onTapNode != null
+            ? GestureDetector(onTap: () => onTapNode!(n, d), child: pill)
+            : pill,
+        if (hasChildren && (isCollapsed || interactive))
           GestureDetector(
-            onTap: () => onToggleCollapse(id),
+            onTap: interactive && onToggleCollapse != null ? () => onToggleCollapse!(id) : null,
             child: Container(
               margin: const EdgeInsets.only(left: 3),
-              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+              width: isCollapsed ? null : 16,
+              height: 16,
+              padding: EdgeInsets.symmetric(horizontal: isCollapsed ? 4.5 : 0),
               decoration: BoxDecoration(
-                color: isCollapsed ? accent : Colors.white,
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: accent, width: 1.2),
+                color: isCollapsed ? branchColor : Colors.white,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: branchColor, width: 1.1),
               ),
+              alignment: Alignment.center,
               child: Text(
-                isCollapsed ? '+$childCount' : '−',
+                isCollapsed ? '$childCount' : '−',
                 style: TextStyle(
-                  fontSize: 10.5,
+                  fontSize: 9.5,
                   fontWeight: FontWeight.bold,
-                  color: isCollapsed ? Colors.white : accent,
+                  color: isCollapsed ? Colors.white : branchColor,
+                  height: 1.0,
                 ),
               ),
             ),
@@ -1310,12 +1403,165 @@ class MindmapGraphView extends StatelessWidget {
   }
 }
 
-// ==================== 全屏横屏思维导图画布页 ====================
+/// 自定义测量行：实时获取父节点右侧中心点与每个子节点左侧中心点，画出图2样式的精准直角圆弧连接线
+class _XMindTreeRow extends StatefulWidget {
+  final Widget parent;
+  final List<Widget> children;
+  final Color lineColor;
+
+  const _XMindTreeRow({
+    required this.parent,
+    required this.children,
+    required this.lineColor,
+  });
+
+  @override
+  State<_XMindTreeRow> createState() => _XMindTreeRowState();
+}
+
+class _XMindTreeRowState extends State<_XMindTreeRow> {
+  final GlobalKey _rowKey = GlobalKey();
+  final GlobalKey _parentKey = GlobalKey();
+  late List<GlobalKey> _childKeys;
+  Offset? _parentAnchor;
+  List<Offset> _childAnchors = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _initKeys();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _measure());
+  }
+
+  @override
+  void didUpdateWidget(covariant _XMindTreeRow oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _initKeys();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _measure());
+  }
+
+  void _initKeys() {
+    _childKeys = List.generate(widget.children.length, (_) => GlobalKey());
+  }
+
+  void _measure() {
+    if (!mounted) return;
+    final rowBox = _rowKey.currentContext?.findRenderObject() as RenderBox?;
+    final pBox = _parentKey.currentContext?.findRenderObject() as RenderBox?;
+    if (rowBox == null || pBox == null || !rowBox.hasSize || !pBox.hasSize) return;
+
+    final pPos = pBox.localToGlobal(Offset(pBox.size.width, pBox.size.height / 2), ancestor: rowBox);
+    final cAnchors = <Offset>[];
+    for (final k in _childKeys) {
+      final cBox = k.currentContext?.findRenderObject() as RenderBox?;
+      if (cBox != null && cBox.hasSize) {
+        cAnchors.add(cBox.localToGlobal(Offset(0, cBox.size.height / 2), ancestor: rowBox));
+      }
+    }
+    if (cAnchors.isNotEmpty) {
+      setState(() {
+        _parentAnchor = pPos;
+        _childAnchors = cAnchors;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      key: _rowKey,
+      painter: _XMindBracketPainter(
+        parentRight: _parentAnchor,
+        childLefts: _childAnchors,
+        color: widget.lineColor,
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Container(key: _parentKey, child: widget.parent),
+          const SizedBox(width: 24),
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: List.generate(widget.children.length, (i) {
+              return Container(
+                key: _childKeys[i],
+                child: widget.children[i],
+              );
+            }),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _XMindBracketPainter extends CustomPainter {
+  final Offset? parentRight;
+  final List<Offset> childLefts;
+  final Color color;
+
+  _XMindBracketPainter({
+    required this.parentRight,
+    required this.childLefts,
+    required this.color,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (parentRight == null || childLefts.isEmpty) return;
+    final paint = Paint()
+      ..color = color.withOpacity(0.75)
+      ..strokeWidth = 1.4
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+
+    final pr = parentRight!;
+    final midX = pr.dx + (childLefts.first.dx - pr.dx) * 0.45;
+
+    // 1. 从父节点右侧中心引出水平主干线到 midX
+    canvas.drawLine(pr, Offset(midX, pr.dy), paint);
+
+    // 2. 垂直主干线：严格从第一个子节点的 Y 坐标画到最后一个子节点的 Y 坐标（绝不上下出头！）
+    final minY = math.min(pr.dy, childLefts.first.dy);
+    final maxY = math.max(pr.dy, childLefts.last.dy);
+    if ((maxY - minY).abs() > 0.5) {
+      canvas.drawLine(Offset(midX, minY), Offset(midX, maxY), paint);
+    }
+
+    // 3. 从垂直线向每个子节点左侧中心引出水平支线
+    for (final cl in childLefts) {
+      canvas.drawLine(Offset(midX, cl.dy), cl, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _XMindBracketPainter oldDelegate) {
+    return oldDelegate.parentRight != parentRight ||
+        oldDelegate.childLefts.length != childLefts.length ||
+        oldDelegate.color != color;
+  }
+}
+
+class _XMindConnectorPainter extends CustomPainter {
+  final _ConnectorLayoutInfo info;
+  final Color color;
+  _XMindConnectorPainter({required this.info, required this.color}) : super(repaint: info);
+  @override
+  void paint(Canvas canvas, Size size) {}
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+// ==================== 全屏思维导图画布页 ====================
 class FullscreenMindmapPage extends StatefulWidget {
   final int mmId;
   final Map<String, dynamic> root;
   final Set<String> collapsedIds;
   final Future<void> Function(Map<String, dynamic> updatedRoot) onSave;
+  final Future<void> Function() onSaveCollapseState;
 
   const FullscreenMindmapPage({
     super.key,
@@ -1323,6 +1569,7 @@ class FullscreenMindmapPage extends StatefulWidget {
     required this.root,
     required this.collapsedIds,
     required this.onSave,
+    required this.onSaveCollapseState,
   });
 
   @override
@@ -1331,24 +1578,11 @@ class FullscreenMindmapPage extends StatefulWidget {
 
 class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
   final _uuid = const Uuid();
-  bool _isLandscape = true;
-
-  @override
-  void initState() {
-    super.initState();
-    // 进入全屏画布默认切换为横屏，视野更开阔
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]);
-  }
+  bool _isLandscape = false;
 
   @override
   void dispose() {
-    // 退出时自动恢复竖屏
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.portraitUp,
-    ]);
+    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     super.dispose();
   }
 
@@ -1376,17 +1610,37 @@ class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
   }
 
   void _onNodeAction(Map<String, dynamic> node, int depth) {
+    final id = '${node['id']}';
+    final hasChildren = ((node['children'] as List?) ?? []).isNotEmpty;
+    final isCol = widget.collapsedIds.contains(id);
+
     showModalBottomSheet(
       context: context,
       builder: (ctx) => SafeArea(
         child: Wrap(
           children: [
             ListTile(
-              leading: const Icon(Icons.account_tree, color: Color(0xFF4F46E5)),
+              leading: const Icon(Icons.account_tree, color: Color(0xFFF0564A)),
               title: Text('${node['text']}', style: const TextStyle(fontWeight: FontWeight.bold)),
               subtitle: const Text('选择对该节点的操作'),
             ),
             const Divider(height: 1),
+            if (hasChildren)
+              ListTile(
+                leading: Icon(isCol ? Icons.unfold_more : Icons.unfold_less, color: const Color(0xFF4F46E5)),
+                title: Text(isCol ? '展开该节点分支' : '折叠收起该节点分支'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  setState(() {
+                    if (isCol) {
+                      widget.collapsedIds.remove(id);
+                    } else {
+                      widget.collapsedIds.add(id);
+                    }
+                  });
+                  widget.onSaveCollapseState();
+                },
+              ),
             ListTile(
               leading: const Icon(Icons.add_circle_outline, color: Colors.indigo),
               title: const Text('添加子节点'),
@@ -1404,7 +1658,8 @@ class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
                         onPressed: () async {
                           if (ctrl.text.trim().isEmpty) return;
                           (node['children'] as List).add({'id': _uuid.v4(), 'text': ctrl.text.trim(), 'children': []});
-                          widget.collapsedIds.remove('${node['id']}');
+                          widget.collapsedIds.remove(id);
+                          await widget.onSaveCollapseState();
                           if (mounted) Navigator.pop(dCtx);
                           await widget.onSave(widget.root);
                           setState(() {});
@@ -1450,7 +1705,7 @@ class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
                 title: const Text('删除该节点及下属分支', style: TextStyle(color: Colors.redAccent)),
                 onTap: () async {
                   Navigator.pop(ctx);
-                  _rm(widget.root, '${node['id']}');
+                  _rm(widget.root, id);
                   await widget.onSave(widget.root);
                   setState(() {});
                 },
@@ -1464,10 +1719,10 @@ class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF8FAFC),
+      backgroundColor: Colors.white,
       appBar: AppBar(
         toolbarHeight: 44,
-        title: Text('🧠 ${widget.root['text']}（双指缩放 / 轻点节点编辑）', style: const TextStyle(fontSize: 14.5, fontWeight: FontWeight.bold)),
+        title: Text('${widget.root['text']}', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
         actions: [
           TextButton.icon(
             onPressed: () {
@@ -1475,9 +1730,10 @@ class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
                 if (widget.collapsedIds.isNotEmpty) {
                   widget.collapsedIds.clear();
                 } else {
-                  // 一键收起到只显示前 2 层，理清主干
                   void foldDeep(Map<String, dynamic> n, int d) {
-                    if (d >= 1) widget.collapsedIds.add('${n['id']}');
+                    if (d >= 1 && ((n['children'] as List?) ?? []).isNotEmpty) {
+                      widget.collapsedIds.add('${n['id']}');
+                    }
                     for (final c in ((n['children'] as List?)?.cast<Map<String, dynamic>>() ?? [])) {
                       foldDeep(c, d + 1);
                     }
@@ -1485,6 +1741,7 @@ class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
                   foldDeep(widget.root, 0);
                 }
               });
+              widget.onSaveCollapseState();
             },
             icon: const Icon(Icons.unfold_less, size: 17),
             label: Text(widget.collapsedIds.isNotEmpty ? '全部展开' : '只看主干', style: const TextStyle(fontSize: 12.5)),
@@ -1498,21 +1755,27 @@ class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
       ),
       body: InteractiveViewer(
         constrained: false,
-        boundaryMargin: const EdgeInsets.all(400),
-        minScale: 0.25,
-        maxScale: 2.5,
+        boundaryMargin: const EdgeInsets.all(800),
+        minScale: 0.1,
+        maxScale: 3.0,
         child: Padding(
-          padding: const EdgeInsets.all(32),
-          child: MindmapGraphView(
-            root: widget.root,
+          padding: const EdgeInsets.all(40),
+          child: XMindBranchNodeWidget(
+            node: widget.root,
+            depth: 0,
+            branchIdx: 0,
             collapsedIds: widget.collapsedIds,
-            onToggleCollapse: (id) => setState(() {
-              if (widget.collapsedIds.contains(id)) {
-                widget.collapsedIds.remove(id);
-              } else {
-                widget.collapsedIds.add(id);
-              }
-            }),
+            interactive: true,
+            onToggleCollapse: (id) {
+              setState(() {
+                if (widget.collapsedIds.contains(id)) {
+                  widget.collapsedIds.remove(id);
+                } else {
+                  widget.collapsedIds.add(id);
+                }
+              });
+              widget.onSaveCollapseState();
+            },
             onTapNode: _onNodeAction,
           ),
         ),
@@ -1521,7 +1784,7 @@ class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
   }
 }
 
-// ==================== Tab 4: 规划页（支持二维连接线导图 + 一键全屏横屏 + 导入 XMind） ====================
+// ==================== Tab 4: 规划页（未全屏时自动缩小全景预览 + 点击直接进入全屏 + 状态持久化） ====================
 class PlanPage extends StatefulWidget {
   final Database db;
   const PlanPage({super.key, required this.db});
@@ -1532,6 +1795,31 @@ class PlanPage extends StatefulWidget {
 class _PlanPageState extends State<PlanPage> {
   final _uuid = const Uuid();
   final Set<String> _col = {};
+  bool _uiLoaded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _restorePlanUiState();
+  }
+
+  /// 恢复「规划」页上次保存的导图节点折叠状态
+  Future<void> _restorePlanUiState() async {
+    final raw = await AppDatabase.getUiState(widget.db, 'plan_collapsed_nodes');
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final list = (jsonDecode(raw) as List).map((e) => '$e');
+        _col
+          ..clear()
+          ..addAll(list);
+      } catch (_) {}
+    }
+    if (mounted) setState(() => _uiLoaded = true);
+  }
+
+  Future<void> _savePlanUiState() async {
+    await AppDatabase.setUiState(widget.db, 'plan_collapsed_nodes', jsonEncode(_col.toList()));
+  }
 
   Map<String, dynamic> _convertXMindJsonTopic(Map<String, dynamic> topic) {
     final title = (topic['title'] ?? '未命名节点').toString().trim();
@@ -1645,6 +1933,21 @@ class _PlanPageState extends State<PlanPage> {
     }
   }
 
+  void _openFullscreen(int mmId, Map<String, dynamic> root) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => FullscreenMindmapPage(
+          mmId: mmId,
+          root: root,
+          collapsedIds: _col,
+          onSave: (updated) => _save(mmId, updated),
+          onSaveCollapseState: _savePlanUiState,
+        ),
+      ),
+    ).then((_) => setState(() {}));
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1665,7 +1968,10 @@ class _PlanPageState extends State<PlanPage> {
         ],
       ),
       body: FutureBuilder<List<Map<String, dynamic>>>(
-        future: widget.db.query('mindmaps', orderBy: 'id DESC'),
+        future: () async {
+          if (!_uiLoaded) await _restorePlanUiState();
+          return widget.db.query('mindmaps', orderBy: 'id DESC');
+        }(),
         builder: (_, snap) {
           final list = snap.data ?? [];
           if (list.isEmpty) {
@@ -1697,6 +2003,7 @@ class _PlanPageState extends State<PlanPage> {
 
               return Card(
                 margin: const EdgeInsets.only(bottom: 14),
+                color: Colors.white,
                 elevation: 0,
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(14),
@@ -1707,15 +2014,14 @@ class _PlanPageState extends State<PlanPage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // 顶部栏：标题 + 只看主干/展开 + 全屏横屏按钮 + 删除
                       Row(
                         children: [
-                          const Icon(Icons.account_tree, size: 16, color: Color(0xFF4F46E5)),
+                          const Icon(Icons.account_tree, size: 16, color: Color(0xFFF0564A)),
                           const SizedBox(width: 6),
                           Expanded(
                             child: Text(
                               '${root['text']}',
-                              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Color(0xFF1E293B)),
+                              style: const TextStyle(fontSize: 14.5, fontWeight: FontWeight.bold, color: Color(0xFF1E293B)),
                               overflow: TextOverflow.ellipsis,
                             ),
                           ),
@@ -1729,7 +2035,9 @@ class _PlanPageState extends State<PlanPage> {
                               setState(() {
                                 final subIds = <String>[];
                                 void collectDeep(Map<String, dynamic> n, int d) {
-                                  if (d >= 1) subIds.add('${n['id']}');
+                                  if (d >= 1 && ((n['children'] as List?) ?? []).isNotEmpty) {
+                                    subIds.add('${n['id']}');
+                                  }
                                   for (final c in ((n['children'] as List?)?.cast<Map<String, dynamic>>() ?? [])) {
                                     collectDeep(c, d + 1);
                                   }
@@ -1742,31 +2050,9 @@ class _PlanPageState extends State<PlanPage> {
                                   _col.addAll(subIds);
                                 }
                               });
+                              _savePlanUiState();
                             },
                             child: const Text('收起/展开', style: TextStyle(fontSize: 11.5)),
-                          ),
-                          const SizedBox(width: 4),
-                          FilledButton.tonalIcon(
-                            style: FilledButton.styleFrom(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                              minimumSize: Size.zero,
-                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                            ),
-                            onPressed: () {
-                              Navigator.push(
-                                context,
-                                MaterialPageRoute(
-                                  builder: (_) => FullscreenMindmapPage(
-                                    mmId: mmId,
-                                    root: root,
-                                    collapsedIds: _col,
-                                    onSave: (updated) => _save(mmId, updated),
-                                  ),
-                                ),
-                              ).then((_) => setState(() {}));
-                            },
-                            icon: const Icon(Icons.screen_rotation, size: 13),
-                            label: const Text('全屏横屏', style: TextStyle(fontSize: 11.5)),
                           ),
                           InkWell(
                             onTap: () => _confirmDeleteMindmap(mmId, '${root['text']}'),
@@ -1778,28 +2064,42 @@ class _PlanPageState extends State<PlanPage> {
                         ],
                       ),
                       const Padding(
-                        padding: EdgeInsets.only(top: 2, bottom: 4),
+                        padding: EdgeInsets.only(top: 2, bottom: 6),
                         child: Text(
-                          '💡 左右滑动查看树状连接脉络 · 轻点任意节点可增删编辑 · 点击右上「全屏横屏」可双指自由缩放',
-                          style: TextStyle(fontSize: 10.5, color: Colors.grey),
+                          '💡 全景微缩预览 · 轻点下方导图任意位置即可进入全屏查看与编辑',
+                          style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ),
-                      const Divider(height: 8),
-                      // 二维树状连接线导图视图（支持横向滚动）
-                      SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
-                        child: MindmapGraphView(
-                          root: root,
-                          collapsedIds: _col,
-                          onToggleCollapse: (id) => setState(() {
-                            if (_col.contains(id)) {
-                              _col.remove(id);
-                            } else {
-                              _col.add(id);
-                            }
-                          }),
-                          onTapNode: (node, depth) => _showNodeActionSheet(mmId, root, node, depth),
+                      const Divider(height: 1),
+                      // 未全屏前：通过 FittedBox 将整张思维导图（含字体和连接线）等比例缩小至一屏完整展示全景；
+                      // 点击一下导图立即进入全屏！
+                      GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: () => _openFullscreen(mmId, root),
+                        child: Container(
+                          width: double.infinity,
+                          height: 360,
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFFAFAFA),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: IgnorePointer(
+                            child: FittedBox(
+                              fit: BoxFit.contain,
+                              alignment: Alignment.centerLeft,
+                              child: Padding(
+                                padding: const EdgeInsets.all(16),
+                                child: XMindBranchNodeWidget(
+                                  node: root,
+                                  depth: 0,
+                                  branchIdx: 0,
+                                  collapsedIds: _col,
+                                  interactive: false,
+                                ),
+                              ),
+                            ),
+                          ),
                         ),
                       ),
                     ],
@@ -1809,50 +2109,6 @@ class _PlanPageState extends State<PlanPage> {
             },
           );
         },
-      ),
-    );
-  }
-
-  void _showNodeActionSheet(int mmId, Map<String, dynamic> root, Map<String, dynamic> node, int depth) {
-    showModalBottomSheet(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            ListTile(
-              leading: const Icon(Icons.account_tree, color: Color(0xFF4F46E5)),
-              title: Text('${node['text']}', style: const TextStyle(fontWeight: FontWeight.bold)),
-              subtitle: const Text('选择对该节点的操作'),
-            ),
-            const Divider(height: 1),
-            ListTile(
-              leading: const Icon(Icons.add_circle_outline, color: Colors.indigo),
-              title: const Text('添加子节点'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _addNode(mmId, root, node);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.edit_outlined, color: Colors.blueGrey),
-              title: const Text('修改节点文字'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _editNode(mmId, root, node);
-              },
-            ),
-            if (depth > 0)
-              ListTile(
-                leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
-                title: const Text('删除该节点及下属分支', style: TextStyle(color: Colors.redAccent)),
-                onTap: () async {
-                  Navigator.pop(ctx);
-                  _rm(root, '${node['id']}');
-                  await _save(mmId, root);
-                },
-              ),
-          ],
-        ),
       ),
     );
   }
@@ -1878,13 +2134,6 @@ class _PlanPageState extends State<PlanPage> {
     );
   }
 
-  bool _rm(Map<String, dynamic> p, String tid) {
-    final ch = (p['children'] as List).cast<Map<String, dynamic>>();
-    final idx = ch.indexWhere((c) => c['id'] == tid);
-    if (idx != -1) { ch.removeAt(idx); return true; }
-    return ch.any((c) => _rm(c, tid));
-  }
-
   Future<void> _save(int mmId, Map<String, dynamic> root) async {
     await widget.db.update('mindmaps', {'title': root['text'], 'root_json': jsonEncode(root), 'updated_at': DateTime.now().toIso8601String()}, where: 'id = ?', whereArgs: [mmId]);
     setState(() {});
@@ -1908,53 +2157,6 @@ class _PlanPageState extends State<PlanPage> {
               setState(() {});
             },
             child: const Text('创建'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _addNode(int mmId, Map<String, dynamic> root, Map<String, dynamic> pNode) {
-    final ctrl = TextEditingController();
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('添加子节点'),
-        content: TextField(controller: ctrl, autofocus: true, minLines: 1, maxLines: 3),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-          FilledButton(
-            onPressed: () async {
-              if (ctrl.text.trim().isEmpty) return;
-              (pNode['children'] as List).add({'id': _uuid.v4(), 'text': ctrl.text.trim(), 'children': []});
-              _col.remove('${pNode['id']}');
-              if (mounted) Navigator.pop(ctx);
-              await _save(mmId, root);
-            },
-            child: const Text('添加'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _editNode(int mmId, Map<String, dynamic> root, Map<String, dynamic> node) {
-    final ctrl = TextEditingController(text: '${node['text']}');
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('修改节点内容'),
-        content: TextField(controller: ctrl, autofocus: true, minLines: 1, maxLines: 4),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-          FilledButton(
-            onPressed: () async {
-              if (ctrl.text.trim().isEmpty) return;
-              node['text'] = ctrl.text.trim();
-              if (mounted) Navigator.pop(ctx);
-              await _save(mmId, root);
-            },
-            child: const Text('保存'),
           ),
         ],
       ),
