@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as math;
 import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -217,7 +216,8 @@ class FamilyPage extends StatefulWidget {
 }
 
 class _FamilyPageState extends State<FamilyPage> {
-  final Set<int> _collapsedMods = {};
+  // 默认为空集合，代表所有小标题默认全部处于折叠状态，点击才展开
+  final Set<int> _expandedMods = {};
 
   Future<List<Map<String, dynamic>>> _loadMods() async {
     return widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
@@ -284,8 +284,9 @@ class _FamilyPageState extends State<FamilyPage> {
       itemBuilder: (ctx, i) {
         final m = items[i];
         final id = m['id'] as int;
-        final hasSub = all.any((x) => x['parent_id'] == id);
-        final isCol = _collapsedMods.contains(id);
+        final subList = all.where((x) => x['parent_id'] == id).toList();
+        final hasSub = subList.isNotEmpty;
+        final isExpanded = _expandedMods.contains(id); // 默认 false（折叠）
 
         return Column(
           key: ValueKey('mod_$id'),
@@ -303,10 +304,11 @@ class _FamilyPageState extends State<FamilyPage> {
                     children: [
                       if (hasSub)
                         GestureDetector(
-                          onTap: () => setState(() => isCol ? _collapsedMods.remove(id) : _collapsedMods.add(id)),
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () => setState(() => isExpanded ? _expandedMods.remove(id) : _expandedMods.add(id)),
                           child: Padding(
-                            padding: const EdgeInsets.only(right: 4),
-                            child: Icon(isCol ? Icons.chevron_right : Icons.expand_more, size: 20, color: Colors.grey[700]),
+                            padding: const EdgeInsets.only(right: 4, top: 2, bottom: 2),
+                            child: Icon(isExpanded ? Icons.expand_more : Icons.chevron_right, size: 20, color: const Color(0xFF4F46E5)),
                           ),
                         )
                       else
@@ -314,9 +316,33 @@ class _FamilyPageState extends State<FamilyPage> {
                       Icon(depth == 0 ? Icons.folder_outlined : Icons.subdirectory_arrow_right, color: Colors.indigo, size: 19),
                       const SizedBox(width: 8),
                       Expanded(
-                        child: Text(
-                          '${m['title']}',
-                          style: TextStyle(fontWeight: depth == 0 ? FontWeight.bold : FontWeight.w600, fontSize: depth == 0 ? 15 : 14),
+                        child: Row(
+                          children: [
+                            Flexible(
+                              child: Text(
+                                '${m['title']}',
+                                style: TextStyle(fontWeight: depth == 0 ? FontWeight.bold : FontWeight.w600, fontSize: depth == 0 ? 15 : 14),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            if (hasSub) ...[
+                              const SizedBox(width: 6),
+                              GestureDetector(
+                                onTap: () => setState(() => isExpanded ? _expandedMods.remove(id) : _expandedMods.add(id)),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFFEEF2FF),
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: Text(
+                                    '${subList.length}',
+                                    style: const TextStyle(fontSize: 11, color: Color(0xFF4F46E5), fontWeight: FontWeight.bold),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
                       ),
                       IconButton(
@@ -349,7 +375,7 @@ class _FamilyPageState extends State<FamilyPage> {
                 ),
               ),
             ),
-            if (hasSub && !isCol) _buildModLevel(id, depth + 1, all, map),
+            if (hasSub && isExpanded) _buildModLevel(id, depth + 1, all, map),
           ],
         );
       },
@@ -419,7 +445,8 @@ class _FamilyPageState extends State<FamilyPage> {
                   'sort_order': siblings.length,
                   'created_at': DateTime.now().toIso8601String(),
                 });
-                if (parentId != null) _collapsedMods.remove(parentId);
+                // 新建子标题时自动展开该父标题以便查看
+                if (parentId != null) _expandedMods.add(parentId);
               }
               if (mounted) Navigator.pop(ctx);
               setState(() {});
@@ -1098,7 +1125,6 @@ class _SearchPageState extends State<SearchPage> {
   }
 }
 
-// ==================== Tab 4: 规划页（支持直接读取 .xmind 文件 + 美观清爽防挤压树形视图） ====================
 class PlanPage extends StatefulWidget {
   final Database db;
   const PlanPage({super.key, required this.db});
@@ -1110,7 +1136,6 @@ class _PlanPageState extends State<PlanPage> {
   final _uuid = const Uuid();
   final Set<String> _col = {};
 
-  /// 解析 XMind (Zen/2020+ 的 content.json 节点结构)
   Map<String, dynamic> _convertXMindJsonTopic(Map<String, dynamic> topic) {
     final title = (topic['title'] ?? '未命名节点').toString().trim();
     final childrenList = <Map<String, dynamic>>[];
@@ -1139,7 +1164,6 @@ class _PlanPageState extends State<PlanPage> {
     };
   }
 
-  /// 兼容旧版 XMind 8 的 content.xml 结构简易解析
   Map<String, dynamic>? _parseLegacyXMindXml(String xmlStr) {
     final matches = RegExp(r'<title[^>]*>([\s\S]*?)</title>').allMatches(xmlStr).map((m) => m.group(1)!.trim()).where((s) => s.isNotEmpty).toList();
     if (matches.isEmpty) return null;
@@ -1148,7 +1172,6 @@ class _PlanPageState extends State<PlanPage> {
     return {'id': _uuid.v4(), 'text': rootTitle, 'children': children};
   }
 
-  /// 直接选择并读取 .xmind 文件导入为思维导图
   Future<void> _importXMindFile() async {
     try {
       final res = await FilePicker.platform.pickFiles(type: FileType.any);
@@ -1160,7 +1183,6 @@ class _PlanPageState extends State<PlanPage> {
       int importedCount = 0;
       final now = DateTime.now().toIso8601String();
 
-      // 1. 优先寻找 content.json（XMind 2020 / 2022 / 2024 / 移动端通用格式）
       ArchiveFile? jsonFile;
       ArchiveFile? xmlFile;
       for (final f in archive) {
@@ -1296,7 +1318,6 @@ class _PlanPageState extends State<PlanPage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // 卡片顶部工具栏：支持一键展开/收起与删除
                       Row(
                         children: [
                           const Icon(Icons.account_tree, size: 16, color: Color(0xFF4F46E5)),
@@ -1316,7 +1337,6 @@ class _PlanPageState extends State<PlanPage> {
                             ),
                             onPressed: () {
                               setState(() {
-                                // 切换二级及以下节点的展开/收起
                                 void collectIds(Map<String, dynamic> n, int d) {
                                   if (d >= 1) _col.add('${n['id']}');
                                   for (final c in ((n['children'] as List?)?.cast<Map<String, dynamic>>() ?? [])) {
@@ -1343,7 +1363,6 @@ class _PlanPageState extends State<PlanPage> {
                         ],
                       ),
                       const Divider(height: 12),
-                      // 采用横向滚动保护 + 扁平化精致层级行，彻底杜绝深层文字竖排挤压
                       SingleChildScrollView(
                         scrollDirection: Axis.horizontal,
                         child: ConstrainedBox(
@@ -1365,14 +1384,12 @@ class _PlanPageState extends State<PlanPage> {
     );
   }
 
-  /// 清爽美观的扁平化节点渲染（不论多少层级都不会把文字挤成一竖列）
   Widget _buildFlatNodeRow(int mmId, Map<String, dynamic> root, Map<String, dynamic> node, int d) {
     final id = '${node['id']}';
     final ch = (node['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
     final col = _col.contains(id);
     final indent = d * 18.0;
 
-    // 根据层级赋予不同视觉样式
     Color bgColor;
     Color textColor;
     Color borderColor;
@@ -1399,7 +1416,6 @@ class _PlanPageState extends State<PlanPage> {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // 展开/收起按钮或层级指示符
           if (ch.isNotEmpty)
             GestureDetector(
               onTap: () => setState(() => col ? _col.remove(id) : _col.add(id)),
@@ -1431,7 +1447,6 @@ class _PlanPageState extends State<PlanPage> {
               ),
             ),
 
-          // 节点主体胶囊卡片（点击可直接编辑文字，最大宽度充裕，绝不竖排）
           GestureDetector(
             onTap: () => _editNode(mmId, root, node),
             child: Container(
@@ -1476,7 +1491,6 @@ class _PlanPageState extends State<PlanPage> {
           ),
 
           const SizedBox(width: 6),
-          // 紧凑型操作按钮（添加子节点 & 删除当前节点）
           InkWell(
             borderRadius: BorderRadius.circular(12),
             onTap: () => _addNode(mmId, root, node),
