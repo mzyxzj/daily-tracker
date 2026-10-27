@@ -26,12 +26,12 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
-      version: 3,
+      version: 4,
       onCreate: (db, v) async {
         await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE status_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, value TEXT DEFAULT "", UNIQUE(item_id, date))');
         await db.execute('CREATE TABLE status_images (id INTEGER PRIMARY KEY AUTOINCREMENT, record_id INTEGER NOT NULL, file_path TEXT NOT NULL, sort_order INTEGER DEFAULT 0)');
-        await db.execute('CREATE TABLE schedule_items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, plan_info TEXT DEFAULT "", sort_order INTEGER DEFAULT 0)');
+        await db.execute('CREATE TABLE schedule_items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, plan_info TEXT DEFAULT "", parent_id INTEGER, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE schedule_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, done INTEGER DEFAULT 0, UNIQUE(item_id, date))');
         await db.execute('CREATE TABLE modules (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, parent_id INTEGER, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE module_entries (id INTEGER PRIMARY KEY AUTOINCREMENT, module_id INTEGER NOT NULL, seq INTEGER NOT NULL, content TEXT NOT NULL, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)');
@@ -46,6 +46,9 @@ class AppDatabase {
           try { await db.execute("ALTER TABLE modules ADD COLUMN parent_id INTEGER"); } catch (_) {}
           try { await db.execute("ALTER TABLE modules ADD COLUMN sort_order INTEGER DEFAULT 0"); } catch (_) {}
           try { await db.execute("ALTER TABLE module_entries ADD COLUMN sort_order INTEGER DEFAULT 0"); } catch (_) {}
+        }
+        if (oldV < 4) {
+          try { await db.execute("ALTER TABLE schedule_items ADD COLUMN parent_id INTEGER"); } catch (_) {}
         }
       },
     );
@@ -167,6 +170,7 @@ class _MainShellState extends State<MainShell> {
     return Scaffold(
       body: pages[_idx],
       bottomNavigationBar: NavigationBar(
+        height: 62,
         selectedIndex: _idx,
         onDestinationSelected: (i) => setState(() => _idx = i),
         destinations: const [
@@ -189,7 +193,13 @@ class TodayPage extends StatefulWidget {
 
 class _TodayPageState extends State<TodayPage> {
   String _date = DateFormat('yyyy-MM-dd').format(DateTime.now());
-  final Map<int, bool> _expanded = {};
+  final Map<int, bool> _expandedPhoto = {};
+  final Set<int> _collapsedStatusIds = {}; // 折叠过长的单条状态
+  final Set<int> _collapsedSchedParents = {}; // 折叠子日程
+  bool _foldSummary = true; // 摘要默认折叠为一行以省空间，点击展开
+  bool _foldStatusSection = false;
+  bool _foldSchedSection = false;
+
   String get _today => DateFormat('yyyy-MM-dd').format(DateTime.now());
 
   Future<Map<String, dynamic>> _load() async {
@@ -235,14 +245,34 @@ class _TodayPageState extends State<TodayPage> {
     return res;
   }
 
+  /// 将包含换行、|、◦、；的内容自动拆分成独立分列项
+  List<String> _splitColumns(String raw) {
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty) return [];
+    if (trimmed.contains('\n')) {
+      return trimmed.split('\n').map((s) => s.trim()).where((s) => s.isNotEmpty).toList();
+    }
+    if (trimmed.contains('|')) {
+      return trimmed.split('|').map((s) => s.trim()).where((s) => s.isNotEmpty).toList();
+    }
+    if (trimmed.contains('◦') || trimmed.contains('•')) {
+      return trimmed.split(RegExp(r'[◦•]')).map((s) => s.trim()).where((s) => s.isNotEmpty).toList();
+    }
+    if (trimmed.contains('；') || trimmed.contains(';')) {
+      return trimmed.split(RegExp(r'[；;]')).map((s) => s.trim()).where((s) => s.isNotEmpty).toList();
+    }
+    return [trimmed];
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(_date == _today ? '今天 · $_date' : _date),
+        toolbarHeight: 46,
+        title: Text(_date == _today ? '今天 · $_date' : _date, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
         actions: [
           IconButton(
-            icon: const Icon(Icons.date_range),
+            icon: const Icon(Icons.date_range, size: 20),
             onPressed: () async {
               final d = await showDatePicker(context: context, initialDate: DateTime.parse(_date), firstDate: DateTime(2020), lastDate: DateTime(2035));
               if (d != null) setState(() => _date = DateFormat('yyyy-MM-dd').format(d));
@@ -259,56 +289,117 @@ class _TodayPageState extends State<TodayPage> {
           final scheds = snap.data!['scheds'] as List<Map<String, dynamic>>;
           final doneMap = snap.data!['done'] as Map<int, bool>;
 
+          final doneCount = doneMap.values.where((v) => v).length;
+
           return ListView(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             children: [
               _buildSummary(items, disp, scheds, doneMap),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  const Text('📊 每日状态', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                  TextButton.icon(onPressed: _addStatusDialog, icon: const Icon(Icons.add, size: 18), label: const Text('新条目')),
-                ],
+
+              // ==================== 板块一：每日状态（支持整体折叠） ====================
+              _buildSectionHeader(
+                icon: '📊',
+                title: '每日状态 (${items.length})',
+                isFolded: _foldStatusSection,
+                onToggleFold: () => setState(() => _foldStatusSection = !_foldStatusSection),
+                actionLabel: '新条目',
+                onAction: () => _addOrEditStatusItemDialog(),
               ),
-              ...items.map((it) => _buildStatusCard(it, disp[it['id'] as int])),
-              const SizedBox(height: 16),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  const Text('📅 日程打卡', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                  TextButton.icon(onPressed: _addSchedDialog, icon: const Icon(Icons.add, size: 18), label: const Text('新日程')),
-                ],
-              ),
-              ...scheds.map((s) {
-                final sid = s['id'] as int, done = doneMap[sid] ?? false;
-                final plan = (s['plan_info'] as String? ?? '').trim();
-                return CheckboxListTile(
-                  value: done,
-                  controlAffinity: ListTileControlAffinity.leading,
-                  title: Text(s['title'] as String, style: TextStyle(decoration: done ? TextDecoration.lineThrough : null)),
-                  subtitle: plan.isNotEmpty ? Text('🎯 关联规划：$plan', style: const TextStyle(fontSize: 12, color: Color(0xFF4F46E5))) : null,
-                  secondary: IconButton(
-                    icon: const Icon(Icons.delete_outline, color: Colors.red),
-                    onPressed: () async {
-                      await widget.db.delete('schedule_records', where: 'item_id = ?', whereArgs: [sid]);
-                      await widget.db.delete('schedule_items', where: 'id = ?', whereArgs: [sid]);
-                      setState(() {});
-                    },
+              if (!_foldStatusSection)
+                Card(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  elevation: 0,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    side: const BorderSide(color: Color(0xFFE2E8F0)),
                   ),
-                  onChanged: (v) async {
-                    await widget.db.insert('schedule_records', {'item_id': sid, 'date': _date, 'done': (v ?? false) ? 1 : 0}, conflictAlgorithm: ConflictAlgorithm.replace);
-                    setState(() {});
-                  },
-                );
-              }),
-              if (scheds.isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.only(top: 8),
-                  child: Text('今日完成：${doneMap.values.where((v) => v).length} / ${scheds.length}', textAlign: TextAlign.right, style: const TextStyle(fontWeight: FontWeight.bold)),
+                  child: items.isEmpty
+                      ? const Padding(
+                          padding: EdgeInsets.all(16),
+                          child: Center(child: Text('暂无状态条目，点击右上角「+ 新条目」添加', style: TextStyle(color: Colors.grey, fontSize: 13))),
+                        )
+                      : Column(
+                          children: [
+                            for (int i = 0; i < items.length; i++) ...[
+                              if (i > 0) const Divider(height: 1, color: Color(0xFFF1F5F9)),
+                              _buildCompactStatusRow(items[i], disp[items[i]['id'] as int]),
+                            ],
+                          ],
+                        ),
+                ),
+
+              // ==================== 板块二：日程打卡（支持整体折叠与子日程折叠） ====================
+              _buildSectionHeader(
+                icon: '📅',
+                title: '日程打卡 ($doneCount/${scheds.length})',
+                isFolded: _foldSchedSection,
+                onToggleFold: () => setState(() => _foldSchedSection = !_foldSchedSection),
+                actionLabel: '新日程',
+                onAction: () => _addOrEditSchedDialog(),
+              ),
+              if (!_foldSchedSection)
+                Card(
+                  margin: const EdgeInsets.only(bottom: 16),
+                  elevation: 0,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    side: const BorderSide(color: Color(0xFFE2E8F0)),
+                  ),
+                  child: scheds.isEmpty
+                      ? const Padding(
+                          padding: EdgeInsets.all(16),
+                          child: Center(child: Text('暂无日程，点击右上角「+ 新日程」添加', style: TextStyle(color: Colors.grey, fontSize: 13))),
+                        )
+                      : Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          child: _buildScheduleTree(scheds, doneMap),
+                        ),
                 ),
             ],
           );
         },
+      ),
+    );
+  }
+
+  Widget _buildSectionHeader({
+    required String icon,
+    required String title,
+    required bool isFolded,
+    required VoidCallback onToggleFold,
+    required String actionLabel,
+    required VoidCallback onAction,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 2, bottom: 4),
+      child: Row(
+        children: [
+          InkWell(
+            borderRadius: BorderRadius.circular(6),
+            onTap: onToggleFold,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
+              child: Row(
+                children: [
+                  Icon(isFolded ? Icons.chevron_right : Icons.expand_more, size: 20, color: const Color(0xFF475569)),
+                  const SizedBox(width: 2),
+                  Text('$icon $title', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+                ],
+              ),
+            ),
+          ),
+          const Spacer(),
+          TextButton.icon(
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            onPressed: onAction,
+            icon: const Icon(Icons.add, size: 16),
+            label: Text(actionLabel, style: const TextStyle(fontSize: 13)),
+          ),
+        ],
       ),
     );
   }
@@ -322,10 +413,12 @@ class _TodayPageState extends State<TodayPage> {
         final imgs = d['images'] as List<String>;
         if (imgs.isNotEmpty) lines.add('${it['name']}：[${imgs.length}张图片]');
       } else if ((d['value'] as String).isNotEmpty) {
-        lines.add('${it['name']}：${d['value']}');
+        final cleanVal = (d['value'] as String).replaceAll('\n', ' | ');
+        lines.add('${it['name']}：$cleanVal');
       }
     }
     if (lines.isEmpty && scheds.isEmpty) return const SizedBox.shrink();
+
     String fmt(Map<String, dynamic> s) {
       final p = (s['plan_info'] as String? ?? '').trim();
       return p.isEmpty ? '${s['title']}' : '${s['title']}($p)';
@@ -335,96 +428,407 @@ class _TodayPageState extends State<TodayPage> {
     var text = '📋 $_date 状态记录${lines.isNotEmpty ? '\n${lines.join('\n')}' : ''}';
     if (scheds.isNotEmpty) text += '\n\n✅ 已完成日程：${doneStr.isEmpty ? "无" : doneStr}\n⬜ 未完成日程：${todoStr.isEmpty ? "无" : todoStr}';
 
-    return Card(
-      color: const Color(0xFFF8FAFC),
-      margin: const EdgeInsets.only(bottom: 16),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Text('今日状态摘要', style: TextStyle(fontWeight: FontWeight.bold)),
-                FilledButton.tonal(
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFC),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFCBD5E1)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => setState(() => _foldSummary = !_foldSummary),
+                  child: Row(
+                    children: [
+                      Icon(_foldSummary ? Icons.chevron_right : Icons.expand_more, size: 18, color: const Color(0xFF475569)),
+                      const SizedBox(width: 4),
+                      const Text('📋 今日状态摘要', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5)),
+                      const SizedBox(width: 6),
+                      Text(_foldSummary ? '(点击展开)' : '(点击收起)', style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                    ],
+                  ),
+                ),
+              ),
+              SizedBox(
+                height: 26,
+                child: FilledButton.tonal(
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    minimumSize: Size.zero,
+                  ),
                   onPressed: () {
                     Clipboard.setData(ClipboardData(text: text));
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已复制到剪贴板')));
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已复制摘要到剪贴板')));
                   },
-                  child: const Text('复制'),
+                  child: const Text('复制', style: TextStyle(fontSize: 12)),
                 ),
-              ],
-            ),
-            const SizedBox(height: 6),
-            Text(text, style: const TextStyle(fontSize: 13, height: 1.5)),
+              ),
+            ],
+          ),
+          if (!_foldSummary) ...[
+            const Divider(height: 10),
+            Text(text, style: const TextStyle(fontSize: 12.5, height: 1.45, color: Color(0xFF334155))),
           ],
-        ),
+        ],
       ),
     );
   }
 
-  Widget _buildStatusCard(Map<String, dynamic> it, Map<String, dynamic>? d) {
+  /// 紧凑型每日状态行：支持点击名称改条目、点击内容分列填写、多列自适应展示、单条折叠
+  Widget _buildCompactStatusRow(Map<String, dynamic> it, Map<String, dynamic>? d) {
     final id = it['id'] as int, name = it['name'] as String, type = it['type'] as String;
     final inh = d?['isInherited'] == true, val = d?['value'] as String? ?? '';
     final imgs = (d?['images'] as List<String>?) ?? [];
     final recId = d?['recordId'] as int? ?? id;
+    final cols = type == 'image' ? <String>[] : _splitColumns(val);
+    final isItemFolded = _collapsedStatusIds.contains(id);
 
-    return Card(
-      margin: const EdgeInsets.only(bottom: 10),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                Row(
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              // 折叠单条箭头（当有多个分列或长文本时方便收起）
+              if (cols.length > 1 || val.length > 22 || imgs.isNotEmpty)
+                GestureDetector(
+                  onTap: () => setState(() => isItemFolded ? _collapsedStatusIds.remove(id) : _collapsedStatusIds.add(id)),
+                  child: Padding(
+                    padding: const EdgeInsets.only(right: 4),
+                    child: Icon(isItemFolded ? Icons.chevron_right : Icons.expand_more, size: 17, color: Colors.grey[600]),
+                  ),
+                ),
+              // 状态条目名称（点击可直接编辑条目名称/类型）
+              GestureDetector(
+                onTap: () => _addOrEditStatusItemDialog(editItem: it),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    if (type == 'number') IconButton(icon: const Icon(Icons.show_chart, color: Colors.indigo), onPressed: () => _showTrend(id, name)),
-                    if (type == 'image')
-                      TextButton.icon(onPressed: () => _pickImgs(id), icon: const Icon(Icons.add_a_photo, size: 16), label: const Text('添加'))
-                    else
-                      TextButton(onPressed: () => _editValDialog(id, name, type, val), child: Text(inh ? '覆盖' : '修改')),
-                    IconButton(
-                      icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20),
-                      onPressed: () async {
-                        await widget.db.delete('status_records', where: 'item_id = ?', whereArgs: [id]);
-                        await widget.db.delete('status_items', where: 'id = ?', whereArgs: [id]);
-                        setState(() {});
-                      },
-                    ),
+                    Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Color(0xFF1E293B))),
+                    const SizedBox(width: 3),
+                    Icon(Icons.edit_ note, size: 14, color: Colors.grey[400]),
                   ],
                 ),
+              ),
+              if (inh) ...[
+                const SizedBox(width: 6),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                  decoration: BoxDecoration(color: Colors.amber[100], borderRadius: BorderRadius.circular(4)),
+                  child: Text('承自${(d!['inheritedFrom'] as String).substring(5)}', style: TextStyle(fontSize: 10, color: Colors.amber[900])),
+                ),
               ],
-            ),
-            if (type != 'image')
-              d == null
-                  ? const Text('未填写', style: TextStyle(color: Colors.grey))
-                  : Row(
-                      children: [
-                        Text(val, style: TextStyle(fontStyle: inh ? FontStyle.italic : FontStyle.normal)),
-                        if (inh) ...[
-                          const SizedBox(width: 8),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                            decoration: BoxDecoration(color: Colors.amber[100], borderRadius: BorderRadius.circular(4)),
-                            child: Text('继承自 ${d['inheritedFrom']}', style: TextStyle(fontSize: 11, color: Colors.amber[900])),
-                          ),
-                        ]
-                      ],
+              const SizedBox(width: 8),
+              // 如果只有 1 列简短内容且未折叠，直接同行展示，极致省空间
+              if (type != 'image' && cols.length <= 1 && val.length <= 18 && !isItemFolded)
+                Expanded(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => _editValDialog(id, name, type, val),
+                    child: Text(
+                      val.isEmpty ? '点击填写...' : val,
+                      style: TextStyle(
+                        fontSize: 13.5,
+                        fontStyle: inh ? FontStyle.italic : FontStyle.normal,
+                        color: val.isEmpty ? Colors.grey[400] : (inh ? Colors.grey[700] : const Color(0xFF0F172A)),
+                      ),
+                      overflow: TextOverflow.ellipsis,
                     ),
-            if (type == 'image' && imgs.isNotEmpty) _buildGrid(recId, imgs),
-          ],
-        ),
+                  ),
+                )
+              else
+                Expanded(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => type == 'image' ? _pickImgs(id) : _editValDialog(id, name, type, val),
+                    child: Text(
+                      isItemFolded ? '已折叠 (${cols.isNotEmpty ? "${cols.length}栏" : "${imgs.length}图"})' : '',
+                      style: const TextStyle(fontSize: 11.5, color: Colors.grey),
+                    ),
+                  ),
+                ),
+              // 右侧紧凑功能图标组
+              if (type == 'number')
+                InkWell(
+                  onTap: () => _showTrend(id, name),
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                    child: Icon(Icons.show_chart, size: 18, color: Color(0xFF4F46E5)),
+                  ),
+                ),
+              InkWell(
+                onTap: () => type == 'image' ? _pickImgs(id) : _editValDialog(id, name, type, val),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                  child: Icon(
+                    type == 'image' ? Icons.add_a_photo_outlined : Icons.edit_outlined,
+                    size: 17,
+                    color: const Color(0xFF4F46E5),
+                  ),
+                ),
+              ),
+              InkWell(
+                onTap: () => _confirmDeleteStatusItem(id, name),
+                child: const Padding(
+                  padding: EdgeInsets.only(left: 4, top: 2, bottom: 2),
+                  child: Icon(Icons.delete_outline, size: 17, color: Colors.redAccent),
+                ),
+              ),
+            ],
+          ),
+
+          // 当有多列内容（分列模式）或较长文本时，在下方以清晰的自适应分列网格/列表展示
+          if (!isItemFolded && type != 'image' && (cols.length > 1 || val.length > 18))
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: GestureDetector(
+                onTap: () => _editValDialog(id, name, type, val),
+                child: LayoutBuilder(
+                  builder: (ctx, constraints) {
+                    // 若每列较短则双列并排分列展示，若包含长句则全宽分栏展示，绝不截断
+                    final useTwoCols = cols.length >= 2 && cols.every((c) => c.length <= 16);
+                    final itemWidth = useTwoCols ? (constraints.maxWidth - 6) / 2 : constraints.maxWidth;
+                    return Wrap(
+                      spacing: 6,
+                      runSpacing: 5,
+                      children: cols.map((colText) {
+                        final colonIdx = colText.indexOf(RegExp(r'[:：]'));
+                        Widget inner;
+                        if (colonIdx > 0 && colonIdx < 8) {
+                          final label = colText.substring(0, colonIdx);
+                          final body = colText.substring(colonIdx + 1).trim();
+                          inner = RichText(
+                            text: TextSpan(
+                              style: TextStyle(
+                                fontSize: 13,
+                                height: 1.35,
+                                fontStyle: inh ? FontStyle.italic : FontStyle.normal,
+                                color: const Color(0xFF1E293B),
+                              ),
+                              children: [
+                                TextSpan(text: '$label：', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF4F46E5))),
+                                TextSpan(text: body),
+                              ],
+                            ),
+                          );
+                        } else {
+                          inner = Text(
+                            colText,
+                            style: TextStyle(
+                              fontSize: 13,
+                              height: 1.35,
+                              fontStyle: inh ? FontStyle.italic : FontStyle.normal,
+                              color: const Color(0xFF1E293B),
+                            ),
+                          );
+                        }
+                        return Container(
+                          width: itemWidth,
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFF8FAFC),
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(color: const Color(0xFFE2E8F0)),
+                          ),
+                          child: inner,
+                        );
+                      }).toList(),
+                    );
+                  },
+                ),
+              ),
+            ),
+
+          if (!isItemFolded && type == 'image' && imgs.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: _buildGrid(recId, imgs),
+            ),
+        ],
       ),
     );
   }
 
+  /// 支持多级可折叠子日程与点击编辑的日程树
+  Widget _buildScheduleTree(List<Map<String, dynamic>> allScheds, Map<int, bool> doneMap) {
+    final validIds = allScheds.map((s) => s['id'] as int).toSet();
+    final roots = allScheds.where((s) {
+      final pid = s['parent_id'] as int?;
+      return pid == null || !validIds.contains(pid);
+    }).toList();
+
+    List<Map<String, dynamic>> childrenOf(int pid) {
+      return allScheds.where((s) => s['parent_id'] == pid).toList();
+    }
+
+    Widget buildNode(Map<String, dynamic> s, int depth) {
+      final sid = s['id'] as int;
+      final done = doneMap[sid] ?? false;
+      final plan = (s['plan_info'] as String? ?? '').trim();
+      final children = childrenOf(sid);
+      final hasChildren = children.isNotEmpty;
+      final isCollapsed = _collapsedSchedParents.contains(sid);
+      final doneChildrenCount = children.where((c) => doneMap[c['id'] as int] == true).length;
+
+      return Column(
+        key: ValueKey('sched_$sid'),
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: EdgeInsets.only(left: depth * 18.0 + 6, right: 6, top: 3, bottom: 3),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                if (hasChildren)
+                  GestureDetector(
+                    onTap: () => setState(() => isCollapsed ? _collapsedSchedParents.remove(sid) : _collapsedSchedParents.add(sid)),
+                    child: Padding(
+                      padding: const EdgeInsets.only(right: 2),
+                      child: Icon(isCollapsed ? Icons.chevron_right : Icons.expand_more, size: 19, color: const Color(0xFF4F46E5)),
+                    ),
+                  )
+                else if (depth > 0)
+                  const Padding(
+                    padding: EdgeInsets.only(right: 4),
+                    child: Icon(Icons.subdirectory_arrow_right, size: 15, color: Colors.grey),
+                  )
+                else
+                  const SizedBox(width: 4),
+                SizedBox(
+                  width: 26,
+                  height: 26,
+                  child: Checkbox(
+                    value: done,
+                    visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
+                    onChanged: (v) async {
+                      await widget.db.insert(
+                        'schedule_records',
+                        {'item_id': sid, 'date': _date, 'done': (v ?? false) ? 1 : 0},
+                        conflictAlgorithm: ConflictAlgorithm.replace,
+                      );
+                      setState(() {});
+                    },
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => _addOrEditSchedDialog(editSched: s),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                '${s['title']}',
+                                style: TextStyle(
+                                  fontSize: depth == 0 ? 14 : 13,
+                                  fontWeight: depth == 0 ? FontWeight.w500 : FontWeight.normal,
+                                  decoration: done ? TextDecoration.lineThrough : null,
+                                  color: done ? Colors.grey : const Color(0xFF1E293B),
+                                ),
+                              ),
+                            ),
+                            if (hasChildren)
+                              Container(
+                                margin: const EdgeInsets.only(left: 4),
+                                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFFEEF2FF),
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Text(
+                                  '$doneChildrenCount/${children.length}',
+                                  style: const TextStyle(fontSize: 10.5, color: Color(0xFF4F46E5)),
+                                ),
+                              ),
+                          ],
+                        ),
+                        if (plan.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 1),
+                            child: Text(
+                              '🎯 $plan',
+                              style: const TextStyle(fontSize: 11, color: Color(0xFF4F46E5)),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+                // 添加子日程按钮
+                InkWell(
+                  onTap: () => _addOrEditSchedDialog(parentId: sid, parentTitle: '${s['title']}'),
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 5, vertical: 3),
+                    child: Icon(Icons.add_circle_outline, size: 17, color: Color(0xFF4F46E5)),
+                  ),
+                ),
+                // 编辑日程按钮
+                InkWell(
+                  onTap: () => _addOrEditSchedDialog(editSched: s),
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+                    child: Icon(Icons.edit_outlined, size: 16, color: Colors.blueGrey),
+                  ),
+                ),
+                // 删除日程按钮（连带删除子日程）
+                InkWell(
+                  onTap: () async {
+                    final subIds = <int>[sid];
+                    void collect(int p) {
+                      for (final c in childrenOf(p)) {
+                        final cid = c['id'] as int;
+                        subIds.add(cid);
+                        collect(cid);
+                      }
+                    }
+                    collect(sid);
+                    for (final did in subIds) {
+                      await widget.db.delete('schedule_records', where: 'item_id = ?', whereArgs: [did]);
+                      await widget.db.delete('schedule_items', where: 'id = ?', whereArgs: [did]);
+                    }
+                    setState(() {});
+                  },
+                  child: const Padding(
+                    padding: EdgeInsets.only(left: 4, right: 2, top: 3, bottom: 3),
+                    child: Icon(Icons.delete_outline, size: 17, color: Colors.redAccent),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (hasChildren && !isCollapsed)
+            ...children.map((c) => buildNode(c, depth + 1)),
+        ],
+      );
+    }
+
+    return Column(
+      children: [
+        for (int i = 0; i < roots.length; i++) ...[
+          if (i > 0) const Divider(height: 1, color: Color(0xFFF1F5F9)),
+          buildNode(roots[i], 0),
+        ],
+      ],
+    );
+  }
+
   Widget _buildGrid(int recId, List<String> paths) {
-    final exp = _expanded[recId] ?? false, total = paths.length;
+    final exp = _expandedPhoto[recId] ?? false, total = paths.length;
     final show = exp ? total : math.min(3, total);
     final cols = total == 1 ? 1 : (total == 2 ? 2 : 3);
     return Column(
@@ -447,7 +851,7 @@ class _TodayPageState extends State<TodayPage> {
             ),
           ),
         ),
-        if (total > 3) TextButton(onPressed: () => setState(() => _expanded[recId] = !exp), child: Text(exp ? '收起' : '展开全部 $total 张')),
+        if (total > 3) TextButton(onPressed: () => setState(() => _expandedPhoto[recId] = !exp), child: Text(exp ? '收起' : '展开全部 $total 张')),
       ],
     );
   }
@@ -470,24 +874,55 @@ class _TodayPageState extends State<TodayPage> {
     setState(() {});
   }
 
-  void _addStatusDialog() {
-    final ctrl = TextEditingController();
-    String type = 'text';
+  void _confirmDeleteStatusItem(int id, String name) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('确认删除'),
+        content: Text('确定删除「$name」及其所有历史记录吗？'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          FilledButton(
+            onPressed: () async {
+              await widget.db.delete('status_records', where: 'item_id = ?', whereArgs: [id]);
+              await widget.db.delete('status_items', where: 'id = ?', whereArgs: [id]);
+              if (mounted) Navigator.pop(ctx);
+              setState(() {});
+            },
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 新建或修改状态条目（名称与类型）
+  void _addOrEditStatusItemDialog({Map<String, dynamic>? editItem}) {
+    final isEdit = editItem != null;
+    final ctrl = TextEditingController(text: isEdit ? '${editItem['name']}' : '');
+    String type = isEdit ? '${editItem['type']}' : 'text';
+
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setS) => AlertDialog(
-          title: const Text('新建状态条目'),
+          title: Text(isEdit ? '编辑状态条目' : '新建状态条目', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              TextField(controller: ctrl, decoration: const InputDecoration(labelText: '名称（如：体重）')),
-              DropdownButton<String>(
+              TextField(
+                controller: ctrl,
+                autofocus: true,
+                decoration: const InputDecoration(labelText: '条目名称（如：体重/kg、饮食记录）'),
+              ),
+              const SizedBox(height: 10),
+              DropdownButtonFormField<String>(
                 value: type,
                 isExpanded: true,
+                decoration: const InputDecoration(labelText: '数据类型', isDense: true),
                 items: const [
-                  DropdownMenuItem(value: 'text', child: Text('文本')),
-                  DropdownMenuItem(value: 'number', child: Text('数字（支持折线图）')),
+                  DropdownMenuItem(value: 'text', child: Text('文本（支持多行与分列展示）')),
+                  DropdownMenuItem(value: 'number', child: Text('数字（支持趋势折线图）')),
                   DropdownMenuItem(value: 'image', child: Text('图片（九宫格原图）')),
                 ],
                 onChanged: (v) => setS(() => type = v!),
@@ -499,11 +934,20 @@ class _TodayPageState extends State<TodayPage> {
             FilledButton(
               onPressed: () async {
                 if (ctrl.text.trim().isEmpty) return;
-                await widget.db.insert('status_items', {'name': ctrl.text.trim(), 'type': type});
+                if (isEdit) {
+                  await widget.db.update(
+                    'status_items',
+                    {'name': ctrl.text.trim(), 'type': type},
+                    where: 'id = ?',
+                    whereArgs: [editItem['id']],
+                  );
+                } else {
+                  await widget.db.insert('status_items', {'name': ctrl.text.trim(), 'type': type});
+                }
                 if (mounted) Navigator.pop(ctx);
                 setState(() {});
               },
-              child: const Text('创建'),
+              child: Text(isEdit ? '保存' : '创建'),
             ),
           ],
         ),
@@ -511,13 +955,76 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
+  /// 支持多行编辑与一键分列的填写弹窗
   void _editValDialog(int id, String name, String type, String init) {
-    final ctrl = TextEditingController(text: init);
+    // 将旧文本中的 ◦ 或 ； 自动转换为换行，方便用户在多行模式下直观编辑各分列
+    String formattedInit = init;
+    if (type == 'text' && !init.contains('\n') && (init.contains('◦') || init.contains('；'))) {
+      formattedInit = _splitColumns(init).join('\n');
+    }
+    final ctrl = TextEditingController(text: formattedInit);
+
+    void appendTemplate(String tpl) {
+      final cur = ctrl.text.trimRight();
+      ctrl.text = cur.isEmpty ? tpl : '$cur\n$tpl';
+      ctrl.selection = TextSelection.fromPosition(TextPosition(offset: ctrl.text.length));
+    }
+
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text('填写：$name'),
-        content: TextField(controller: ctrl, keyboardType: type == 'number' ? const TextInputType.numberWithOptions(decimal: true) : TextInputType.text, autofocus: true),
+        insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+        titlePadding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
+        contentPadding: const EdgeInsets.fromLTRB(16, 6, 16, 10),
+        title: Text('填写：$name', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (type == 'text') ...[
+                const Text('💡 每一行（或用 | 分隔）会自动在卡片中独立分列展示：', style: TextStyle(fontSize: 11.5, color: Colors.grey)),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 4,
+                  children: [
+                    ActionChip(
+                      visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
+                      label: const Text('+ 新增分列行', style: TextStyle(fontSize: 11.5)),
+                      onPressed: () => appendTemplate('项目：'),
+                    ),
+                    ActionChip(
+                      visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
+                      label: const Text('早/午/晚餐模板', style: TextStyle(fontSize: 11.5)),
+                      onPressed: () => appendTemplate('早餐：\n午餐：\n晚餐：'),
+                    ),
+                    ActionChip(
+                      visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
+                      label: const Text('上/下/晚模板', style: TextStyle(fontSize: 11.5)),
+                      onPressed: () => appendTemplate('上午：\n下午：\n晚上：'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+              ],
+              TextField(
+                controller: ctrl,
+                minLines: type == 'number' ? 1 : 4,
+                maxLines: type == 'number' ? 1 : 10,
+                keyboardType: type == 'number' ? const TextInputType.numberWithOptions(decimal: true) : TextInputType.multiline,
+                autofocus: true,
+                style: const TextStyle(fontSize: 14, height: 1.45),
+                decoration: InputDecoration(
+                  hintText: type == 'number' ? '输入数值...' : '输入内容（换行即可自动分列展示）...',
+                  contentPadding: const EdgeInsets.all(10),
+                  border: const OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+        ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
           FilledButton(
@@ -533,53 +1040,99 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  Future<void> _addSchedDialog() async {
+  /// 新建、修改日程或添加子日程
+  Future<void> _addOrEditSchedDialog({Map<String, dynamic>? editSched, int? parentId, String? parentTitle}) async {
     final plans = await _loadPlans();
     if (!mounted) return;
-    final ctrl = TextEditingController();
-    String selPlan = '';
+
+    final isEdit = editSched != null;
+    final ctrl = TextEditingController(text: isEdit ? '${editSched['title']}' : '');
+    String selPlan = isEdit ? ('${editSched['plan_info'] ?? ''}') : '';
+    if (selPlan.isNotEmpty && !plans.any((p) => p.path == selPlan)) {
+      plans.insert(0, (path: selPlan, name: selPlan.split(' > ').last));
+    }
+
+    final dlgTitle = isEdit
+        ? '编辑日程'
+        : (parentId != null ? '在「$parentTitle」下添加子日程' : '添加日程');
+
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setS) => AlertDialog(
-          title: const Text('添加日程'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              TextField(controller: ctrl, autofocus: true, decoration: const InputDecoration(labelText: '日程内容', hintText: '如：晨跑30分钟')),
-              const SizedBox(height: 14),
-              const Text('关联规划（确保符合规划）：', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 6),
-              if (plans.isEmpty)
-                const Text('暂无规划可关联，可先在「规划」页创建', style: TextStyle(fontSize: 12, color: Colors.grey))
-              else
-                DropdownButtonFormField<String>(
-                  value: selPlan,
-                  isExpanded: true,
-                  items: [
-                    const DropdownMenuItem(value: '', child: Text('不关联规划')),
-                    ...plans.map((n) => DropdownMenuItem(value: n.path, child: Text(n.path, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13)))),
-                  ],
-                  onChanged: (v) => setS(() {
-                    selPlan = v ?? '';
-                    if (selPlan.isNotEmpty && ctrl.text.trim().isEmpty) {
-                      ctrl.text = plans.firstWhere((e) => e.path == selPlan).name;
-                    }
-                  }),
+          title: Text(dlgTitle, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: ctrl,
+                  autofocus: true,
+                  minLines: 1,
+                  maxLines: 3,
+                  decoration: const InputDecoration(
+                    labelText: '日程内容',
+                    hintText: '如：晨跑30分钟',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
                 ),
-            ],
+                const SizedBox(height: 12),
+                const Text('关联规划（确保符合规划）：', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                if (plans.isEmpty)
+                  const Text('暂无规划可关联，可先在「规划」页创建或导入 XMind', style: TextStyle(fontSize: 12, color: Colors.grey))
+                else
+                  DropdownButtonFormField<String>(
+                    value: selPlan,
+                    isExpanded: true,
+                    decoration: const InputDecoration(
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                      contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    ),
+                    items: [
+                      const DropdownMenuItem(value: '', child: Text('不关联规划', style: TextStyle(fontSize: 13))),
+                      ...plans.map((n) => DropdownMenuItem(
+                            value: n.path,
+                            child: Text(n.path, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12.5)),
+                          )),
+                    ],
+                    onChanged: (v) => setS(() {
+                      selPlan = v ?? '';
+                      if (selPlan.isNotEmpty && ctrl.text.trim().isEmpty) {
+                        ctrl.text = plans.firstWhere((e) => e.path == selPlan).name;
+                      }
+                    }),
+                  ),
+              ],
+            ),
           ),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
             FilledButton(
               onPressed: () async {
                 if (ctrl.text.trim().isEmpty) return;
-                await widget.db.insert('schedule_items', {'title': ctrl.text.trim(), 'plan_info': selPlan});
+                if (isEdit) {
+                  await widget.db.update(
+                    'schedule_items',
+                    {'title': ctrl.text.trim(), 'plan_info': selPlan},
+                    where: 'id = ?',
+                    whereArgs: [editSched['id']],
+                  );
+                } else {
+                  await widget.db.insert('schedule_items', {
+                    'title': ctrl.text.trim(),
+                    'plan_info': selPlan,
+                    'parent_id': parentId,
+                  });
+                  if (parentId != null) _collapsedSchedParents.remove(parentId);
+                }
                 if (mounted) Navigator.pop(ctx);
                 setState(() {});
               },
-              child: const Text('添加'),
+              child: Text(isEdit ? '保存' : '添加'),
             ),
           ],
         ),
