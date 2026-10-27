@@ -18,7 +18,6 @@ void main() async {
   runApp(DailyTrackerApp(db: db));
 }
 
-// ==================== 数据库层 (SQLite v5 含 UI 缩略状态持久化表) ====================
 class AppDatabase {
   static final AppDatabase instance = AppDatabase._();
   static Database? _db;
@@ -29,9 +28,9 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
-      version: 5,
+      version: 6,
       onCreate: (db, v) async {
-        await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, sort_order INTEGER DEFAULT 0)');
+        await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, allow_inherit INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE status_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, value TEXT DEFAULT "", UNIQUE(item_id, date))');
         await db.execute('CREATE TABLE status_images (id INTEGER PRIMARY KEY AUTOINCREMENT, record_id INTEGER NOT NULL, file_path TEXT NOT NULL, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE schedule_items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, plan_info TEXT DEFAULT "", parent_id INTEGER, sort_order INTEGER DEFAULT 0)');
@@ -56,6 +55,9 @@ class AppDatabase {
         }
         if (oldV < 5) {
           try { await db.execute('CREATE TABLE IF NOT EXISTS ui_states (state_key TEXT PRIMARY KEY, state_val TEXT NOT NULL)'); } catch (_) {}
+        }
+        if (oldV < 6) {
+          try { await db.execute("ALTER TABLE status_items ADD COLUMN allow_inherit INTEGER DEFAULT 1"); } catch (_) {}
         }
       },
     );
@@ -272,12 +274,14 @@ class _TodayPageState extends State<TodayPage> {
 
     for (final it in items) {
       final id = it['id'] as int, type = it['type'] as String;
-      final recs = await widget.db.query('status_records', where: 'item_id = ? AND date = ?', whereArgs: [id, _date]);
-      if (recs.isNotEmpty) {
-        final r = recs.first;
+      final allowInherit = (it['allow_inherit'] as int? ?? 1) == 1;
+
+      final todayRecs = await widget.db.query('status_records', where: 'item_id = ? AND date = ?', whereArgs: [id, _date]);
+      if (todayRecs.isNotEmpty) {
+        final r = todayRecs.first;
         final imgs = await widget.db.query('status_images', where: 'record_id = ?', whereArgs: [r['id']], orderBy: 'sort_order ASC');
         disp[id] = {'recordId': r['id'], 'value': r['value'], 'images': imgs.map((i) => p.join(appDir.path, i['file_path'] as String)).toList(), 'isInherited': false};
-      } else if (type != 'image') {
+      } else if (type != 'image' && allowInherit) {
         final prev = await widget.db.query('status_records', where: 'item_id = ? AND date < ? AND value != ""', whereArgs: [id, _date], orderBy: 'date DESC', limit: 1);
         if (prev.isNotEmpty) disp[id] = {'recordId': null, 'value': prev.first['value'], 'images': <String>[], 'isInherited': true, 'inheritedFrom': prev.first['date']};
       }
@@ -330,7 +334,6 @@ class _TodayPageState extends State<TodayPage> {
     return [trimmed];
   }
 
-  // ==================== 新增：解析并导入每日记录 Word (.docx)（含多日期、分列条目与原图提取） ====================
   String _unescapeXml(String s) {
     return s
         .replaceAll('&amp;', '&')
@@ -343,7 +346,6 @@ class _TodayPageState extends State<TodayPage> {
   Future<int> _ensureStatusItem(String name, String type) async {
     final existing = await widget.db.query('status_items', where: 'name = ?', whereArgs: [name]);
     if (existing.isNotEmpty) return existing.first['id'] as int;
-    // 兼容“状态与异状”和“状态和异状”同义归并
     if (name == '状态与异状' || name == '状态和异状') {
       final alt = await widget.db.query('status_items', where: 'name IN (?, ?)', whereArgs: ['状态与异状', '状态和异状']);
       if (alt.isNotEmpty) return alt.first['id'] as int;
@@ -352,6 +354,7 @@ class _TodayPageState extends State<TodayPage> {
     return await widget.db.insert('status_items', {
       'name': name,
       'type': type,
+      'allow_inherit': 1,
       'sort_order': all.length,
     });
   }
@@ -380,13 +383,10 @@ class _TodayPageState extends State<TodayPage> {
       }
 
       if (docXmlFile == null) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('未识别到标准 Word (.docx) 结构，请确认文件格式')));
-        }
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('未识别到标准 Word 结构')));
         return;
       }
 
-      // 1. 解析 rId -> word/media/xxx 图片映射关系
       final relMap = <String, String>{};
       if (relsXmlFile != null) {
         final relsXml = utf8.decode(relsXmlFile.content as List<int>, allowMalformed: true);
@@ -407,7 +407,6 @@ class _TodayPageState extends State<TodayPage> {
         }
       }
 
-      // 2. 逐段解析 word/document.xml
       final docXml = utf8.decode(docXmlFile.content as List<int>, allowMalformed: true);
       final pMatches = RegExp(r'<w:p\b[^>]*>([\s\S]*?)<\/w:p>').allMatches(docXml);
 
@@ -441,11 +440,9 @@ class _TodayPageState extends State<TodayPage> {
 
       for (final pm in pMatches) {
         final pXml = pm.group(1)!;
-        // 提取段落文字
         final tMatches = RegExp(r'<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>').allMatches(pXml);
         final rawText = _unescapeXml(tMatches.map((m) => m.group(1)!).join('')).trim();
 
-        // 提取段落内嵌图片 r:embed / v:imagedata
         final blipMatches = RegExp(r'r:(?:embed|id)="([^"]+)"').allMatches(pXml);
         for (final bm in blipMatches) {
           final rId = bm.group(1)!;
@@ -460,7 +457,6 @@ class _TodayPageState extends State<TodayPage> {
 
         if (rawText.isEmpty || rawText == '每日记录') continue;
 
-        // 检查是否为【X月X日】日期标题
         final dm = dateHeaderRegex.firstMatch(rawText);
         if (dm != null) {
           final year = dm.group(1) != null ? int.parse(dm.group(1)!) : DateTime.parse(_date).year;
@@ -472,18 +468,15 @@ class _TodayPageState extends State<TodayPage> {
           continue;
         }
 
-        // 清理前导项目符号（●、•、◦、▪、□ 等）
         final cleanLine = rawText.replaceFirst(RegExp(r'^[\u25CF\u2022\u25E6\u25AA\u25A1\u25B6\uF0B7\uF0A7\-\*]+\s*'), '').trim();
         if (cleanLine.isEmpty) continue;
 
-        // 检查是否命中顶层状态字段（如“基础数据：...”、“饮食记录：”）
         String? matchedField;
         String remainder = '';
         final colonIdx = cleanLine.indexOf(RegExp(r'[:：]'));
         if (colonIdx > 0 && colonIdx <= 14) {
           final prefix = cleanLine.substring(0, colonIdx).trim();
           final after = cleanLine.substring(colonIdx + 1).trim();
-          // 若前缀是已知顶层字段，或不是子项编号（如 a. / b. / i. / iv. / 早餐 / 午餐 / 晚餐）
           final isSubItemPrefix = RegExp(r'^([a-zA-Z]{1,4}[\.、]|早餐|午餐|下午茶|晚餐|夜宵|加餐|上午|下午|晚上|\d+[\.、])').hasMatch(cleanLine);
           if (topFields.contains(prefix) || (!isSubItemPrefix && currentField == null)) {
             matchedField = prefix;
@@ -494,41 +487,32 @@ class _TodayPageState extends State<TodayPage> {
         if (matchedField != null) {
           if (matchedField == '基础数据') {
             currentField = null;
-            // 拆分“体重 80.6 kg | 运动：无”
             final parts = remainder.split(RegExp(r'[|｜；;]'));
             for (final part in parts) {
               final pTrim = part.trim();
               if (pTrim.isEmpty) continue;
               if (pTrim.contains('体重')) {
                 final numM = RegExp(r'(\d+(?:\.\d+)?)').firstMatch(pTrim);
-                if (numM != null) {
-                  addTextLine(currentDate, '体重/kg', numM.group(1)!);
-                }
+                if (numM != null) addTextLine(currentDate, '体重/kg', numM.group(1)!);
               } else if (pTrim.contains('运动')) {
                 final subColon = pTrim.indexOf(RegExp(r'[:：]'));
                 final sportVal = subColon >= 0 ? pTrim.substring(subColon + 1).trim() : pTrim.replaceFirst('运动', '').trim();
                 addTextLine(currentDate, '运动量', sportVal);
               } else {
                 final subColon = pTrim.indexOf(RegExp(r'[:：]'));
-                if (subColon > 0) {
-                  addTextLine(currentDate, pTrim.substring(0, subColon).trim(), pTrim.substring(subColon + 1).trim());
-                }
+                if (subColon > 0) addTextLine(currentDate, pTrim.substring(0, subColon).trim(), pTrim.substring(subColon + 1).trim());
               }
             }
           } else {
             currentField = matchedField;
-            if (remainder.isNotEmpty) {
-              addTextLine(currentDate, currentField!, remainder);
-            }
+            if (remainder.isNotEmpty) addTextLine(currentDate, currentField!, remainder);
           }
         } else {
-          // 归属到当前激活的字段下作为独立分列行（例如饮食记录下的早餐/午餐/晚餐，或 AI 分析下的 a./b./c./iv.）
           final targetField = currentField ?? '状态与异状';
           addTextLine(currentDate, targetField, cleanLine);
         }
       }
 
-      // 3. 将解析出的文本与图片写入 SQLite 数据库
       int importedDays = 0;
       int importedImgs = 0;
       final allDates = <String>{...dateTextData.keys, ...dateImages.keys};
@@ -553,7 +537,6 @@ class _TodayPageState extends State<TodayPage> {
           );
         }
 
-        // 处理该日期下提取出的内嵌原图
         final imgList = dateImages[dKey] ?? [];
         if (imgList.isNotEmpty) {
           final imgItemId = await _ensureStatusItem('今日图片', 'image');
@@ -562,11 +545,7 @@ class _TodayPageState extends State<TodayPage> {
             {'item_id': imgItemId, 'date': dKey, 'value': ''},
             conflictAlgorithm: ConflictAlgorithm.ignore,
           );
-          final recs = await widget.db.query(
-            'status_records',
-            where: 'item_id = ? AND date = ?',
-            whereArgs: [imgItemId, dKey],
-          );
+          final recs = await widget.db.query('status_records', where: 'item_id = ? AND date = ?', whereArgs: [imgItemId, dKey]);
           final recId = recs.first['id'] as int;
 
           final dFolder = dKey.replaceAll('-', '');
@@ -592,14 +571,10 @@ class _TodayPageState extends State<TodayPage> {
         }
       }
 
-      if (lastimportedDate != null) {
-        _date = lastimportedDate;
-      }
+      if (lastimportedDate != null) _date = lastimportedDate;
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('🎉 导入完成：共导入 $importedDays 天记录、$importedImgs 张内嵌图片！')),
-      );
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('🎉 成功导入 $importedDays 天记录、$importedImgs 张图片！')));
       setState(() {});
     } catch (e) {
       if (!mounted) return;
@@ -968,6 +943,7 @@ class _TodayPageState extends State<TodayPage> {
 
   Widget _buildCompactStatusRow(Map<String, dynamic> it, Map<String, dynamic>? d) {
     final id = it['id'] as int, name = it['name'] as String, type = it['type'] as String;
+    final allowInherit = (it['allow_inherit'] as int? ?? 1) == 1;
     final inh = d?['isInherited'] == true, val = d?['value'] as String? ?? '';
     final imgs = (d?['images'] as List<String>?) ?? [];
     final recId = d?['recordId'] as int? ?? id;
@@ -1376,10 +1352,12 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
+  /// 新建或修改状态条目（支持勾选是否允许跨天继承）
   void _addOrEditStatusItemDialog({Map<String, dynamic>? editItem}) {
     final isEdit = editItem != null;
     final ctrl = TextEditingController(text: isEdit ? '${editItem['name']}' : '');
     String type = isEdit ? '${editItem['type']}' : 'text';
+    bool allowInherit = isEdit ? ((editItem['allow_inherit'] as int? ?? 1) == 1) : true;
 
     showDialog(
       context: context,
@@ -1406,6 +1384,14 @@ class _TodayPageState extends State<TodayPage> {
                 ],
                 onChanged: (v) => setS(() => type = v!),
               ),
+              const SizedBox(height: 6),
+              CheckboxListTile(
+                value: allowInherit,
+                contentPadding: EdgeInsets.zero,
+                title: const Text('允许跨天继承历史数据', style: TextStyle(fontSize: 13.5)),
+                subtitle: const Text('关闭后，若当天未填写则自动清空（不显示历史继承值）', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                onChanged: (v) => setS(() => allowInherit = v ?? true),
+              ),
             ],
           ),
           actions: [
@@ -1416,12 +1402,16 @@ class _TodayPageState extends State<TodayPage> {
                 if (isEdit) {
                   await widget.db.update(
                     'status_items',
-                    {'name': ctrl.text.trim(), 'type': type},
+                    {'name': ctrl.text.trim(), 'type': type, 'allow_inherit': allowInherit ? 1 : 0},
                     where: 'id = ?',
                     whereArgs: [editItem['id']],
                   );
                 } else {
-                  await widget.db.insert('status_items', {'name': ctrl.text.trim(), 'type': type});
+                  await widget.db.insert('status_items', {
+                    'name': ctrl.text.trim(),
+                    'type': type,
+                    'allow_inherit': allowInherit ? 1 : 0,
+                  });
                 }
                 if (mounted) Navigator.pop(ctx);
                 setState(() {});
