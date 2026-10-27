@@ -9,6 +9,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart' hide TextDirection;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:sqflite/sqflite.dart';
 import 'pages_extra.dart';
 
@@ -18,6 +19,7 @@ void main() async {
   runApp(DailyTrackerApp(db: db));
 }
 
+// ==================== 数据库层 (SQLite v7 含成员标识与 AI 配置持久化) ====================
 class AppDatabase {
   static final AppDatabase instance = AppDatabase._();
   static Database? _db;
@@ -28,14 +30,14 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
-      version: 6,
+      version: 7,
       onCreate: (db, v) async {
         await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, allow_inherit INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE status_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, value TEXT DEFAULT "", UNIQUE(item_id, date))');
         await db.execute('CREATE TABLE status_images (id INTEGER PRIMARY KEY AUTOINCREMENT, record_id INTEGER NOT NULL, file_path TEXT NOT NULL, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE schedule_items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, plan_info TEXT DEFAULT "", parent_id INTEGER, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE schedule_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, done INTEGER DEFAULT 0, UNIQUE(item_id, date))');
-        await db.execute('CREATE TABLE modules (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, parent_id INTEGER, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)');
+        await db.execute('CREATE TABLE modules (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, parent_id INTEGER, is_member INTEGER DEFAULT 0, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE module_entries (id INTEGER PRIMARY KEY AUTOINCREMENT, module_id INTEGER NOT NULL, seq INTEGER NOT NULL, content TEXT NOT NULL, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE module_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, module_ids TEXT NOT NULL, created_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE mindmaps (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, root_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)');
@@ -58,6 +60,9 @@ class AppDatabase {
         }
         if (oldV < 6) {
           try { await db.execute("ALTER TABLE status_items ADD COLUMN allow_inherit INTEGER DEFAULT 1"); } catch (_) {}
+        }
+        if (oldV < 7) {
+          try { await db.execute("ALTER TABLE modules ADD COLUMN is_member INTEGER DEFAULT 0"); } catch (_) {}
         }
       },
     );
@@ -357,6 +362,447 @@ class _TodayPageState extends State<TodayPage> {
       'allow_inherit': 1,
       'sort_order': all.length,
     });
+  }
+
+  // ==================== 新增：Gemini AI 状态总结分析与一键导入每日状态 ====================
+  Future<void> _openGeminiAnalyzerSheet(String summaryText) async {
+    final rawCfg = await AppDatabase.getUiState(widget.db, 'gemini_ai_config');
+    Map<String, dynamic> cfg = {
+      'model': 'gemini-3.1-pro',
+      'mode': 'gem', // 'chat' (普通对话) 或 'gem' (专属Gem)
+      'gemName': '每日状态系统分析师',
+      'gemPrompt': '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条控制在一段话内，格式如“标题：具体分析”。',
+      'targetField': 'AI 深度异状分析',
+      'apiKey': '',
+    };
+    if (rawCfg != null && rawCfg.isNotEmpty) {
+      try {
+        cfg.addAll(jsonDecode(rawCfg) as Map<String, dynamic>);
+      } catch (_) {}
+    }
+
+    if (!mounted) return;
+    final gemNameCtrl = TextEditingController(text: '${cfg['gemName']}');
+    final gemPromptCtrl = TextEditingController(text: '${cfg['gemPrompt']}');
+    final targetFieldCtrl = TextEditingController(text: '${cfg['targetField']}');
+    final apiKeyCtrl = TextEditingController(text: '${cfg['apiKey']}');
+    final resultCtrl = TextEditingController();
+    String selectedModel = '${cfg['model']}';
+    String selectedMode = '${cfg['mode']}';
+    bool isLoading = false;
+    bool showAdvancedKey = false;
+
+    Future<void> saveCurrentConfig() async {
+      final newCfg = {
+        'model': selectedModel,
+        'mode': selectedMode,
+        'gemName': gemNameCtrl.text.trim(),
+        'gemPrompt': gemPromptCtrl.text.trim(),
+        'targetField': targetFieldCtrl.text.trim().isEmpty ? 'AI 深度异状分析' : targetFieldCtrl.text.trim(),
+        'apiKey': apiKeyCtrl.text.trim(),
+      };
+      await AppDatabase.setUiState(widget.db, 'gemini_ai_config', jsonEncode(newCfg));
+    }
+
+    String buildFullPrompt() {
+      final header = selectedMode == 'gem'
+          ? '【当前启用 Gem：${gemNameCtrl.text.trim()} | 模型：$selectedModel】\n${gemPromptCtrl.text.trim()}\n\n'
+          : '【模型：$selectedModel】\n请客观分析以下今日状态并给出分条建议：\n\n';
+      return '$header$summaryText';
+    }
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setS) => DraggableScrollableSheet(
+          expand: false,
+          initialChildSize: 0.88,
+          maxChildSize: 0.96,
+          builder: (_, sc) => Padding(
+            padding: EdgeInsets.fromLTRB(16, 14, 16, MediaQuery.of(ctx).viewInsets.bottom + 14),
+            child: ListView(
+              controller: sc,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(6),
+                      decoration: BoxDecoration(
+                        gradient: const LinearGradient(colors: [Color(0xFF4F46E5), Color(0xFF9333EA)]),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(Icons.auto_awesome, color: Colors.white, size: 18),
+                    ),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text('Gemini 今日状态智能分析', style: TextStyle(fontSize: 16.5, fontWeight: FontWeight.bold)),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, size: 20),
+                      onPressed: () => Navigator.pop(ctx),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                const Text('💡 自动记忆上次选用的模型、对话模式与 Gem 设定，支持直接生成或拉起外部 Gemini', style: TextStyle(fontSize: 11.5, color: Colors.grey)),
+                const Divider(height: 16),
+
+                // 1. 模型选择 & 对话/Gem 模式切换
+                Row(
+                  children: [
+                    Expanded(
+                      flex: 5,
+                      child: DropdownButtonFormField<String>(
+                        value: ['gemini-3.1-pro', 'gemini-2.5-pro', 'gemini-2.5-flash'].contains(selectedModel)
+                            ? selectedModel
+                            : 'gemini-3.1-pro',
+                        isExpanded: true,
+                        decoration: const InputDecoration(
+                          labelText: '选择模型 (Model)',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                          contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                        ),
+                        items: const [
+                          DropdownMenuItem(value: 'gemini-3.1-pro', child: Text('Gemini 3.1 Pro', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold))),
+                          DropdownMenuItem(value: 'gemini-2.5-pro', child: Text('Gemini 2.5 Pro', style: TextStyle(fontSize: 13))),
+                          DropdownMenuItem(value: 'gemini-2.5-flash', child: Text('Gemini 2.5 Flash', style: TextStyle(fontSize: 13))),
+                        ],
+                        onChanged: (v) {
+                          setS(() => selectedModel = v!);
+                          saveCurrentConfig();
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      flex: 4,
+                      child: DropdownButtonFormField<String>(
+                        value: selectedMode == 'chat' ? 'chat' : 'gem',
+                        isExpanded: true,
+                        decoration: const InputDecoration(
+                          labelText: '会话类型',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                          contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                        ),
+                        items: const [
+                          DropdownMenuItem(value: 'gem', child: Text('💎 专属 Gem', style: TextStyle(fontSize: 13))),
+                          DropdownMenuItem(value: 'chat', child: Text('💬 普通对话', style: TextStyle(fontSize: 13))),
+                        ],
+                        onChanged: (v) {
+                          setS(() => selectedMode = v!);
+                          saveCurrentConfig();
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+
+                // 2. Gem 设定（当选择专属 Gem 时展示）
+                if (selectedMode == 'gem') ...[
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: gemNameCtrl,
+                          style: const TextStyle(fontSize: 13),
+                          decoration: const InputDecoration(
+                            labelText: 'Gem 名称 / 预设角色',
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                            contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                          ),
+                          onChanged: (_) => saveCurrentConfig(),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      PopupMenuButton<({String name, String prompt})>(
+                        tooltip: '快速切换常用 Gem 预设',
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFEEF2FF),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: const Color(0xFFC7D2FE)),
+                          ),
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.bookmarks_outlined, size: 15, color: Color(0xFF4F46E5)),
+                              SizedBox(width: 4),
+                              Text('预设Gem', style: TextStyle(fontSize: 12, color: Color(0xFF4F46E5), fontWeight: FontWeight.bold)),
+                            ],
+                          ),
+                        ),
+                        onSelected: (preset) {
+                          setS(() {
+                            gemNameCtrl.text = preset.name;
+                            gemPromptCtrl.text = preset.prompt;
+                          });
+                          saveCurrentConfig();
+                        },
+                        itemBuilder: (_) => [
+                          const PopupMenuItem(
+                            value: (
+                              name: '客观理性系统分析师',
+                              prompt: '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条格式如“标题：具体分析”。',
+                            ),
+                            child: Text('💎 客观理性系统分析师'),
+                          ),
+                          const PopupMenuItem(
+                            value: (
+                              name: '代谢与营养精算师',
+                              prompt: '请聚焦我今日的饮食结构（碳水/蛋白质/钠摄入）与体重变化、体能训练表现，分析水肿或热量缺口情况，并给出明日三餐调整方案。每条格式如“标题：具体分析”。',
+                            ),
+                            child: Text('🥗 代谢与营养精算师'),
+                          ),
+                          const PopupMenuItem(
+                            value: (
+                              name: '精力与日程效能教练',
+                              prompt: '请结合我今日的已完成/未完成日程与核心目标，分析精力分配与决策疲劳点，给出明日单线程减法行动建议。每条格式如“标题：具体分析”。',
+                            ),
+                            child: Text('⚡ 精力与日程效能教练'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: gemPromptCtrl,
+                    minLines: 2,
+                    maxLines: 4,
+                    style: const TextStyle(fontSize: 12.5, height: 1.35),
+                    decoration: const InputDecoration(
+                      labelText: 'Gem 专属分析指令（自动保存）',
+                      border: OutlineInputBorder(),
+                      contentPadding: EdgeInsets.all(8),
+                    ),
+                    onChanged: (_) => saveCurrentConfig(),
+                  ),
+                  const SizedBox(height: 10),
+                ],
+
+                // 3. 导出目标条目设置 & API Key 折叠配置
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: targetFieldCtrl,
+                        style: const TextStyle(fontSize: 13),
+                        decoration: const InputDecoration(
+                          labelText: '导出到每日状态的条目名称',
+                          hintText: '如：AI 深度异状分析',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                          contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                        ),
+                        onChanged: (_) => saveCurrentConfig(),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    TextButton.icon(
+                      onPressed: () => setS(() => showAdvancedKey = !showAdvancedKey),
+                      icon: Icon(showAdvancedKey ? Icons.key_off : Icons.key, size: 16),
+                      label: Text(apiKeyCtrl.text.trim().isEmpty ? '配置API直连' : '已配API', style: const TextStyle(fontSize: 12)),
+                    ),
+                  ],
+                ),
+                if (showAdvancedKey) ...[
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: apiKeyCtrl,
+                    obscureText: true,
+                    style: const TextStyle(fontSize: 12.5),
+                    decoration: const InputDecoration(
+                      labelText: 'Gemini API Key（选填，配置后可直接在App内一键生成）',
+                      hintText: 'AIzaSy...',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    onChanged: (_) => saveCurrentConfig(),
+                  ),
+                ],
+                const SizedBox(height: 12),
+
+                // 4. 操作按钮栏：方式A（复制并跳转 Gemini App/对话） & 方式B（API 内置一键生成）
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 10)),
+                        onPressed: () async {
+                          await saveCurrentConfig();
+                          final fullPrompt = buildFullPrompt();
+                          await Clipboard.setData(ClipboardData(text: fullPrompt));
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(content: Text('✅ 已复制含「${selectedMode == 'gem' ? gemNameCtrl.text : '对话'}」指令的今日摘要，正在拉起 Gemini...')),
+                            );
+                          }
+                          await Share.share(fullPrompt, subject: '今日状态 Gemini 分析');
+                        },
+                        icon: const Icon(Icons.open_in_new, size: 17),
+                        label: const Text('复制并拉起 Gemini App', style: TextStyle(fontSize: 12.5)),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: FilledButton.icon(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: const Color(0xFF4F46E5),
+                          padding: const EdgeInsets.symmetric(vertical: 10),
+                        ),
+                        onPressed: isLoading
+                            ? null
+                            : () async {
+                                await saveCurrentConfig();
+                                final key = apiKeyCtrl.text.trim();
+                                if (key.isEmpty) {
+                                  // 若未配置 API Key，自动复制完整提示词并提示粘贴回下方框
+                                  final fullPrompt = buildFullPrompt();
+                                  await Clipboard.setData(ClipboardData(text: fullPrompt));
+                                  setS(() => showAdvancedKey = true);
+                                  if (mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(content: Text('📋 已复制完整分析指令！可点左侧拉起 Gemini 对话，或填入 API Key 实现应用内直连生成')),
+                                    );
+                                  }
+                                  return;
+                                }
+                                setS(() => isLoading = true);
+                                try {
+                                  // 映射实际 API 模型端点（兼容 3.1-pro 与 2.5-pro）
+                                  final apiModel = selectedModel.contains('flash') ? 'gemini-2.5-flash' : 'gemini-2.5-pro';
+                                  final uri = Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/$apiModel:generateContent?key=$key');
+                                  final client = HttpClient();
+                                  final req = await client.postUrl(uri);
+                                  req.headers.set('Content-Type', 'application/json; charset=utf-8');
+                                  final body = jsonEncode({
+                                    'contents': [
+                                      {
+                                        'parts': [
+                                          {'text': buildFullPrompt()}
+                                        ]
+                                      }
+                                    ]
+                                  });
+                                  req.add(utf8.encode(body));
+                                  final resp = await req.close();
+                                  final respStr = await resp.transform(utf8.decoder).join();
+                                  final json = jsonDecode(respStr) as Map<String, dynamic>;
+                                  final candidates = json['candidates'] as List?;
+                                  if (candidates != null && candidates.isNotEmpty) {
+                                    final parts = candidates.first['content']['parts'] as List;
+                                    final aiText = parts.map((p) => p['text']).join('\n').trim();
+                                    setS(() => resultCtrl.text = aiText);
+                                  } else {
+                                    throw Exception(json['error']?['message'] ?? '返回结果为空');
+                                  }
+                                } catch (e) {
+                                  if (mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('API 调用提示：$e')));
+                                  }
+                                } finally {
+                                  setS(() => isLoading = false);
+                                }
+                              },
+                        icon: isLoading
+                            ? const SizedBox(width: 15, height: 15, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                            : const Icon(Icons.bolt, size: 17),
+                        label: Text(isLoading ? '正在分析...' : 'AI 直接生成分析', style: const TextStyle(fontSize: 12.5)),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+
+                // 5. AI 分析结果预览 / 粘贴框 + 一键导出至每日状态
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text('📥 AI 分析建议（可自由编辑或从 Gemini 粘贴）：', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
+                    TextButton.icon(
+                      style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      onPressed: () async {
+                        final clip = await Clipboard.getData(Clipboard.kTextPlain);
+                        if (clip?.text != null && clip!.text!.trim().isNotEmpty) {
+                          setS(() => resultCtrl.text = clip.text!.trim());
+                        }
+                      },
+                      icon: const Icon(Icons.content_paste, size: 14),
+                      label: const Text('一键粘贴剪贴板', style: TextStyle(fontSize: 12)),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                TextField(
+                  controller: resultCtrl,
+                  minLines: 5,
+                  maxLines: 11,
+                  style: const TextStyle(fontSize: 13.5, height: 1.45),
+                  decoration: const InputDecoration(
+                    hintText: '在此查看 AI 生成的分析建议，或将你在 Gemini App / Gem 中得到的回复粘贴到这里，点击下方按钮即可自动分列导入到今日状态中...',
+                    border: OutlineInputBorder(),
+                    contentPadding: EdgeInsets.all(10),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF10B981),
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                    onPressed: () async {
+                      final rawAi = resultCtrl.text.trim();
+                      if (rawAi.isEmpty) {
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先生成或粘贴 AI 分析内容')));
+                        return;
+                      }
+                      await saveCurrentConfig();
+                      final targetName = targetFieldCtrl.text.trim().isEmpty ? 'AI 深度异状分析' : targetFieldCtrl.text.trim();
+                      // 清理 Markdown 星号符号并将空行规整为标准分列换行
+                      final cleanedLines = rawAi
+                          .split('\n')
+                          .map((line) => line.replaceAll('**', '').replaceFirst(RegExp(r'^[\-\*\•\d]+[\.、\s]\s*'), '').trim())
+                          .where((line) => line.isNotEmpty)
+                          .toList();
+
+                      final itemId = await _ensureStatusItem(targetName, 'text');
+                      // AI 分析默认设为不跨天继承，确保每天都是针对当日的独立评估
+                      await widget.db.update('status_items', {'allow_inherit': 0}, where: 'id = ?', whereArgs: [itemId]);
+                      await widget.db.insert(
+                        'status_records',
+                        {'item_id': itemId, 'date': _date, 'value': cleanedLines.join('\n')},
+                        conflictAlgorithm: ConflictAlgorithm.replace,
+                      );
+                      if (mounted) {
+                        Navigator.pop(ctx);
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(content: Text('🎉 已将 AI 分析建议导入至今日「$targetName」（共 ${cleanedLines.length} 栏）！')),
+                        );
+                        setState(() {});
+                      }
+                    },
+                    icon: const Icon(Icons.download_done, size: 18),
+                    label: const Text('导出 AI 分析建议至「每日状态」', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _importDailyDocx() async {
@@ -800,26 +1246,46 @@ class _TodayPageState extends State<TodayPage> {
                   child: Row(
                     children: [
                       Icon(_foldSummary ? Icons.chevron_right : Icons.expand_more, size: 18, color: const Color(0xFF475569)),
-                      const SizedBox(width: 4),
-                      Text('📋 今日状态摘要 · $_date', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5)),
-                      const SizedBox(width: 6),
-                      Text(_foldSummary ? '(点击展开)' : '(点击收起)', style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                      const SizedBox(width: 3),
+                      Flexible(
+                        child: Text(
+                          '📋 今日状态摘要 · $_date',
+                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
                     ],
                   ),
                 ),
               ),
+              const SizedBox(width: 4),
+              // 一键导入 Gemini 分析按钮
+              SizedBox(
+                height: 26,
+                child: FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF4F46E5),
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    minimumSize: Size.zero,
+                  ),
+                  onPressed: () => _openGeminiAnalyzerSheet(copyText),
+                  icon: const Icon(Icons.auto_awesome, size: 13),
+                  label: const Text('Gemini分析', style: TextStyle(fontSize: 11.5)),
+                ),
+              ),
+              const SizedBox(width: 6),
               SizedBox(
                 height: 26,
                 child: FilledButton.tonal(
                   style: FilledButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    padding: const EdgeInsets.symmetric(horizontal: 9),
                     minimumSize: Size.zero,
                   ),
                   onPressed: () {
                     Clipboard.setData(ClipboardData(text: copyText));
                     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已按分列格式复制摘要到剪贴板')));
                   },
-                  child: const Text('复制', style: TextStyle(fontSize: 12)),
+                  child: const Text('复制', style: TextStyle(fontSize: 11.5)),
                 ),
               ),
             ],
@@ -943,7 +1409,6 @@ class _TodayPageState extends State<TodayPage> {
 
   Widget _buildCompactStatusRow(Map<String, dynamic> it, Map<String, dynamic>? d) {
     final id = it['id'] as int, name = it['name'] as String, type = it['type'] as String;
-    final allowInherit = (it['allow_inherit'] as int? ?? 1) == 1;
     final inh = d?['isInherited'] == true, val = d?['value'] as String? ?? '';
     final imgs = (d?['images'] as List<String>?) ?? [];
     final recId = d?['recordId'] as int? ?? id;
@@ -1352,7 +1817,6 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  /// 新建或修改状态条目（支持勾选是否允许跨天继承）
   void _addOrEditStatusItemDialog({Map<String, dynamic>? editItem}) {
     final isEdit = editItem != null;
     final ctrl = TextEditingController(text: isEdit ? '${editItem['name']}' : '');
