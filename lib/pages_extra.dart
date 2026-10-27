@@ -12,7 +12,6 @@ import 'package:share_plus/share_plus.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
 import 'main.dart' show AppDatabase;
-import 'mindmap_widgets.dart';
 
 class SequenceParser {
   static List<({int seq, String text})> parse(String raw, int currentMaxSeq) {
