@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart' hide TextDirection;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -216,7 +217,6 @@ class FamilyPage extends StatefulWidget {
 }
 
 class _FamilyPageState extends State<FamilyPage> {
-  // 默认为空集合，代表所有小标题默认全部处于折叠状态，点击才展开
   final Set<int> _expandedMods = {};
 
   Future<List<Map<String, dynamic>>> _loadMods() async {
@@ -286,7 +286,7 @@ class _FamilyPageState extends State<FamilyPage> {
         final id = m['id'] as int;
         final subList = all.where((x) => x['parent_id'] == id).toList();
         final hasSub = subList.isNotEmpty;
-        final isExpanded = _expandedMods.contains(id); // 默认 false（折叠）
+        final isExpanded = _expandedMods.contains(id);
 
         return Column(
           key: ValueKey('mod_$id'),
@@ -445,7 +445,6 @@ class _FamilyPageState extends State<FamilyPage> {
                   'sort_order': siblings.length,
                   'created_at': DateTime.now().toIso8601String(),
                 });
-                // 新建子标题时自动展开该父标题以便查看
                 if (parentId != null) _expandedMods.add(parentId);
               }
               if (mounted) Navigator.pop(ctx);
@@ -1125,6 +1124,404 @@ class _SearchPageState extends State<SearchPage> {
   }
 }
 
+// ==================== 二维连接线思维导图绘制器（支持从左向右树形连接线 + 折叠） ====================
+class _BranchLinePainter extends CustomPainter {
+  final int childCount;
+  final Color color;
+  _BranchLinePainter({required this.childCount, required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final p = Paint()
+      ..color = color
+      ..strokeWidth = 1.8
+      ..style = PaintingStyle.stroke;
+    final midY = size.height / 2;
+    canvas.drawLine(Offset(0, midY), Offset(size.width, midY), p);
+  }
+
+  @override
+  bool shouldRepaint(covariant _BranchLinePainter oldDelegate) => false;
+}
+
+class MindmapGraphView extends StatelessWidget {
+  final Map<String, dynamic> root;
+  final Set<String> collapsedIds;
+  final void Function(String nodeId) onToggleCollapse;
+  final void Function(Map<String, dynamic> node, int depth) onTapNode;
+
+  const MindmapGraphView({
+    super.key,
+    required this.root,
+    required this.collapsedIds,
+    required this.onToggleCollapse,
+    required this.onTapNode,
+  });
+
+  static const List<Color> _palette = [
+    Color(0xFF4F46E5),
+    Color(0xFF0EA5E9),
+    Color(0xFF10B981),
+    Color(0xFFF59E0B),
+    Color(0xFFEC4899),
+    Color(0xFF8B5CF6),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return _buildSubtree(root, 0, 0);
+  }
+
+  Widget _buildSubtree(Map<String, dynamic> node, int depth, int branchIndex) {
+    final id = '${node['id']}';
+    final children = (node['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+    final isCollapsed = collapsedIds.contains(id);
+    final hasChildren = children.isNotEmpty;
+    final accent = _palette[branchIndex % _palette.length];
+
+    final nodeCard = _buildNodeCard(node, depth, accent, hasChildren, isCollapsed, children.length);
+
+    if (!hasChildren || isCollapsed) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: nodeCard,
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: IntrinsicHeight(
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            nodeCard,
+            // 父节点右侧引出水平连接线
+            SizedBox(
+              width: 18,
+              height: 20,
+              child: CustomPaint(painter: _BranchLinePainter(childCount: children.length, color: accent.withOpacity(0.55))),
+            ),
+            // 子节点列（左侧带垂直汇流树枝线）
+            Container(
+              decoration: children.length > 1
+                  ? BoxDecoration(
+                      border: Border(left: BorderSide(color: accent.withOpacity(0.45), width: 2)),
+                    )
+                  : null,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: List.generate(children.length, (idx) {
+                  final subBranchIdx = depth == 0 ? idx : branchIndex;
+                  final subColor = _palette[subBranchIdx % _palette.length];
+                  return Row(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      Container(width: 14, height: 1.8, color: subColor.withOpacity(0.55)),
+                      _buildSubtree(children[idx], depth + 1, subBranchIdx),
+                    ],
+                  );
+                }),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildNodeCard(
+    Map<String, dynamic> node,
+    int depth,
+    Color accent,
+    bool hasChildren,
+    bool isCollapsed,
+    int childCount,
+  ) {
+    final id = '${node['id']}';
+    Color bg;
+    Color fg;
+    Color borderCol;
+    if (depth == 0) {
+      bg = const Color(0xFF4F46E5);
+      fg = Colors.white;
+      borderCol = const Color(0xFF4F46E5);
+    } else if (depth == 1) {
+      bg = accent.withOpacity(0.12);
+      fg = const Color(0xFF0F172A);
+      borderCol = accent.withOpacity(0.6);
+    } else {
+      bg = Colors.white;
+      fg = const Color(0xFF1E293B);
+      borderCol = accent.withOpacity(0.35);
+    }
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        GestureDetector(
+          onTap: () => onTapNode(node, depth),
+          child: Container(
+            constraints: BoxConstraints(minWidth: 56, maxWidth: depth == 0 ? 180 : 210),
+            padding: EdgeInsets.symmetric(horizontal: depth == 0 ? 12 : 10, vertical: depth == 0 ? 8 : 6),
+            decoration: BoxDecoration(
+              color: bg,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: borderCol, width: depth <= 1 ? 1.5 : 1.0),
+              boxShadow: const [BoxShadow(color: Color(0x0A000000), blurRadius: 3, offset: Offset(0, 1))],
+            ),
+            child: Text(
+              '${node['text']}',
+              style: TextStyle(
+                fontSize: depth == 0 ? 14 : (depth == 1 ? 13 : 12.5),
+                fontWeight: depth <= 1 ? FontWeight.bold : FontWeight.w500,
+                color: fg,
+                height: 1.3,
+              ),
+            ),
+          ),
+        ),
+        if (hasChildren)
+          GestureDetector(
+            onTap: () => onToggleCollapse(id),
+            child: Container(
+              margin: const EdgeInsets.only(left: 3),
+              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+              decoration: BoxDecoration(
+                color: isCollapsed ? accent : Colors.white,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: accent, width: 1.2),
+              ),
+              child: Text(
+                isCollapsed ? '+$childCount' : '−',
+                style: TextStyle(
+                  fontSize: 10.5,
+                  fontWeight: FontWeight.bold,
+                  color: isCollapsed ? Colors.white : accent,
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+// ==================== 全屏横屏思维导图画布页 ====================
+class FullscreenMindmapPage extends StatefulWidget {
+  final int mmId;
+  final Map<String, dynamic> root;
+  final Set<String> collapsedIds;
+  final Future<void> Function(Map<String, dynamic> updatedRoot) onSave;
+
+  const FullscreenMindmapPage({
+    super.key,
+    required this.mmId,
+    required this.root,
+    required this.collapsedIds,
+    required this.onSave,
+  });
+
+  @override
+  State<FullscreenMindmapPage> createState() => _FullscreenMindmapPageState();
+}
+
+class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
+  final _uuid = const Uuid();
+  bool _isLandscape = true;
+
+  @override
+  void initState() {
+    super.initState();
+    // 进入全屏画布默认切换为横屏，视野更开阔
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+  }
+
+  @override
+  void dispose() {
+    // 退出时自动恢复竖屏
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+    ]);
+    super.dispose();
+  }
+
+  void _toggleOrientation() {
+    setState(() {
+      _isLandscape = !_isLandscape;
+      if (_isLandscape) {
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]);
+      } else {
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.portraitUp,
+        ]);
+      }
+    });
+  }
+
+  bool _rm(Map<String, dynamic> p, String tid) {
+    final ch = (p['children'] as List).cast<Map<String, dynamic>>();
+    final idx = ch.indexWhere((c) => c['id'] == tid);
+    if (idx != -1) { ch.removeAt(idx); return true; }
+    return ch.any((c) => _rm(c, tid));
+  }
+
+  void _onNodeAction(Map<String, dynamic> node, int depth) {
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.account_tree, color: Color(0xFF4F46E5)),
+              title: Text('${node['text']}', style: const TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: const Text('选择对该节点的操作'),
+            ),
+            const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.add_circle_outline, color: Colors.indigo),
+              title: const Text('添加子节点'),
+              onTap: () {
+                Navigator.pop(ctx);
+                final ctrl = TextEditingController();
+                showDialog(
+                  context: context,
+                  builder: (dCtx) => AlertDialog(
+                    title: const Text('添加子节点'),
+                    content: TextField(controller: ctrl, autofocus: true, minLines: 1, maxLines: 3),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(dCtx), child: const Text('取消')),
+                      FilledButton(
+                        onPressed: () async {
+                          if (ctrl.text.trim().isEmpty) return;
+                          (node['children'] as List).add({'id': _uuid.v4(), 'text': ctrl.text.trim(), 'children': []});
+                          widget.collapsedIds.remove('${node['id']}');
+                          if (mounted) Navigator.pop(dCtx);
+                          await widget.onSave(widget.root);
+                          setState(() {});
+                        },
+                        child: const Text('添加'),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.edit_outlined, color: Colors.blueGrey),
+              title: const Text('修改节点文字'),
+              onTap: () {
+                Navigator.pop(ctx);
+                final ctrl = TextEditingController(text: '${node['text']}');
+                showDialog(
+                  context: context,
+                  builder: (dCtx) => AlertDialog(
+                    title: const Text('修改节点文字'),
+                    content: TextField(controller: ctrl, autofocus: true, minLines: 1, maxLines: 4),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(dCtx), child: const Text('取消')),
+                      FilledButton(
+                        onPressed: () async {
+                          if (ctrl.text.trim().isEmpty) return;
+                          node['text'] = ctrl.text.trim();
+                          if (mounted) Navigator.pop(dCtx);
+                          await widget.onSave(widget.root);
+                          setState(() {});
+                        },
+                        child: const Text('保存'),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+            if (depth > 0)
+              ListTile(
+                leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
+                title: const Text('删除该节点及下属分支', style: TextStyle(color: Colors.redAccent)),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  _rm(widget.root, '${node['id']}');
+                  await widget.onSave(widget.root);
+                  setState(() {});
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF8FAFC),
+      appBar: AppBar(
+        toolbarHeight: 44,
+        title: Text('🧠 ${widget.root['text']}（双指缩放 / 轻点节点编辑）', style: const TextStyle(fontSize: 14.5, fontWeight: FontWeight.bold)),
+        actions: [
+          TextButton.icon(
+            onPressed: () {
+              setState(() {
+                if (widget.collapsedIds.isNotEmpty) {
+                  widget.collapsedIds.clear();
+                } else {
+                  // 一键收起到只显示前 2 层，理清主干
+                  void foldDeep(Map<String, dynamic> n, int d) {
+                    if (d >= 1) widget.collapsedIds.add('${n['id']}');
+                    for (final c in ((n['children'] as List?)?.cast<Map<String, dynamic>>() ?? [])) {
+                      foldDeep(c, d + 1);
+                    }
+                  }
+                  foldDeep(widget.root, 0);
+                }
+              });
+            },
+            icon: const Icon(Icons.unfold_less, size: 17),
+            label: Text(widget.collapsedIds.isNotEmpty ? '全部展开' : '只看主干', style: const TextStyle(fontSize: 12.5)),
+          ),
+          TextButton.icon(
+            onPressed: _toggleOrientation,
+            icon: const Icon(Icons.screen_rotation, size: 16),
+            label: Text(_isLandscape ? '切回竖屏' : '切换横屏', style: const TextStyle(fontSize: 12.5)),
+          ),
+        ],
+      ),
+      body: InteractiveViewer(
+        constrained: false,
+        boundaryMargin: const EdgeInsets.all(400),
+        minScale: 0.25,
+        maxScale: 2.5,
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: MindmapGraphView(
+            root: widget.root,
+            collapsedIds: widget.collapsedIds,
+            onToggleCollapse: (id) => setState(() {
+              if (widget.collapsedIds.contains(id)) {
+                widget.collapsedIds.remove(id);
+              } else {
+                widget.collapsedIds.add(id);
+              }
+            }),
+            onTapNode: _onNodeAction,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ==================== Tab 4: 规划页（支持二维连接线导图 + 一键全屏横屏 + 导入 XMind） ====================
 class PlanPage extends StatefulWidget {
   final Database db;
   const PlanPage({super.key, required this.db});
@@ -1294,17 +1691,9 @@ class _PlanPageState extends State<PlanPage> {
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             itemCount: list.length,
             itemBuilder: (_, i) {
-              final mm = list[i], root = jsonDecode('${mm['root_json']}') as Map<String, dynamic>;
-              final flatNodes = <({Map<String, dynamic> node, int depth})>[];
-              void flatten(Map<String, dynamic> n, int d) {
-                flatNodes.add((node: n, depth: d));
-                final id = '${n['id']}';
-                if (!_col.contains(id)) {
-                  final ch = (n['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
-                  for (final c in ch) flatten(c, d + 1);
-                }
-              }
-              flatten(root, 0);
+              final mm = list[i];
+              final mmId = mm['id'] as int;
+              final root = jsonDecode('${mm['root_json']}') as Map<String, dynamic>;
 
               return Card(
                 margin: const EdgeInsets.only(bottom: 14),
@@ -1314,10 +1703,11 @@ class _PlanPageState extends State<PlanPage> {
                   side: const BorderSide(color: Color(0xFFE2E8F0)),
                 ),
                 child: Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      // 顶部栏：标题 + 只看主干/展开 + 全屏横屏按钮 + 删除
                       Row(
                         children: [
                           const Icon(Icons.account_tree, size: 16, color: Color(0xFF4F46E5)),
@@ -1325,52 +1715,91 @@ class _PlanPageState extends State<PlanPage> {
                           Expanded(
                             child: Text(
                               '${root['text']}',
-                              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFF475569)),
+                              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Color(0xFF1E293B)),
                               overflow: TextOverflow.ellipsis,
                             ),
                           ),
                           TextButton(
                             style: TextButton.styleFrom(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                               minimumSize: Size.zero,
                               tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                             ),
                             onPressed: () {
                               setState(() {
-                                void collectIds(Map<String, dynamic> n, int d) {
-                                  if (d >= 1) _col.add('${n['id']}');
+                                final subIds = <String>[];
+                                void collectDeep(Map<String, dynamic> n, int d) {
+                                  if (d >= 1) subIds.add('${n['id']}');
                                   for (final c in ((n['children'] as List?)?.cast<Map<String, dynamic>>() ?? [])) {
-                                    collectIds(c, d + 1);
+                                    collectDeep(c, d + 1);
                                   }
                                 }
-                                final anyCollapsed = flatNodes.any((x) => _col.contains('${x.node['id']}'));
-                                if (anyCollapsed) {
-                                  _col.clear();
+                                collectDeep(root, 0);
+                                final anyCol = subIds.any((id) => _col.contains(id));
+                                if (anyCol) {
+                                  _col.removeAll(subIds);
                                 } else {
-                                  collectIds(root, 0);
+                                  _col.addAll(subIds);
                                 }
                               });
                             },
-                            child: const Text('展开/收起', style: TextStyle(fontSize: 11.5)),
+                            child: const Text('收起/展开', style: TextStyle(fontSize: 11.5)),
+                          ),
+                          const SizedBox(width: 4),
+                          FilledButton.tonalIcon(
+                            style: FilledButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              minimumSize: Size.zero,
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                            onPressed: () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => FullscreenMindmapPage(
+                                    mmId: mmId,
+                                    root: root,
+                                    collapsedIds: _col,
+                                    onSave: (updated) => _save(mmId, updated),
+                                  ),
+                                ),
+                              ).then((_) => setState(() {}));
+                            },
+                            icon: const Icon(Icons.screen_rotation, size: 13),
+                            label: const Text('全屏横屏', style: TextStyle(fontSize: 11.5)),
                           ),
                           InkWell(
-                            onTap: () => _confirmDeleteMindmap(mm['id'] as int, '${root['text']}'),
+                            onTap: () => _confirmDeleteMindmap(mmId, '${root['text']}'),
                             child: const Padding(
-                              padding: EdgeInsets.only(left: 6),
+                              padding: EdgeInsets.only(left: 8),
                               child: Icon(Icons.delete_outline, color: Colors.redAccent, size: 18),
                             ),
                           ),
                         ],
                       ),
-                      const Divider(height: 12),
+                      const Padding(
+                        padding: EdgeInsets.only(top: 2, bottom: 4),
+                        child: Text(
+                          '💡 左右滑动查看树状连接脉络 · 轻点任意节点可增删编辑 · 点击右上「全屏横屏」可双指自由缩放',
+                          style: TextStyle(fontSize: 10.5, color: Colors.grey),
+                        ),
+                      ),
+                      const Divider(height: 8),
+                      // 二维树状连接线导图视图（支持横向滚动）
                       SingleChildScrollView(
                         scrollDirection: Axis.horizontal,
-                        child: ConstrainedBox(
-                          constraints: BoxConstraints(minWidth: MediaQuery.of(context).size.width - 52),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: flatNodes.map((item) => _buildFlatNodeRow(mm['id'] as int, root, item.node, item.depth)).toList(),
-                          ),
+                        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+                        child: MindmapGraphView(
+                          root: root,
+                          collapsedIds: _col,
+                          onToggleCollapse: (id) => setState(() {
+                            if (_col.contains(id)) {
+                              _col.remove(id);
+                            } else {
+                              _col.add(id);
+                            }
+                          }),
+                          onTapNode: (node, depth) => _showNodeActionSheet(mmId, root, node, depth),
                         ),
                       ),
                     ],
@@ -1384,134 +1813,46 @@ class _PlanPageState extends State<PlanPage> {
     );
   }
 
-  Widget _buildFlatNodeRow(int mmId, Map<String, dynamic> root, Map<String, dynamic> node, int d) {
-    final id = '${node['id']}';
-    final ch = (node['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
-    final col = _col.contains(id);
-    final indent = d * 18.0;
-
-    Color bgColor;
-    Color textColor;
-    Color borderColor;
-    if (d == 0) {
-      bgColor = const Color(0xFF4F46E5);
-      textColor = Colors.white;
-      borderColor = const Color(0xFF4F46E5);
-    } else if (d == 1) {
-      bgColor = const Color(0xFFEEF2FF);
-      textColor = const Color(0xFF3730A3);
-      borderColor = const Color(0xFFC7D2FE);
-    } else if (d == 2) {
-      bgColor = const Color(0xFFF8FAFC);
-      textColor = const Color(0xFF1E293B);
-      borderColor = const Color(0xFFE2E8F0);
-    } else {
-      bgColor = Colors.white;
-      textColor = const Color(0xFF334155);
-      borderColor = const Color(0xFFF1F5F9);
-    }
-
-    return Padding(
-      padding: EdgeInsets.only(left: indent, top: 3, bottom: 3),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (ch.isNotEmpty)
-            GestureDetector(
-              onTap: () => setState(() => col ? _col.remove(id) : _col.add(id)),
-              child: Container(
-                width: 22,
-                height: 22,
-                margin: const EdgeInsets.only(right: 4),
-                decoration: BoxDecoration(
-                  color: col ? const Color(0xFFEEF2FF) : Colors.transparent,
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                alignment: Alignment.center,
-                child: Icon(
-                  col ? Icons.add_box_outlined : Icons.indeterminate_check_box_outlined,
-                  size: 16,
-                  color: const Color(0xFF4F46E5),
-                ),
-              ),
-            )
-          else if (d > 0)
-            Container(
-              width: 18,
-              alignment: Alignment.center,
-              margin: const EdgeInsets.only(right: 4),
-              child: Container(
-                width: 5,
-                height: 5,
-                decoration: const BoxDecoration(color: Color(0xFF94A3B8), shape: BoxShape.circle),
-              ),
+  void _showNodeActionSheet(int mmId, Map<String, dynamic> root, Map<String, dynamic> node, int depth) {
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.account_tree, color: Color(0xFF4F46E5)),
+              title: Text('${node['text']}', style: const TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: const Text('选择对该节点的操作'),
             ),
-
-          GestureDetector(
-            onTap: () => _editNode(mmId, root, node),
-            child: Container(
-              constraints: const BoxConstraints(minWidth: 60, maxWidth: 260),
-              padding: EdgeInsets.symmetric(horizontal: d == 0 ? 12 : 10, vertical: d == 0 ? 6 : 5),
-              decoration: BoxDecoration(
-                color: bgColor,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: borderColor),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Flexible(
-                    child: Text(
-                      '${node['text']}',
-                      style: TextStyle(
-                        fontSize: d == 0 ? 14.5 : (d == 1 ? 13.5 : 13),
-                        fontWeight: d <= 1 ? FontWeight.bold : FontWeight.normal,
-                        color: textColor,
-                        height: 1.3,
-                      ),
-                    ),
-                  ),
-                  if (col && ch.isNotEmpty) ...[
-                    const SizedBox(width: 6),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                      decoration: BoxDecoration(
-                        color: d == 0 ? Colors.white24 : const Color(0xFFE0E7FF),
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: Text(
-                        '+${ch.length}',
-                        style: TextStyle(fontSize: 10, color: d == 0 ? Colors.white : const Color(0xFF4F46E5), fontWeight: FontWeight.bold),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ),
-
-          const SizedBox(width: 6),
-          InkWell(
-            borderRadius: BorderRadius.circular(12),
-            onTap: () => _addNode(mmId, root, node),
-            child: const Padding(
-              padding: EdgeInsets.all(4),
-              child: Icon(Icons.add_circle_outline, size: 17, color: Color(0xFF64748B)),
-            ),
-          ),
-          if (d > 0)
-            InkWell(
-              borderRadius: BorderRadius.circular(12),
-              onTap: () async {
-                _rm(root, id);
-                await _save(mmId, root);
+            const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.add_circle_outline, color: Colors.indigo),
+              title: const Text('添加子节点'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _addNode(mmId, root, node);
               },
-              child: const Padding(
-                padding: EdgeInsets.all(4),
-                child: Icon(Icons.close, size: 16, color: Colors.redAccent),
-              ),
             ),
-        ],
+            ListTile(
+              leading: const Icon(Icons.edit_outlined, color: Colors.blueGrey),
+              title: const Text('修改节点文字'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _editNode(mmId, root, node);
+              },
+            ),
+            if (depth > 0)
+              ListTile(
+                leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
+                title: const Text('删除该节点及下属分支', style: TextStyle(color: Colors.redAccent)),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  _rm(root, '${node['id']}');
+                  await _save(mmId, root);
+                },
+              ),
+          ],
+        ),
       ),
     );
   }
