@@ -194,9 +194,9 @@ class TodayPage extends StatefulWidget {
 class _TodayPageState extends State<TodayPage> {
   String _date = DateFormat('yyyy-MM-dd').format(DateTime.now());
   final Map<int, bool> _expandedPhoto = {};
-  final Set<int> _collapsedStatusIds = {}; // 折叠过长的单条状态
-  final Set<int> _collapsedSchedParents = {}; // 折叠子日程
-  bool _foldSummary = true; // 摘要默认折叠为一行以省空间，点击展开
+  final Set<int> _collapsedStatusIds = {};
+  final Set<int> _collapsedSchedParents = {};
+  bool _foldSummary = true;
   bool _foldStatusSection = false;
   bool _foldSchedSection = false;
 
@@ -245,7 +245,6 @@ class _TodayPageState extends State<TodayPage> {
     return res;
   }
 
-  /// 将包含换行、|、◦、；的内容自动拆分成独立分列项
   List<String> _splitColumns(String raw) {
     final trimmed = raw.trim();
     if (trimmed.isEmpty) return [];
@@ -296,7 +295,6 @@ class _TodayPageState extends State<TodayPage> {
             children: [
               _buildSummary(items, disp, scheds, doneMap),
 
-              // ==================== 板块一：每日状态（支持整体折叠） ====================
               _buildSectionHeader(
                 icon: '📊',
                 title: '每日状态 (${items.length})',
@@ -328,7 +326,6 @@ class _TodayPageState extends State<TodayPage> {
                         ),
                 ),
 
-              // ==================== 板块二：日程打卡（支持整体折叠与子日程折叠） ====================
               _buildSectionHeader(
                 icon: '📅',
                 title: '日程打卡 ($doneCount/${scheds.length})',
@@ -481,7 +478,6 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  /// 紧凑型每日状态行：支持点击名称改条目、点击内容分列填写、多列自适应展示、单条折叠
   Widget _buildCompactStatusRow(Map<String, dynamic> it, Map<String, dynamic>? d) {
     final id = it['id'] as int, name = it['name'] as String, type = it['type'] as String;
     final inh = d?['isInherited'] == true, val = d?['value'] as String? ?? '';
@@ -498,7 +494,6 @@ class _TodayPageState extends State<TodayPage> {
           Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              // 折叠单条箭头（当有多个分列或长文本时方便收起）
               if (cols.length > 1 || val.length > 22 || imgs.isNotEmpty)
                 GestureDetector(
                   onTap: () => setState(() => isItemFolded ? _collapsedStatusIds.remove(id) : _collapsedStatusIds.add(id)),
@@ -507,7 +502,6 @@ class _TodayPageState extends State<TodayPage> {
                     child: Icon(isItemFolded ? Icons.chevron_right : Icons.expand_more, size: 17, color: Colors.grey[600]),
                   ),
                 ),
-              // 状态条目名称（点击可直接编辑条目名称/类型）
               GestureDetector(
                 onTap: () => _addOrEditStatusItemDialog(editItem: it),
                 child: Row(
@@ -515,7 +509,7 @@ class _TodayPageState extends State<TodayPage> {
                   children: [
                     Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Color(0xFF1E293B))),
                     const SizedBox(width: 3),
-                    Icon(Icons.edit_ note, size: 14, color: Colors.grey[400]),
+                    Icon(Icons.edit_note, size: 14, color: Colors.grey[400]),
                   ],
                 ),
               ),
@@ -528,7 +522,6 @@ class _TodayPageState extends State<TodayPage> {
                 ),
               ],
               const SizedBox(width: 8),
-              // 如果只有 1 列简短内容且未折叠，直接同行展示，极致省空间
               if (type != 'image' && cols.length <= 1 && val.length <= 18 && !isItemFolded)
                 Expanded(
                   child: GestureDetector(
@@ -556,7 +549,6 @@ class _TodayPageState extends State<TodayPage> {
                     ),
                   ),
                 ),
-              // 右侧紧凑功能图标组
               if (type == 'number')
                 InkWell(
                   onTap: () => _showTrend(id, name),
@@ -586,7 +578,6 @@ class _TodayPageState extends State<TodayPage> {
             ],
           ),
 
-          // 当有多列内容（分列模式）或较长文本时，在下方以清晰的自适应分列网格/列表展示
           if (!isItemFolded && type != 'image' && (cols.length > 1 || val.length > 18))
             Padding(
               padding: const EdgeInsets.only(top: 6),
@@ -594,7 +585,6 @@ class _TodayPageState extends State<TodayPage> {
                 onTap: () => _editValDialog(id, name, type, val),
                 child: LayoutBuilder(
                   builder: (ctx, constraints) {
-                    // 若每列较短则双列并排分列展示，若包含长句则全宽分栏展示，绝不截断
                     final useTwoCols = cols.length >= 2 && cols.every((c) => c.length <= 16);
                     final itemWidth = useTwoCols ? (constraints.maxWidth - 6) / 2 : constraints.maxWidth;
                     return Wrap(
@@ -658,7 +648,6 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  /// 支持多级可折叠子日程与点击编辑的日程树
   Widget _buildScheduleTree(List<Map<String, dynamic>> allScheds, Map<int, bool> doneMap) {
     final validIds = allScheds.map((s) => s['id'] as int).toSet();
     final roots = allScheds.where((s) {
@@ -769,7 +758,6 @@ class _TodayPageState extends State<TodayPage> {
                     ),
                   ),
                 ),
-                // 添加子日程按钮
                 InkWell(
                   onTap: () => _addOrEditSchedDialog(parentId: sid, parentTitle: '${s['title']}'),
                   child: const Padding(
@@ -777,7 +765,6 @@ class _TodayPageState extends State<TodayPage> {
                     child: Icon(Icons.add_circle_outline, size: 17, color: Color(0xFF4F46E5)),
                   ),
                 ),
-                // 编辑日程按钮
                 InkWell(
                   onTap: () => _addOrEditSchedDialog(editSched: s),
                   child: const Padding(
@@ -785,7 +772,6 @@ class _TodayPageState extends State<TodayPage> {
                     child: Icon(Icons.edit_outlined, size: 16, color: Colors.blueGrey),
                   ),
                 ),
-                // 删除日程按钮（连带删除子日程）
                 InkWell(
                   onTap: () async {
                     final subIds = <int>[sid];
@@ -896,7 +882,6 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  /// 新建或修改状态条目（名称与类型）
   void _addOrEditStatusItemDialog({Map<String, dynamic>? editItem}) {
     final isEdit = editItem != null;
     final ctrl = TextEditingController(text: isEdit ? '${editItem['name']}' : '');
@@ -955,9 +940,7 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  /// 支持多行编辑与一键分列的填写弹窗
   void _editValDialog(int id, String name, String type, String init) {
-    // 将旧文本中的 ◦ 或 ； 自动转换为换行，方便用户在多行模式下直观编辑各分列
     String formattedInit = init;
     if (type == 'text' && !init.contains('\n') && (init.contains('◦') || init.contains('；'))) {
       formattedInit = _splitColumns(init).join('\n');
@@ -1040,7 +1023,6 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  /// 新建、修改日程或添加子日程
   Future<void> _addOrEditSchedDialog({Map<String, dynamic>? editSched, int? parentId, String? parentTitle}) async {
     final plans = await _loadPlans();
     if (!mounted) return;
