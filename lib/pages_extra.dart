@@ -187,6 +187,195 @@ class _ModuleTreeSelectorState extends State<ModuleTreeSelector> {
                       value: isChecked,
                       materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
                       visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
+ import 'dart:convert';
+import 'dart:io';
+import 'dart:math' as math;
+import 'package:archive/archive_io.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:intl/intl.dart' hide TextDirection;
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:uuid/uuid.dart';
+import 'main.dart' show AppDatabase;
+
+class SequenceParser {
+  static List<({int seq, String text})> parse(String raw, int currentMaxSeq) {
+    final lines = raw.split('\n');
+    final results = <({int seq, String text})>[];
+    final circledMap = <String, int>{};
+    for (int i = 0; i < 20; i++) circledMap[String.fromCharCode(0x2460 + i)] = i + 1;
+    for (int i = 0; i < 30; i++) circledMap[String.fromCharCode(0x3251 + i)] = i + 21;
+    final arabic = RegExp(r'^(\d+)[\.、\)）\s]\s*(.*)$');
+    final paren = RegExp(r'^[\(（](\d+)[\)）]\s*(.*)$');
+    int autoSeq = currentMaxSeq;
+
+    for (final line in lines) {
+      final t = line.trim();
+      if (t.isEmpty) continue;
+      final fc = t.characters.first;
+      if (circledMap.containsKey(fc)) {
+        final c = t.substring(fc.length).trim();
+        if (c.isNotEmpty) results.add((seq: circledMap[fc]!, text: c));
+        continue;
+      }
+      final m1 = arabic.firstMatch(t);
+      if (m1 != null && m1.group(2)!.trim().isNotEmpty) {
+        results.add((seq: int.parse(m1.group(1)!), text: m1.group(2)!.trim()));
+        continue;
+      }
+      final m2 = paren.firstMatch(t);
+      if (m2 != null && m2.group(2)!.trim().isNotEmpty) {
+        results.add((seq: int.parse(m2.group(1)!), text: m2.group(2)!.trim()));
+        continue;
+      }
+      autoSeq++;
+      results.add((seq: autoSeq, text: t));
+    }
+    return results;
+  }
+}
+
+class ModuleTreeSelector extends StatefulWidget {
+  final List<Map<String, dynamic>> allMods;
+  final Set<int> selectedIds;
+  final VoidCallback onChanged;
+
+  const ModuleTreeSelector({
+    super.key,
+    required this.allMods,
+    required this.selectedIds,
+    required this.onChanged,
+  });
+
+  @override
+  State<ModuleTreeSelector> createState() => _ModuleTreeSelectorState();
+}
+
+class _ModuleTreeSelectorState extends State<ModuleTreeSelector> {
+  final Set<int> _expandedIds = {};
+
+  List<Map<String, dynamic>> _childrenOf(int? pid) {
+    return widget.allMods.where((m) => m['parent_id'] == pid).toList();
+  }
+
+  List<int> _descendantsOf(int pid) {
+    final res = <int>[];
+    void walk(int cur) {
+      for (final m in _childrenOf(cur)) {
+        final id = m['id'] as int;
+        res.add(id);
+        walk(id);
+      }
+    }
+    walk(pid);
+    return res;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final roots = _childrenOf(null);
+    if (roots.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.all(16),
+        child: Center(child: Text('暂无标题', style: TextStyle(color: Colors.grey))),
+      );
+    }
+    return ListView(
+      shrinkWrap: true,
+      children: roots.map((r) => _buildNode(r, 0)).toList(),
+    );
+  }
+
+  Widget _buildNode(Map<String, dynamic> m, int depth) {
+    final id = m['id'] as int;
+    final children = _childrenOf(id);
+    final hasChildren = children.isNotEmpty;
+    final isExpanded = _expandedIds.contains(id);
+    final isChecked = widget.selectedIds.contains(id);
+    final descIds = hasChildren ? _descendantsOf(id) : <int>[];
+    final selectedChildCount = descIds.where((cid) => widget.selectedIds.contains(cid)).length;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          onTap: () {
+            setState(() {
+              if (isChecked) {
+                widget.selectedIds.remove(id);
+              } else {
+                widget.selectedIds.add(id);
+              }
+            });
+            widget.onChanged();
+          },
+          child: Padding(
+            padding: EdgeInsets.only(left: depth * 16.0, top: 2, bottom: 2),
+            child: SizedBox(
+              height: 32,
+              child: Row(
+                children: [
+                  if (hasChildren)
+                    GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => setState(() => isExpanded ? _expandedIds.remove(id) : _expandedIds.add(id)),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                        child: Icon(
+                          isExpanded ? Icons.arrow_drop_down : Icons.arrow_right,
+                          size: 20,
+                          color: const Color(0xFF4F46E5),
+                        ),
+                      ),
+                    )
+                  else
+                    const SizedBox(width: 28),
+                  Icon(
+                    depth == 0 ? Icons.folder_outlined : Icons.subdirectory_arrow_right,
+                    size: 16,
+                    color: depth == 0 ? Colors.indigo : Colors.blueGrey,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '${m['title']}',
+                      style: TextStyle(
+                        fontSize: 13.5,
+                        fontWeight: depth == 0 ? FontWeight.w600 : FontWeight.normal,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  if (hasChildren)
+                    GestureDetector(
+                      onTap: () => setState(() => isExpanded ? _expandedIds.remove(id) : _expandedIds.add(id)),
+                      child: Container(
+                        margin: const EdgeInsets.only(right: 4),
+                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: selectedChildCount > 0 ? const Color(0xFFEEF2FF) : const Color(0xFFF1F5F9),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          selectedChildCount > 0 ? '已选$selectedChildCount/${children.length}' : '细筛(${children.length})',
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            color: selectedChildCount > 0 ? const Color(0xFF4F46E5) : Colors.grey[600],
+                          ),
+                        ),
+                      ),
+                    ),
+                  SizedBox(
+                    width: 28,
+                    height: 28,
+                    child: Checkbox(
+                      value: isChecked,
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
                       onChanged: (v) {
                         setState(() {
                           if (v == true) {
@@ -211,7 +400,7 @@ class _ModuleTreeSelectorState extends State<ModuleTreeSelector> {
   }
 }
 
-// ==================== 家庭模块（精准多级文件夹拆分 + 成员管理） ====================
+// ==================== 家庭模块（跨层级自由拖拽 + 高定审美成员卡片 + Word 智能分级导入） ====================
 class FamilyPage extends StatefulWidget {
   final Database db;
   const FamilyPage({super.key, required this.db});
@@ -222,6 +411,7 @@ class FamilyPage extends StatefulWidget {
 class _FamilyPageState extends State<FamilyPage> {
   final Set<int> _expandedMods = {};
   bool _uiLoaded = false;
+  int? _draggingModId; // 当前正在长按拖拽的标题 ID
 
   @override
   void initState() {
@@ -262,6 +452,61 @@ class _FamilyPageState extends State<FamilyPage> {
     return parts.join(' > ');
   }
 
+  /// 检查 targetId 是否为 draggedId 的子孙节点（防止父节点拖进自己的子节点造成死循环）
+  bool _isDescendant(int draggedId, int? targetId, List<Map<String, dynamic>> all) {
+    if (targetId == null) return false;
+    if (draggedId == targetId) return true;
+    final map = {for (final m in all) m['id'] as int: m};
+    int? cur = targetId;
+    int guard = 0;
+    while (cur != null && map.containsKey(cur) && guard++ < 30) {
+      if (cur == draggedId) return true;
+      cur = map[cur]!['parent_id'] as int?;
+    }
+    return false;
+  }
+
+  /// 核心：跨层级移动或同级排序（支持成为子标题、脱出成为大标题、插队排序）
+  Future<void> _moveModule({
+    required int draggedId,
+    required int? newParentId,
+    int? insertBeforeId,
+    int? insertAfterId,
+    required List<Map<String, dynamic>> all,
+  }) async {
+    if (_isDescendant(draggedId, newParentId, all)) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('⚠️ 不能将父标题拖动到其自己的子标题内部')));
+      }
+      return;
+    }
+
+    // 取出目标父层级下的所有同级节点（排除被拖拽节点自身）
+    final siblings = all
+        .where((m) => m['parent_id'] == newParentId && (m['id'] as int) != draggedId)
+        .map((m) => m['id'] as int)
+        .toList();
+
+    int insertIdx = siblings.length;
+    if (insertBeforeId != null && siblings.contains(insertBeforeId)) {
+      insertIdx = siblings.indexOf(insertBeforeId);
+    } else if (insertAfterId != null && siblings.contains(insertAfterId)) {
+      insertIdx = siblings.indexOf(insertAfterId) + 1;
+    }
+    siblings.insert(insertIdx.clamp(0, siblings.length), draggedId);
+
+    await widget.db.update('modules', {'parent_id': newParentId}, where: 'id = ?', whereArgs: [draggedId]);
+    for (int i = 0; i < siblings.length; i++) {
+      await widget.db.update('modules', {'sort_order': i}, where: 'id = ?', whereArgs: [siblings[i]]);
+    }
+
+    if (newParentId != null) {
+      _expandedMods.add(newParentId);
+      await _saveFamilyUiState();
+    }
+    if (mounted) setState(() => _draggingModId = null);
+  }
+
   String _unescapeXml(String s) {
     return s
         .replaceAll('&amp;', '&')
@@ -271,7 +516,7 @@ class _FamilyPageState extends State<FamilyPage> {
         .replaceAll('&apos;', "'");
   }
 
-  Future<int> _createCleanMod(String title, int? parentId) async {
+  Future<int> _createCleanMod(String title, int? parentId, {bool isMember = false}) async {
     final cleanTitle = title.trim();
     final siblings = await widget.db.query(
       'modules',
@@ -281,6 +526,7 @@ class _FamilyPageState extends State<FamilyPage> {
     return await widget.db.insert('modules', {
       'title': cleanTitle,
       'parent_id': parentId,
+      'is_member': isMember ? 1 : 0,
       'sort_order': siblings.length,
       'created_at': DateTime.now().toIso8601String(),
     });
@@ -305,7 +551,6 @@ class _FamilyPageState extends State<FamilyPage> {
     }
   }
 
-  /// 全新多级文件夹精准解析引擎：彻底解决各级标题揉在一起的问题
   Future<void> _importFamilyDocx() async {
     try {
       final res = await FilePicker.platform.pickFiles(type: FileType.any);
@@ -344,7 +589,7 @@ class _FamilyPageState extends State<FamilyPage> {
                   controller: nameCtrl,
                   autofocus: true,
                   decoration: const InputDecoration(
-                    labelText: '家庭成员姓名（顶层文件夹）',
+                    labelText: '家庭成员姓名（顶层专属卡片）',
                     hintText: '如：梦雨',
                     border: OutlineInputBorder(),
                   ),
@@ -414,21 +659,21 @@ class _FamilyPageState extends State<FamilyPage> {
         return t;
       }
 
-      // 查找或创建顶层成员文件夹（如：梦雨）
       final existingRoots = await widget.db.query('modules', where: 'parent_id IS NULL AND title = ?', whereArgs: [confirmedName]);
       int memberId;
       if (existingRoots.isNotEmpty) {
         memberId = existingRoots.first['id'] as int;
+        await widget.db.update('modules', {'is_member': 1}, where: 'id = ?', whereArgs: [memberId]);
         if (overwriteOld) await _clearMemberOldTree(memberId);
       } else {
-        memberId = await _createCleanMod(confirmedName, null);
+        memberId = await _createCleanMod(confirmedName, null, isMember: true);
       }
       _expandedMods.add(memberId);
 
-      int? l1Id;     // 一、安排 / 二、首要信息
-      int? l2Id;     // ● 身体情况 / ① 短期安排 / ② 长期规划 / ④ 喜欢的主食
-      int? l3Id;     // ① 喜欢吃辣 / ① 过敏 / ② 胃炎 / ③ 晕车 ...
-      int? lastListEntryId; // 用于把“店铺：...”、“菜品：...”合并到上一条探店记录
+      int? l1Id;
+      int? l2Id;
+      int? l3Id;
+      int? lastListEntryId;
       int importedFolders = 0;
       int importedEntries = 0;
 
@@ -436,7 +681,6 @@ class _FamilyPageState extends State<FamilyPage> {
         final cur = paragraphs[i];
         final txt = cur.text;
 
-        // 1. 一级大标题文件夹（如：“一、安排：”、“二、首要信息：”）
         final l1M = RegExp(r'^[一二三四五六七八九十]+[、\.\s]\s*(.+)$').firstMatch(txt);
         if (l1M != null) {
           final folderName = txt.replaceAll(RegExp(r'[:：]$'), '').trim();
@@ -448,7 +692,6 @@ class _FamilyPageState extends State<FamilyPage> {
           continue;
         }
 
-        // 2. 实心圆点分类文件夹（如：“● 身体情况：”、“● 住址：”）
         final bulletM = RegExp(r'^[\u25CF\u2022\uF0B7\u25AA]\s*(.+)$').firstMatch(txt);
         if (bulletM != null) {
           final folderName = bulletM.group(1)!.replaceAll(RegExp(r'[:：]$'), '').trim();
@@ -459,7 +702,6 @@ class _FamilyPageState extends State<FamilyPage> {
           continue;
         }
 
-        // 3. 识别带圈数字或阿拉伯数字序号开头的段落
         final seqNum = extractSeq(txt);
         if (seqNum != null) {
           final rest = stripSeqPrefix(txt);
@@ -474,12 +716,9 @@ class _FamilyPageState extends State<FamilyPage> {
               !RegExp(r'^[\u25CF\u2022\uF0B7\u25AA]').hasMatch(nextP.text);
           final nextIsShopOrDish = nextP != null && RegExp(r'^(店铺|菜品|地址|推荐|备注)[:：]').hasMatch(nextP.text);
 
-          // 情况 A：下一段立刻又是 ①（如“① 短期安排”后跟“① 想要去玩水”，“④ 喜欢的主食”后跟“① 喜欢吃辣”），或字号很大（>=28）
           if (nextSeq == 1 || cur.fontSize >= 28 || cur.hasHeadingStyle) {
-            if (cur.fontSize >= 30 || l2Id == null || nextSeq == 1 && l3Id == null && (l2Id != null && seqNum > 1)) {
-              // 若是 ② 长期规划（紧跟在 ① 短期安排的第24条后面，它的下一段又是 ① 我需要多分享自己的生活），与 ① 短期安排并列作为二级文件夹！
+            if (cur.fontSize >= 30 || l2Id == null || (nextSeq == 1 && l3Id == null && l2Id != null && seqNum > 1)) {
               if (nextSeq == 1 && rest.contains('喜欢吃')) {
-                // 如 ④ 喜欢的主食 下面的 ① 喜欢吃辣（下一段是 ① 喜欢吃火锅）
                 l3Id = await _createCleanMod('$seqNum. $cleanTitle', l2Id ?? l1Id ?? memberId);
               } else {
                 l2Id = await _createCleanMod('$seqNum. $cleanTitle', l1Id ?? memberId);
@@ -493,8 +732,6 @@ class _FamilyPageState extends State<FamilyPage> {
             continue;
           }
 
-          // 情况 B：像“身体情况”下的 ① 过敏：、② 胃炎：、③ 晕车：、④ 例假：、⑤ 睡眠：、⑥ 外貌：、⑦ 敏感处、⑧ 化妆品、⑨ 肺结核
-          // 特征：本身很短（<=18字），且（带冒号 或 加粗 或 下一段是普通多行描述文本且不是店铺/菜品）
           if (cleanTitle.length <= 18 && (hasTrailingColon || cur.isBold || (nextIsPlainText && !nextIsShopOrDish))) {
             final parentFolder = l2Id ?? l1Id ?? memberId;
             l3Id = await _createCleanMod('$seqNum. $cleanTitle', parentFolder);
@@ -503,7 +740,6 @@ class _FamilyPageState extends State<FamilyPage> {
             continue;
           }
 
-          // 情况 C：普通列表条目（如短期安排下的 ①~24，长期规划下的 ①~⑧，喜欢吃辣下的 ① 喜欢吃火锅）
           final targetModId = l3Id ?? l2Id ?? l1Id ?? memberId;
           final existing = await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [targetModId]);
           lastListEntryId = await widget.db.insert('module_entries', {
@@ -517,8 +753,6 @@ class _FamilyPageState extends State<FamilyPage> {
           continue;
         }
 
-        // 4. 普通无序号段落：
-        // 如果是以“店铺：”、“菜品：”开头且紧跟在某个带圈条目后（如“① 喜欢吃火锅”），合并到该条目内方便一起看
         if (lastListEntryId != null && RegExp(r'^(店铺|菜品|地址|推荐)[:：]').hasMatch(txt)) {
           final rows = await widget.db.query('module_entries', where: 'id = ?', whereArgs: [lastListEntryId]);
           if (rows.isNotEmpty) {
@@ -535,7 +769,6 @@ class _FamilyPageState extends State<FamilyPage> {
           }
         }
 
-        // 否则（如“二、首要信息”下的生日/小名，或“② 胃炎”、“⑥ 外貌”子文件夹下的每一段详细描述），作为独立编号条目存入当前子文件夹！
         final targetModId = l3Id ?? l2Id ?? l1Id ?? memberId;
         final existing = await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [targetModId]);
         await widget.db.insert('module_entries', {
@@ -607,141 +840,491 @@ class _FamilyPageState extends State<FamilyPage> {
             );
           }
           final map = {for (final m in all) m['id'] as int: m};
-          return SingleChildScrollView(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            child: _buildModLevel(null, 0, all, map),
+          return Column(
+            children: [
+              // 当长按拖动任意标题时，顶部浮现「脱出成为顶层大标题」感应区
+              if (_draggingModId != null)
+                DragTarget<int>(
+                  onWillAcceptWithDetails: (details) => details.data != 0,
+                  onAcceptWithDetails: (details) {
+                    _moveModule(draggedId: details.data, newParentId: null, all: all);
+                  },
+                  builder: (ctx, candidate, _) {
+                    final hovering = candidate.isNotEmpty;
+                    return AnimatedContainer(
+                      duration: const Duration(milliseconds: 150),
+                      width: double.infinity,
+                      margin: const EdgeInsets.fromLTRB(12, 6, 12, 2),
+                      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 12),
+                      decoration: BoxDecoration(
+                        color: hovering ? const Color(0xFF4F46E5) : const Color(0xFFEEF2FF),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: const Color(0xFF4F46E5), width: hovering ? 2 : 1.2),
+                      ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(Icons.Upload_file, size: 18, color: hovering ? Colors.white : const Color(0xFF4F46E5)),
+                          const SizedBox(width: 6),
+                          Text(
+                            '⬆️ 拖到此处松手：脱出原层级，独立成为「顶层大标题」',
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.bold,
+                              color: hovering ? Colors.white : const Color(0xFF4F46E5),
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                )
+              else
+                const Padding(
+                  padding: EdgeInsets.only(top: 6, bottom: 2),
+                  child: Text(
+                    '💡 长按右侧 ≡ 可自由拖动：拖到其他标题中央变为其小标题，拖到边缘上下排序',
+                    style: TextStyle(fontSize: 11, color: Colors.grey),
+                  ),
+                ),
+              Expanded(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  child: _buildDraggableModLevel(null, 0, all, map),
+                ),
+              ),
+            ],
           );
         },
       ),
     );
   }
 
-  Widget _buildModLevel(int? parentId, int depth, List<Map<String, dynamic>> all, Map<int, Map<String, dynamic>> map) {
+  /// 支持任意跨层级嵌套、脱出、插队排序的递归树形组件
+  Widget _buildDraggableModLevel(int? parentId, int depth, List<Map<String, dynamic>> all, Map<int, Map<String, dynamic>> map) {
     final items = all.where((m) => m['parent_id'] == parentId).toList();
     if (items.isEmpty) return const SizedBox.shrink();
 
-    return ReorderableListView.builder(
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      buildDefaultDragHandles: false,
-      itemCount: items.length,
-      onReorder: (oldIdx, newIdx) async {
-        if (newIdx > oldIdx) newIdx -= 1;
-        final moved = items.removeAt(oldIdx);
-        items.insert(newIdx, moved);
-        for (int i = 0; i < items.length; i++) {
-          await widget.db.update('modules', {'sort_order': i}, where: 'id = ?', whereArgs: [items[i]['id']]);
-        }
-        setState(() {});
-      },
-      itemBuilder: (ctx, i) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: List.generate(items.length, (i) {
         final m = items[i];
         final id = m['id'] as int;
         final subList = all.where((x) => x['parent_id'] == id).toList();
         final hasSub = subList.isNotEmpty;
         final isExpanded = _expandedMods.contains(id);
+        final isMemberCard = (m['is_member'] as int? ?? 0) == 1 || (depth == 0 && (m['title'] == '梦雨' || m['title'] == '球球'));
 
         return Column(
-          key: ValueKey('mod_$id'),
+          key: ValueKey('tree_mod_$id'),
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Card(
-              margin: EdgeInsets.only(left: depth * 15.0, bottom: 6),
-              color: depth == 0 ? null : const Color(0xFFF8FAFC),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(12),
-                onTap: () => _openEntries(id, _buildFullPath(id, map)),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                  child: Row(
-                    children: [
-                      if (hasSub)
-                        GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onTap: () {
-                            setState(() => isExpanded ? _expandedMods.remove(id) : _expandedMods.add(id));
-                            _saveFamilyUiState();
-                          },
-                          child: Padding(
-                            padding: const EdgeInsets.only(right: 4, top: 2, bottom: 2),
-                            child: Icon(isExpanded ? Icons.expand_more : Icons.chevron_right, size: 20, color: const Color(0xFF4F46E5)),
-                          ),
-                        )
-                      else
-                        const SizedBox(width: 4),
-                      Icon(
-                        depth == 0 ? Icons.folder_shared_outlined : Icons.subdirectory_arrow_right,
-                        color: Colors.indigo,
-                        size: 19,
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Row(
-                          children: [
-                            Flexible(
-                              child: Text(
-                                '${m['title']}',
-                                style: TextStyle(fontWeight: depth == 0 ? FontWeight.bold : FontWeight.w600, fontSize: depth == 0 ? 15 : 14),
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                            if (hasSub) ...[
-                              const SizedBox(width: 6),
-                              GestureDetector(
-                                onTap: () {
-                                  setState(() => isExpanded ? _expandedMods.remove(id) : _expandedMods.add(id));
-                                  _saveFamilyUiState();
-                                },
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                                  decoration: BoxDecoration(
-                                    color: const Color(0xFFEEF2FF),
-                                    borderRadius: BorderRadius.circular(4),
-                                  ),
-                                  child: Text(
-                                    '${subList.length}',
-                                    style: const TextStyle(fontSize: 11, color: Color(0xFF4F46E5), fontWeight: FontWeight.bold),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ],
-                        ),
-                      ),
-                      IconButton(
-                        visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
-                        tooltip: '添加内部小标题',
-                        icon: const Icon(Icons.create_new_folder_outlined, size: 18, color: Colors.indigo),
-                        onPressed: () => _createOrEditMod(parentId: id, parentTitle: '${m['title']}'),
-                      ),
-                      IconButton(
-                        visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
-                        tooltip: '修改名称',
-                        icon: const Icon(Icons.edit_outlined, size: 18, color: Colors.blueGrey),
-                        onPressed: () => _createOrEditMod(editMod: m),
-                      ),
-                      IconButton(
-                        visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
-                        tooltip: '删除',
-                        icon: const Icon(Icons.delete_outline, size: 18, color: Colors.red),
-                        onPressed: () => _deleteModCascade(id, all),
-                      ),
-                      ReorderableDragStartListener(
-                        index: i,
-                        child: const Padding(
-                          padding: EdgeInsets.symmetric(horizontal: 4),
-                          child: Icon(Icons.drag_handle, color: Colors.grey, size: 19),
-                        ),
-                      ),
-                    ],
-                  ),
+            // 1. 卡片上方插队感应线（排在当前卡片之前，并与其同级）
+            if (_draggingModId != null && _draggingModId != id)
+              DragTarget<int>(
+                onWillAcceptWithDetails: (d) => d.data != id && !_isDescendant(d.data, parentId, all),
+                onAcceptWithDetails: (d) => _moveModule(
+                  draggedId: d.data,
+                  newParentId: parentId,
+                  insertBeforeId: id,
+                  all: all,
                 ),
+                builder: (ctx, cand, _) {
+                  final hover = cand.isNotEmpty;
+                  return Container(
+                    height: hover ? 18 : 6,
+                    margin: EdgeInsets.only(left: depth * 16.0),
+                    alignment: Alignment.center,
+                    child: hover
+                        ? Container(
+                            height: 3,
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF4F46E5),
+                              borderRadius: BorderRadius.circular(2),
+                            ),
+                          )
+                        : null,
+                  );
+                },
               ),
+
+            // 2. 卡片本体：既是 DragTarget（接收其他卡片成为其内部子标题），右侧手柄又是 LongPressDraggable
+            DragTarget<int>(
+              onWillAcceptWithDetails: (d) => d.data != id && !_isDescendant(d.data, id, all),
+              onAcceptWithDetails: (d) => _moveModule(
+                draggedId: d.data,
+                newParentId: id, // 拖到卡片正中，直接变成该卡片的子标题！
+                all: all,
+              ),
+              builder: (ctx, cand, _) {
+                final hoverNest = cand.isNotEmpty;
+                return Padding(
+                  padding: EdgeInsets.only(left: depth * 16.0, bottom: 4),
+                  child: isMemberCard
+                      ? _buildAestheticMemberCard(m, id, hasSub, isExpanded, subList.length, hoverNest, all, map)
+                      : _buildStandardFolderCard(m, id, depth, hasSub, isExpanded, subList.length, hoverNest, all, map),
+                );
+              },
             ),
-            if (hasSub && isExpanded) _buildModLevel(id, depth + 1, all, map),
+
+            // 3. 递归渲染展开的子标题
+            if (hasSub && isExpanded) _buildDraggableModLevel(id, depth + 1, all, map),
+
+            // 4. 列表末尾卡片的下方插队感应线
+            if (_draggingModId != null && _draggingModId != id && i == items.length - 1)
+              DragTarget<int>(
+                onWillAcceptWithDetails: (d) => d.data != id && !_isDescendant(d.data, parentId, all),
+                onAcceptWithDetails: (d) => _moveModule(
+                  draggedId: d.data,
+                  newParentId: parentId,
+                  insertAfterId: id,
+                  all: all,
+                ),
+                builder: (ctx, cand, _) {
+                  final hover = cand.isNotEmpty;
+                  return Container(
+                    height: hover ? 18 : 6,
+                    margin: EdgeInsets.only(left: depth * 16.0),
+                    alignment: Alignment.center,
+                    child: hover
+                        ? Container(
+                            height: 3,
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF4F46E5),
+                              borderRadius: BorderRadius.circular(2),
+                            ),
+                          )
+                        : null,
+                  );
+                },
+              ),
           ],
         );
-      },
+      }),
+    );
+  }
+
+  /// 高定审美、与众不同的「家庭成员专属卡片」（流光渐变 + 圆形徽章 + 皇冠胶囊标签）
+  Widget _buildAestheticMemberCard(
+    Map<String, dynamic> m,
+    int id,
+    bool hasSub,
+    bool isExpanded,
+    int subCount,
+    bool hoverNest,
+    List<Map<String, dynamic>> all,
+    Map<int, Map<String, dynamic>> map,
+  ) {
+    final title = '${m['title']}';
+    final firstChar = title.isNotEmpty ? title.characters.first : '家';
+
+    return Container(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: hoverNest
+              ? [const Color(0xFF4F46E5), const Color(0xFF7C3AED)]
+              : [const Color(0xFFFFF1F2), const Color(0xFFEEF2FF), const Color(0xFFF5F3FF)],
+        ),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: hoverNest ? const Color(0xFF4F46E5) : const Color(0xFFFECDD3),
+          width: hoverNest ? 2.2 : 1.2,
+        ),
+        boxShadow: const [
+          BoxShadow(color: Color(0x12E11D48), blurRadius: 10, offset: Offset(0, 3)),
+        ],
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: () => _openEntries(id, _buildFullPath(id, map)),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+          child: Row(
+            children: [
+              if (hasSub)
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () {
+                    setState(() => isExpanded ? _expandedMods.remove(id) : _expandedMods.add(id));
+                    _saveFamilyUiState();
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.all(3),
+                    margin: const EdgeInsets.only(right: 6),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.8),
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(
+                      isExpanded ? Icons.expand_more : Icons.chevron_right,
+                      size: 18,
+                      color: const Color(0xFFBE123C),
+                    ),
+                  ),
+                )
+              else
+                const SizedBox(width: 4),
+              // 精致圆形首字母头像徽章
+              Container(
+                width: 34,
+                height: 34,
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [Color(0xFFF43F5E), Color(0xFF6366F1)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  shape: BoxShape.circle,
+                  boxShadow: const [BoxShadow(color: Color(0x33F43F5E), blurRadius: 6, offset: Offset(0, 2))],
+                ),
+                alignment: Alignment.center,
+                child: Text(
+                  firstChar,
+                  style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.bold),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            title,
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: 0.4,
+                              color: hoverNest ? Colors.white : const Color(0xFF881337),
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                          decoration: BoxDecoration(
+                            gradient: const LinearGradient(colors: [Color(0xFFFB7185), Color(0xFF818CF8)]),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.auto_awesome, size: 10, color: Colors.white),
+                              SizedBox(width: 2),
+                              Text('MEMBER', style: TextStyle(fontSize: 9, color: Colors.white, fontWeight: FontWeight.bold, letterSpacing: 0.5)),
+                            ],
+                          ),
+                        ),
+                        if (hasSub) ...[
+                          const SizedBox(width: 6),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withOpacity(0.85),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Text(
+                              '$subCount 项',
+                              style: const TextStyle(fontSize: 10.5, color: Color(0xFFBE123C), fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                    if (hoverNest)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 2),
+                        child: Text('📥 松手放入该成员名下成为子标题', style: TextStyle(fontSize: 11, color: Colors.white)),
+                      ),
+                  ],
+                ),
+              ),
+              IconButton(
+                visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
+                tooltip: '添加内部小标题',
+                icon: Icon(Icons.create_new_folder_outlined, size: 18, color: hoverNest ? Colors.white : const Color(0xFF9F1239)),
+                onPressed: () => _createOrEditMod(parentId: id, parentTitle: title),
+              ),
+              IconButton(
+                visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
+                tooltip: '修改成员或切换样式',
+                icon: Icon(Icons.edit_outlined, size: 18, color: hoverNest ? Colors.white : const Color(0xFF9F1239)),
+                onPressed: () => _createOrEditMod(editMod: m),
+              ),
+              IconButton(
+                visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
+                tooltip: '删除',
+                icon: Icon(Icons.delete_outline, size: 18, color: hoverNest ? Colors.white : Colors.redAccent),
+                onPressed: () => _deleteModCascade(id, all),
+              ),
+              _buildDragHandle(id, title),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 普通大标题与多级小标题卡片
+  Widget _buildStandardFolderCard(
+    Map<String, dynamic> m,
+    int id,
+    int depth,
+    bool hasSub,
+    bool isExpanded,
+    int subCount,
+    bool hoverNest,
+    List<Map<String, dynamic>> all,
+    Map<int, Map<String, dynamic>> map,
+  ) {
+    final title = '${m['title']}';
+    return Container(
+      decoration: BoxDecoration(
+        color: hoverNest
+            ? const Color(0xFFEEF2FF)
+            : (depth == 0 ? Colors.white : const Color(0xFFF8FAFC)),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: hoverNest ? const Color(0xFF4F46E5) : const Color(0xFFE2E8F0),
+          width: hoverNest ? 2.0 : 1.0,
+        ),
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: () => _openEntries(id, _buildFullPath(id, map)),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          child: Row(
+            children: [
+              if (hasSub)
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () {
+                    setState(() => isExpanded ? _expandedMods.remove(id) : _expandedMods.add(id));
+                    _saveFamilyUiState();
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.only(right: 4, top: 2, bottom: 2),
+                    child: Icon(isExpanded ? Icons.expand_more : Icons.chevron_right, size: 20, color: const Color(0xFF4F46E5)),
+                  ),
+                )
+              else
+                const SizedBox(width: 4),
+              Icon(
+                depth == 0 ? Icons.folder_outlined : Icons.subdirectory_arrow_right,
+                color: Colors.indigo,
+                size: 19,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            title,
+                            style: TextStyle(
+                              fontWeight: depth == 0 ? FontWeight.bold : FontWeight.w600,
+                              fontSize: depth == 0 ? 15 : 14,
+                              color: const Color(0xFF1E293B),
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (hasSub) ...[
+                          const SizedBox(width: 6),
+                          GestureDetector(
+                            onTap: () {
+                              setState(() => isExpanded ? _expandedMods.remove(id) : _expandedMods.add(id));
+                              _saveFamilyUiState();
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFEEF2FF),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                '$subCount',
+                                style: const TextStyle(fontSize: 11, color: Color(0xFF4F46E5), fontWeight: FontWeight.bold),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                    if (hoverNest)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 2),
+                        child: Text('📥 松手放入内部成为小标题', style: TextStyle(fontSize: 11, color: Color(0xFF4F46E5), fontWeight: FontWeight.bold)),
+                      ),
+                  ],
+                ),
+              ),
+              IconButton(
+                visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
+                tooltip: '添加内部小标题',
+                icon: const Icon(Icons.create_new_folder_outlined, size: 18, color: Colors.indigo),
+                onPressed: () => _createOrEditMod(parentId: id, parentTitle: title),
+              ),
+              IconButton(
+                visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
+                tooltip: '修改名称',
+                icon: const Icon(Icons.edit_outlined, size: 18, color: Colors.blueGrey),
+                onPressed: () => _createOrEditMod(editMod: m),
+              ),
+              IconButton(
+                visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
+                tooltip: '删除',
+                icon: const Icon(Icons.delete_outline, size: 18, color: Colors.red),
+                onPressed: () => _deleteModCascade(id, all),
+              ),
+              _buildDragHandle(id, title),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 长按自由拖拽手柄（支持跨级拖入、拖出、同级排序）
+  Widget _buildDragHandle(int id, String title) {
+    return LongPressDraggable<int>(
+      data: id,
+      delay: const Duration(milliseconds: 180),
+      onDragStarted: () => setState(() => _draggingModId = id),
+      onDragEnd: (_) => setState(() => _draggingModId = null),
+      onDraggableCanceled: (_, __) => setState(() => _draggingModId = null),
+      feedback: Material(
+        elevation: 8,
+        borderRadius: BorderRadius.circular(10),
+        color: const Color(0xFF4F46E5),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.open_with, color: Colors.white, size: 16),
+              const SizedBox(width: 6),
+              Text(
+                '正在移动：$title',
+                style: const TextStyle(color: Colors.white, fontSize: 13.5, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+        ),
+      ),
+      child: const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        child: Icon(Icons.drag_handle, color: Colors.grey, size: 20),
+      ),
     );
   }
 
@@ -779,40 +1362,61 @@ class _FamilyPageState extends State<FamilyPage> {
   void _createOrEditMod({int? parentId, String? parentTitle, Map<String, dynamic>? editMod, bool isMember = false}) {
     final isEdit = editMod != null;
     final ctrl = TextEditingController(text: isEdit ? '${editMod['title']}' : '');
+    bool memberFlag = isEdit ? ((editMod['is_member'] as int? ?? 0) == 1) : isMember;
     final dlgTitle = isEdit
-        ? '修改名称'
+        ? '修改名称与样式'
         : (isMember ? '添加家庭成员' : (parentId == null ? '新建大标题' : '在「$parentTitle」下新建小标题'));
 
     showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(dlgTitle, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          decoration: InputDecoration(hintText: isMember ? '如：梦雨、球球' : '输入标题名称'),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-          FilledButton(
-            onPressed: () async {
-              final txt = ctrl.text.trim();
-              if (txt.isEmpty) return;
-              if (isEdit) {
-                await widget.db.update('modules', {'title': txt}, where: 'id = ?', whereArgs: [editMod['id']]);
-              } else {
-                await _createCleanMod(txt, parentId);
-                if (parentId != null) {
-                  _expandedMods.add(parentId);
-                  await _saveFamilyUiState();
-                }
-              }
-              if (mounted) Navigator.pop(ctx);
-              setState(() {});
-            },
-            child: Text(isEdit ? '保存' : '创建'),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setS) => AlertDialog(
+          title: Text(dlgTitle, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: ctrl,
+                autofocus: true,
+                decoration: InputDecoration(hintText: memberFlag ? '如：梦雨、球球' : '输入标题名称'),
+              ),
+              const SizedBox(height: 8),
+              CheckboxListTile(
+                value: memberFlag,
+                contentPadding: EdgeInsets.zero,
+                title: const Text('✨ 启用「家庭成员」高定卡片样式', style: TextStyle(fontSize: 13)),
+                subtitle: const Text('带有专属流光渐变、首字母徽章与 MEMBER 铭牌', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                onChanged: (v) => setS(() => memberFlag = v ?? false),
+              ),
+            ],
           ),
-        ],
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+            FilledButton(
+              onPressed: () async {
+                final txt = ctrl.text.trim();
+                if (txt.isEmpty) return;
+                if (isEdit) {
+                  await widget.db.update(
+                    'modules',
+                    {'title': txt, 'is_member': memberFlag ? 1 : 0},
+                    where: 'id = ?',
+                    whereArgs: [editMod['id']],
+                  );
+                } else {
+                  await _createCleanMod(txt, parentId, isMember: memberFlag);
+                  if (parentId != null) {
+                    _expandedMods.add(parentId);
+                    await _saveFamilyUiState();
+                  }
+                }
+                if (mounted) Navigator.pop(ctx);
+                setState(() {});
+              },
+              child: Text(isEdit ? '保存' : '创建'),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1091,6 +1695,7 @@ class _FamilyPageState extends State<FamilyPage> {
     );
   }
 }
+
 // ==================== Tab 1: 查找页 ====================
 class SearchPage extends StatefulWidget {
   final Database db;
@@ -1251,7 +1856,7 @@ class _SearchPageState extends State<SearchPage> {
                 ),
                 const SizedBox(height: 6),
                 const Text(
-                  '💡 提示：直接勾选大标题将包含其全部内容；点击左侧 ▶ 可展开精细化筛选内部小标题',
+                  '💡 提示：直接勾选大标题将包含其全部内容; 点击左侧 ▶ 可展开精细化筛选内部小标题',
                   style: TextStyle(fontSize: 11, color: Colors.grey),
                 ),
                 const Divider(height: 10),
@@ -1435,7 +2040,7 @@ class _SearchPageState extends State<SearchPage> {
     final appDir = await getApplicationDocumentsDirectory();
     final data = {
       'app': 'daily_tracker',
-      'version': '6.0.0',
+      'version': '7.0.0',
       'data': {
         for (final t in ['status_items', 'status_records', 'status_images', 'schedule_items', 'schedule_records', 'modules', 'module_entries', 'module_groups', 'mindmaps', 'ui_states'])
           t: await widget.db.query(t),
