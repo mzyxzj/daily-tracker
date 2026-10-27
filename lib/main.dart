@@ -16,6 +16,7 @@ void main() async {
   runApp(DailyTrackerApp(db: db));
 }
 
+// ==================== 数据库层 (SQLite v5 含 UI 缩略状态持久化表) ====================
 class AppDatabase {
   static final AppDatabase instance = AppDatabase._();
   static Database? _db;
@@ -26,7 +27,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
-      version: 4,
+      version: 5,
       onCreate: (db, v) async {
         await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE status_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, value TEXT DEFAULT "", UNIQUE(item_id, date))');
@@ -37,6 +38,7 @@ class AppDatabase {
         await db.execute('CREATE TABLE module_entries (id INTEGER PRIMARY KEY AUTOINCREMENT, module_id INTEGER NOT NULL, seq INTEGER NOT NULL, content TEXT NOT NULL, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE module_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, module_ids TEXT NOT NULL, created_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE mindmaps (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, root_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)');
+        await db.execute('CREATE TABLE ui_states (state_key TEXT PRIMARY KEY, state_val TEXT NOT NULL)');
       },
       onUpgrade: (db, oldV, newV) async {
         if (oldV < 2) {
@@ -50,8 +52,31 @@ class AppDatabase {
         if (oldV < 4) {
           try { await db.execute("ALTER TABLE schedule_items ADD COLUMN parent_id INTEGER"); } catch (_) {}
         }
+        if (oldV < 5) {
+          try { await db.execute('CREATE TABLE IF NOT EXISTS ui_states (state_key TEXT PRIMARY KEY, state_val TEXT NOT NULL)'); } catch (_) {}
+        }
       },
     );
+  }
+
+  /// 读取持久化的 UI 折叠/展开状态
+  static Future<String?> getUiState(Database db, String key) async {
+    try {
+      final rows = await db.query('ui_states', where: 'state_key = ?', whereArgs: [key]);
+      if (rows.isNotEmpty) return rows.first['state_val'] as String;
+    } catch (_) {}
+    return null;
+  }
+
+  /// 保存 UI 折叠/展开状态
+  static Future<void> setUiState(Database db, String key, String val) async {
+    try {
+      await db.insert(
+        'ui_states',
+        {'state_key': key, 'state_val': val},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    } catch (_) {}
   }
 }
 
@@ -196,13 +221,53 @@ class _TodayPageState extends State<TodayPage> {
   final Map<int, bool> _expandedPhoto = {};
   final Set<int> _collapsedStatusIds = {};
   final Set<int> _collapsedSchedParents = {};
-  bool _foldSummary = false; // 默认展开分列摘要
+  bool _foldSummary = false;
   bool _foldStatusSection = false;
   bool _foldSchedSection = false;
+  bool _uiLoaded = false;
 
   String get _today => DateFormat('yyyy-MM-dd').format(DateTime.now());
 
+  @override
+  void initState() {
+    super.initState();
+    _restoreTodayUiState();
+  }
+
+  /// 启动或进入页面时恢复上次调整的缩略/折叠状态
+  Future<void> _restoreTodayUiState() async {
+    final raw = await AppDatabase.getUiState(widget.db, 'today_ui_state');
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final map = jsonDecode(raw) as Map<String, dynamic>;
+        _foldSummary = map['foldSummary'] == true;
+        _foldStatusSection = map['foldStatusSection'] == true;
+        _foldSchedSection = map['foldSchedSection'] == true;
+        _collapsedStatusIds
+          ..clear()
+          ..addAll(((map['collapsedStatusIds'] as List?) ?? []).map((e) => e as int));
+        _collapsedSchedParents
+          ..clear()
+          ..addAll(((map['collapsedSchedParents'] as List?) ?? []).map((e) => e as int));
+      } catch (_) {}
+    }
+    if (mounted) setState(() => _uiLoaded = true);
+  }
+
+  /// 每次调整缩略状态时自动持久化保存
+  Future<void> _saveTodayUiState() async {
+    final data = jsonEncode({
+      'foldSummary': _foldSummary,
+      'foldStatusSection': _foldStatusSection,
+      'foldSchedSection': _foldSchedSection,
+      'collapsedStatusIds': _collapsedStatusIds.toList(),
+      'collapsedSchedParents': _collapsedSchedParents.toList(),
+    });
+    await AppDatabase.setUiState(widget.db, 'today_ui_state', data);
+  }
+
   Future<Map<String, dynamic>> _load() async {
+    if (!_uiLoaded) await _restoreTodayUiState();
     final items = await widget.db.query('status_items', orderBy: 'sort_order ASC, id ASC');
     final disp = <int, Map<String, dynamic>>{};
     final appDir = await getApplicationDocumentsDirectory();
@@ -245,7 +310,6 @@ class _TodayPageState extends State<TodayPage> {
     return res;
   }
 
-  /// 智能识别换行、|、◦、•、；、; 或多段句号，拆分为分列数组
   List<String> _splitColumns(String raw) {
     final trimmed = raw.trim();
     if (trimmed.isEmpty) return [];
@@ -304,7 +368,10 @@ class _TodayPageState extends State<TodayPage> {
                 icon: '📊',
                 title: '每日状态 (${items.length})',
                 isFolded: _foldStatusSection,
-                onToggleFold: () => setState(() => _foldStatusSection = !_foldStatusSection),
+                onToggleFold: () {
+                  setState(() => _foldStatusSection = !_foldStatusSection);
+                  _saveTodayUiState();
+                },
                 actionLabel: '新条目',
                 onAction: () => _addOrEditStatusItemDialog(),
               ),
@@ -335,7 +402,10 @@ class _TodayPageState extends State<TodayPage> {
                 icon: '📅',
                 title: '日程打卡 ($doneCount/${scheds.length})',
                 isFolded: _foldSchedSection,
-                onToggleFold: () => setState(() => _foldSchedSection = !_foldSchedSection),
+                onToggleFold: () {
+                  setState(() => _foldSchedSection = !_foldSchedSection);
+                  _saveTodayUiState();
+                },
                 actionLabel: '新日程',
                 onAction: () => _addOrEditSchedDialog(),
               ),
@@ -406,7 +476,6 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  /// 结构化分列展示的「今日状态摘要」卡片 + 结构化分列复制文本
   Widget _buildSummary(List<Map<String, dynamic>> items, Map<int, Map<String, dynamic>> disp, List<Map<String, dynamic>> scheds, Map<int, bool> doneMap) {
     final copyLines = <String>[];
     final summaryRows = <Widget>[];
@@ -429,7 +498,6 @@ class _TodayPageState extends State<TodayPage> {
           copyLines.add('$name：${cols.first}');
           summaryRows.add(_buildSummarySingleLine(name, cols.first));
         } else {
-          // 多列内容：复制时自动换行缩进分列，界面上也以分列小标签块呈现
           copyLines.add('$name：\n${cols.map((c) => '  • $c').join('\n')}');
           summaryRows.add(_buildSummaryMultiColRow(name, cols));
         }
@@ -469,7 +537,10 @@ class _TodayPageState extends State<TodayPage> {
               Expanded(
                 child: GestureDetector(
                   behavior: HitTestBehavior.opaque,
-                  onTap: () => setState(() => _foldSummary = !_foldSummary),
+                  onTap: () {
+                    setState(() => _foldSummary = !_foldSummary);
+                    _saveTodayUiState();
+                  },
                   child: Row(
                     children: [
                       Icon(_foldSummary ? Icons.chevron_right : Icons.expand_more, size: 18, color: const Color(0xFF475569)),
@@ -632,7 +703,10 @@ class _TodayPageState extends State<TodayPage> {
             children: [
               if (cols.length > 1 || val.length > 22 || imgs.isNotEmpty)
                 GestureDetector(
-                  onTap: () => setState(() => isItemFolded ? _collapsedStatusIds.remove(id) : _collapsedStatusIds.add(id)),
+                  onTap: () {
+                    setState(() => isItemFolded ? _collapsedStatusIds.remove(id) : _collapsedStatusIds.add(id));
+                    _saveTodayUiState();
+                  },
                   child: Padding(
                     padding: const EdgeInsets.only(right: 4),
                     child: Icon(isItemFolded ? Icons.chevron_right : Icons.expand_more, size: 17, color: Colors.grey[600]),
@@ -815,7 +889,10 @@ class _TodayPageState extends State<TodayPage> {
               children: [
                 if (hasChildren)
                   GestureDetector(
-                    onTap: () => setState(() => isCollapsed ? _collapsedSchedParents.remove(sid) : _collapsedSchedParents.add(sid)),
+                    onTap: () {
+                      setState(() => isCollapsed ? _collapsedSchedParents.remove(sid) : _collapsedSchedParents.add(sid));
+                      _saveTodayUiState();
+                    },
                     child: Padding(
                       padding: const EdgeInsets.only(right: 2),
                       child: Icon(isCollapsed ? Icons.chevron_right : Icons.expand_more, size: 19, color: const Color(0xFF4F46E5)),
@@ -1246,7 +1323,10 @@ class _TodayPageState extends State<TodayPage> {
                     'plan_info': selPlan,
                     'parent_id': parentId,
                   });
-                  if (parentId != null) _collapsedSchedParents.remove(parentId);
+                  if (parentId != null) {
+                    _collapsedSchedParents.remove(parentId);
+                    _saveTodayUiState();
+                  }
                 }
                 if (mounted) Navigator.pop(ctx);
                 setState(() {});
