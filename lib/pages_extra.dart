@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -47,7 +48,6 @@ class SequenceParser {
   }
 }
 
-// ==================== 紧凑型树形多选组件（供新建/编辑标题组与临时查看复用） ====================
 class ModuleTreeSelector extends StatefulWidget {
   final List<Map<String, dynamic>> allMods;
   final Set<int> selectedIds;
@@ -71,7 +71,6 @@ class _ModuleTreeSelectorState extends State<ModuleTreeSelector> {
     return widget.allMods.where((m) => m['parent_id'] == pid).toList();
   }
 
-  /// 获取某个节点下属的所有子孙节点 ID
   List<int> _descendantsOf(int pid) {
     final res = <int>[];
     void walk(int cur) {
@@ -210,7 +209,6 @@ class _ModuleTreeSelectorState extends State<ModuleTreeSelector> {
   }
 }
 
-// ==================== Tab 2: 家庭页 ====================
 class FamilyPage extends StatefulWidget {
   final Database db;
   const FamilyPage({super.key, required this.db});
@@ -240,11 +238,12 @@ class _FamilyPageState extends State<FamilyPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('🏠 家庭'),
+        toolbarHeight: 46,
+        title: const Text('🏠 家庭', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
         actions: [
           TextButton.icon(
             onPressed: () => _createOrEditMod(),
-            icon: const Icon(Icons.add),
+            icon: const Icon(Icons.add, size: 18),
             label: const Text('新建大标题'),
           ),
         ],
@@ -432,7 +431,6 @@ class _FamilyPageState extends State<FamilyPage> {
     );
   }
 
-  /// 优化后的内容查看与编辑弹窗：全宽紧凑排版，同一页面可看到更多文字
   void _openEntries(int modId, String fullPath) {
     final ctrl = TextEditingController();
     showModalBottomSheet(
@@ -448,7 +446,6 @@ class _FamilyPageState extends State<FamilyPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // 顶部标题栏与加小标题按钮
                 Row(
                   children: [
                     Expanded(
@@ -479,7 +476,6 @@ class _FamilyPageState extends State<FamilyPage> {
                     ),
                   ],
                 ),
-                // 下属小标题快捷跳转标签
                 FutureBuilder<List<Map<String, dynamic>>>(
                   future: widget.db.query('modules', where: 'parent_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, id ASC'),
                   builder: (_, subSnap) {
@@ -503,7 +499,6 @@ class _FamilyPageState extends State<FamilyPage> {
                     );
                   },
                 ),
-                // 紧凑型输入栏（左输入框 + 右添加按钮，节省纵向空间）
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.end,
                   children: [
@@ -551,7 +546,6 @@ class _FamilyPageState extends State<FamilyPage> {
                 ),
                 const SizedBox(height: 6),
                 const Divider(height: 1),
-                // 宽幅紧凑内容列表（移除占位铅笔按钮，直接点击文字即可编辑）
                 Expanded(
                   child: FutureBuilder<List<Map<String, dynamic>>>(
                     future: widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC'),
@@ -645,7 +639,6 @@ class _FamilyPageState extends State<FamilyPage> {
     );
   }
 
-  /// 大尺寸内容编辑弹窗：方便看到更多文字并自由排版
   void _editEntryDialog(Map<String, dynamic> entry, VoidCallback onSaved) {
     final seqCtrl = TextEditingController(text: '${entry['seq']}');
     final txtCtrl = TextEditingController(text: '${entry['content']}');
@@ -713,7 +706,6 @@ class _FamilyPageState extends State<FamilyPage> {
   }
 }
 
-// ==================== Tab 1: 查找页（支持标题组二次编辑 + 嵌套树形紧凑筛选） ====================
 class SearchPage extends StatefulWidget {
   final Database db;
   const SearchPage({super.key, required this.db});
@@ -736,7 +728,10 @@ class _SearchPageState extends State<SearchPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('🔍 查找')),
+      appBar: AppBar(
+        toolbarHeight: 46,
+        title: const Text('🔍 查找', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+      ),
       body: FutureBuilder<List<Map<String, dynamic>>>(
         future: widget.db.query('module_groups', orderBy: 'id DESC'),
         builder: (_, snap) {
@@ -822,7 +817,6 @@ class _SearchPageState extends State<SearchPage> {
     );
   }
 
-  /// 新建或编辑标题组（支持树形折叠展示、精细化筛选子标题、紧凑排版）
   Future<void> _createOrEditGroup({Map<String, dynamic>? existingGroup}) async {
     final mods = await widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
     if (!mounted) return;
@@ -915,7 +909,6 @@ class _SearchPageState extends State<SearchPage> {
     );
   }
 
-  /// 临时查看（同样采用紧凑树形折叠筛选）
   Future<void> _tempView() async {
     final mods = await widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
     if (!mounted || mods.isEmpty) return;
@@ -970,9 +963,6 @@ class _SearchPageState extends State<SearchPage> {
     );
   }
 
-  /// 智能聚合查阅：
-  /// 若用户勾选了某个大标题，且【没有】单独精细化勾选它下面的任何子标题，则自动展示该大标题及其所有子标题；
-  /// 若用户展开并精细化勾选了它下面的特定小标题，则只精准展示被勾选的那几个小标题！
   Future<void> _showAgg(String title, List<int> ids) async {
     final allMods = await widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
     final map = {for (final m in allMods) m['id'] as int: m};
@@ -996,7 +986,6 @@ class _SearchPageState extends State<SearchPage> {
       if (!expandedIds.contains(pid)) expandedIds.add(pid);
       final desc = getDescendants(pid);
       final hasSpecificChildSelected = desc.any((cid) => selectedSet.contains(cid));
-      // 如果没有单独精细化勾选子项，才默认全选展开所有子项
       if (!hasSpecificChildSelected) {
         for (final cid in desc) {
           if (!expandedIds.contains(cid)) expandedIds.add(cid);
@@ -1011,7 +1000,6 @@ class _SearchPageState extends State<SearchPage> {
     final blocks = <Widget>[];
     for (final id in expandedIds) {
       final es = await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [id], orderBy: 'sort_order ASC, seq ASC, id ASC');
-      // 如果某个父级大标题自身没有直接挂内容（只作为分类目录），且已有子标题展示，则跳过空壳父目录让查阅更紧凑
       final hasChildrenInList = allMods.any((x) => x['parent_id'] == id && expandedIds.contains(x['id'] as int));
       if (es.isEmpty && hasChildrenInList) continue;
 
@@ -1061,7 +1049,7 @@ class _SearchPageState extends State<SearchPage> {
     final appDir = await getApplicationDocumentsDirectory();
     final data = {
       'app': 'daily_tracker',
-      'version': '3.0.0',
+      'version': '4.0.0',
       'data': {
         for (final t in ['status_items', 'status_records', 'status_images', 'schedule_items', 'schedule_records', 'modules', 'module_entries', 'module_groups', 'mindmaps'])
           t: await widget.db.query(t),
@@ -1110,7 +1098,7 @@ class _SearchPageState extends State<SearchPage> {
   }
 }
 
-// ==================== Tab 4: 规划页（思维导图） ====================
+// ==================== Tab 4: 规划页（支持直接读取 .xmind 文件 + 美观清爽防挤压树形视图） ====================
 class PlanPage extends StatefulWidget {
   final Database db;
   const PlanPage({super.key, required this.db});
@@ -1122,35 +1110,250 @@ class _PlanPageState extends State<PlanPage> {
   final _uuid = const Uuid();
   final Set<String> _col = {};
 
+  /// 解析 XMind (Zen/2020+ 的 content.json 节点结构)
+  Map<String, dynamic> _convertXMindJsonTopic(Map<String, dynamic> topic) {
+    final title = (topic['title'] ?? '未命名节点').toString().trim();
+    final childrenList = <Map<String, dynamic>>[];
+    final childrenObj = topic['children'];
+    if (childrenObj is Map) {
+      for (final key in ['attached', 'detached', 'summary']) {
+        if (childrenObj[key] is List) {
+          for (final sub in (childrenObj[key] as List)) {
+            if (sub is Map<String, dynamic>) {
+              childrenList.add(_convertXMindJsonTopic(sub));
+            }
+          }
+        }
+      }
+    } else if (childrenObj is List) {
+      for (final sub in childrenObj) {
+        if (sub is Map<String, dynamic>) {
+          childrenList.add(_convertXMindJsonTopic(sub));
+        }
+      }
+    }
+    return {
+      'id': _uuid.v4(),
+      'text': title.isEmpty ? '节点' : title,
+      'children': childrenList,
+    };
+  }
+
+  /// 兼容旧版 XMind 8 的 content.xml 结构简易解析
+  Map<String, dynamic>? _parseLegacyXMindXml(String xmlStr) {
+    final matches = RegExp(r'<title[^>]*>([\s\S]*?)</title>').allMatches(xmlStr).map((m) => m.group(1)!.trim()).where((s) => s.isNotEmpty).toList();
+    if (matches.isEmpty) return null;
+    final rootTitle = matches.first;
+    final children = matches.skip(1).map((t) => {'id': _uuid.v4(), 'text': t, 'children': <Map<String, dynamic>>[]}).toList();
+    return {'id': _uuid.v4(), 'text': rootTitle, 'children': children};
+  }
+
+  /// 直接选择并读取 .xmind 文件导入为思维导图
+  Future<void> _importXMindFile() async {
+    try {
+      final res = await FilePicker.platform.pickFiles(type: FileType.any);
+      if (res == null || res.files.single.path == null) return;
+      final filePath = res.files.single.path!;
+      final bytes = await File(filePath).readAsBytes();
+      final archive = ZipDecoder().decodeBytes(bytes);
+
+      int importedCount = 0;
+      final now = DateTime.now().toIso8601String();
+
+      // 1. 优先寻找 content.json（XMind 2020 / 2022 / 2024 / 移动端通用格式）
+      ArchiveFile? jsonFile;
+      ArchiveFile? xmlFile;
+      for (final f in archive) {
+        if (f.isFile && (f.name == 'content.json' || f.name.endsWith('/content.json'))) {
+          jsonFile = f;
+          break;
+        }
+        if (f.isFile && (f.name == 'content.xml' || f.name.endsWith('/content.xml'))) {
+          xmlFile = f;
+        }
+      }
+
+      if (jsonFile != null) {
+        final jsonStr = utf8.decode(jsonFile.content as List<int>);
+        final decoded = jsonDecode(jsonStr);
+        if (decoded is List) {
+          for (final sheet in decoded) {
+            if (sheet is Map<String, dynamic> && sheet['rootTopic'] is Map<String, dynamic>) {
+              final rootNode = _convertXMindJsonTopic(sheet['rootTopic'] as Map<String, dynamic>);
+              await widget.db.insert('mindmaps', {
+                'title': '${rootNode['text']}',
+                'root_json': jsonEncode(rootNode),
+                'created_at': now,
+                'updated_at': now,
+              });
+              importedCount++;
+            }
+          }
+        } else if (decoded is Map<String, dynamic> && decoded['rootTopic'] is Map<String, dynamic>) {
+          final rootNode = _convertXMindJsonTopic(decoded['rootTopic'] as Map<String, dynamic>);
+          await widget.db.insert('mindmaps', {
+            'title': '${rootNode['text']}',
+            'root_json': jsonEncode(rootNode),
+            'created_at': now,
+            'updated_at': now,
+          });
+          importedCount++;
+        }
+      } else if (xmlFile != null) {
+        final xmlStr = utf8.decode(xmlFile.content as List<int>);
+        final rootNode = _parseLegacyXMindXml(xmlStr);
+        if (rootNode != null) {
+          await widget.db.insert('mindmaps', {
+            'title': '${rootNode['text']}',
+            'root_json': jsonEncode(rootNode),
+            'created_at': now,
+            'updated_at': now,
+          });
+          importedCount++;
+        }
+      }
+
+      if (!mounted) return;
+      if (importedCount > 0) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('🎉 成功从 XMind 导入 $importedCount 张思维导图！')));
+        setState(() {});
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('未在该文件中识别到有效的 XMind 导图结构')));
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('读取 XMind 文件失败：$e')));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('🧠 规划'), actions: [TextButton.icon(onPressed: _createMm, icon: const Icon(Icons.add), label: const Text('新建规划'))]),
+      appBar: AppBar(
+        toolbarHeight: 46,
+        title: const Text('🧠 规划', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+        actions: [
+          TextButton.icon(
+            onPressed: _importXMindFile,
+            icon: const Icon(Icons.file_open_outlined, size: 17),
+            label: const Text('导入XMind', style: TextStyle(fontSize: 13)),
+          ),
+          TextButton.icon(
+            onPressed: _createMm,
+            icon: const Icon(Icons.add, size: 18),
+            label: const Text('新建规划', style: TextStyle(fontSize: 13)),
+          ),
+        ],
+      ),
       body: FutureBuilder<List<Map<String, dynamic>>>(
         future: widget.db.query('mindmaps', orderBy: 'id DESC'),
         builder: (_, snap) {
           final list = snap.data ?? [];
-          if (list.isEmpty) return const Center(child: Text('暂无思维导图规划，点击右上角新建'));
+          if (list.isEmpty) {
+            return Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text('暂无思维导图规划', style: TextStyle(color: Colors.grey)),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      FilledButton.icon(onPressed: _createMm, icon: const Icon(Icons.add), label: const Text('新建规划')),
+                      const SizedBox(width: 10),
+                      OutlinedButton.icon(onPressed: _importXMindFile, icon: const Icon(Icons.file_open_outlined), label: const Text('导入 .xmind 文件')),
+                    ],
+                  ),
+                ],
+              ),
+            );
+          }
           return ListView.builder(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             itemCount: list.length,
             itemBuilder: (_, i) {
               final mm = list[i], root = jsonDecode('${mm['root_json']}') as Map<String, dynamic>;
+              final flatNodes = <({Map<String, dynamic> node, int depth})>[];
+              void flatten(Map<String, dynamic> n, int d) {
+                flatNodes.add((node: n, depth: d));
+                final id = '${n['id']}';
+                if (!_col.contains(id)) {
+                  final ch = (n['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+                  for (final c in ch) flatten(c, d + 1);
+                }
+              }
+              flatten(root, 0);
+
               return Card(
                 margin: const EdgeInsets.only(bottom: 14),
+                elevation: 0,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  side: const BorderSide(color: Color(0xFFE2E8F0)),
+                ),
                 child: Padding(
-                  padding: const EdgeInsets.all(12),
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Align(
-                        alignment: Alignment.centerRight,
-                        child: IconButton(
-                          icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20),
-                          onPressed: () async { await widget.db.delete('mindmaps', where: 'id = ?', whereArgs: [mm['id']]); setState(() {}); },
+                      // 卡片顶部工具栏：支持一键展开/收起与删除
+                      Row(
+                        children: [
+                          const Icon(Icons.account_tree, size: 16, color: Color(0xFF4F46E5)),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              '${root['text']}',
+                              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFF475569)),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          TextButton(
+                            style: TextButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                              minimumSize: Size.zero,
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                            onPressed: () {
+                              setState(() {
+                                // 切换二级及以下节点的展开/收起
+                                void collectIds(Map<String, dynamic> n, int d) {
+                                  if (d >= 1) _col.add('${n['id']}');
+                                  for (final c in ((n['children'] as List?)?.cast<Map<String, dynamic>>() ?? [])) {
+                                    collectIds(c, d + 1);
+                                  }
+                                }
+                                final anyCollapsed = flatNodes.any((x) => _col.contains('${x.node['id']}'));
+                                if (anyCollapsed) {
+                                  _col.clear();
+                                } else {
+                                  collectIds(root, 0);
+                                }
+                              });
+                            },
+                            child: const Text('展开/收起', style: TextStyle(fontSize: 11.5)),
+                          ),
+                          InkWell(
+                            onTap: () => _confirmDeleteMindmap(mm['id'] as int, '${root['text']}'),
+                            child: const Padding(
+                              padding: EdgeInsets.only(left: 6),
+                              child: Icon(Icons.delete_outline, color: Colors.redAccent, size: 18),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const Divider(height: 12),
+                      // 采用横向滚动保护 + 扁平化精致层级行，彻底杜绝深层文字竖排挤压
+                      SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: ConstrainedBox(
+                          constraints: BoxConstraints(minWidth: MediaQuery.of(context).size.width - 52),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: flatNodes.map((item) => _buildFlatNodeRow(mm['id'] as int, root, item.node, item.depth)).toList(),
+                          ),
                         ),
                       ),
-                      _tree(mm['id'] as int, root, root, 0),
                     ],
                   ),
                 ),
@@ -1162,32 +1365,161 @@ class _PlanPageState extends State<PlanPage> {
     );
   }
 
-  Widget _tree(int mmId, Map<String, dynamic> root, Map<String, dynamic> node, int d) {
-    final id = '${node['id']}', ch = (node['children'] as List).cast<Map<String, dynamic>>(), col = _col.contains(id);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            if (ch.isNotEmpty) IconButton(icon: Icon(col ? Icons.chevron_right : Icons.expand_more, size: 18), onPressed: () => setState(() => col ? _col.remove(id) : _col.add(id))) else const SizedBox(width: 32),
-            Expanded(
-              child: GestureDetector(
-                onTap: () => _editNode(mmId, root, node),
-                child: Text('${node['text']}', style: TextStyle(fontSize: d == 0 ? 16 : 14, fontWeight: d <= 1 ? FontWeight.bold : FontWeight.normal)),
+  /// 清爽美观的扁平化节点渲染（不论多少层级都不会把文字挤成一竖列）
+  Widget _buildFlatNodeRow(int mmId, Map<String, dynamic> root, Map<String, dynamic> node, int d) {
+    final id = '${node['id']}';
+    final ch = (node['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+    final col = _col.contains(id);
+    final indent = d * 18.0;
+
+    // 根据层级赋予不同视觉样式
+    Color bgColor;
+    Color textColor;
+    Color borderColor;
+    if (d == 0) {
+      bgColor = const Color(0xFF4F46E5);
+      textColor = Colors.white;
+      borderColor = const Color(0xFF4F46E5);
+    } else if (d == 1) {
+      bgColor = const Color(0xFFEEF2FF);
+      textColor = const Color(0xFF3730A3);
+      borderColor = const Color(0xFFC7D2FE);
+    } else if (d == 2) {
+      bgColor = const Color(0xFFF8FAFC);
+      textColor = const Color(0xFF1E293B);
+      borderColor = const Color(0xFFE2E8F0);
+    } else {
+      bgColor = Colors.white;
+      textColor = const Color(0xFF334155);
+      borderColor = const Color(0xFFF1F5F9);
+    }
+
+    return Padding(
+      padding: EdgeInsets.only(left: indent, top: 3, bottom: 3),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // 展开/收起按钮或层级指示符
+          if (ch.isNotEmpty)
+            GestureDetector(
+              onTap: () => setState(() => col ? _col.remove(id) : _col.add(id)),
+              child: Container(
+                width: 22,
+                height: 22,
+                margin: const EdgeInsets.only(right: 4),
+                decoration: BoxDecoration(
+                  color: col ? const Color(0xFFEEF2FF) : Colors.transparent,
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                alignment: Alignment.center,
+                child: Icon(
+                  col ? Icons.add_box_outlined : Icons.indeterminate_check_box_outlined,
+                  size: 16,
+                  color: const Color(0xFF4F46E5),
+                ),
+              ),
+            )
+          else if (d > 0)
+            Container(
+              width: 18,
+              alignment: Alignment.center,
+              margin: const EdgeInsets.only(right: 4),
+              child: Container(
+                width: 5,
+                height: 5,
+                decoration: const BoxDecoration(color: Color(0xFF94A3B8), shape: BoxShape.circle),
               ),
             ),
-            IconButton(icon: const Icon(Icons.add_circle_outline, size: 18), onPressed: () => _addNode(mmId, root, node)),
-            if (d > 0) IconButton(icon: const Icon(Icons.close, size: 16, color: Colors.red), onPressed: () async { _rm(root, id); await _save(mmId, root); }),
-          ],
-        ),
-        if (ch.isNotEmpty && !col)
-          Container(
-            margin: const EdgeInsets.only(left: 20),
-            padding: const EdgeInsets.only(left: 12),
-            decoration: const BoxDecoration(border: Border(left: BorderSide(color: Color(0xFFE5E7EB), width: 2))),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: ch.map((c) => _tree(mmId, root, c, d + 1)).toList()),
+
+          // 节点主体胶囊卡片（点击可直接编辑文字，最大宽度充裕，绝不竖排）
+          GestureDetector(
+            onTap: () => _editNode(mmId, root, node),
+            child: Container(
+              constraints: const BoxConstraints(minWidth: 60, maxWidth: 260),
+              padding: EdgeInsets.symmetric(horizontal: d == 0 ? 12 : 10, vertical: d == 0 ? 6 : 5),
+              decoration: BoxDecoration(
+                color: bgColor,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: borderColor),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Flexible(
+                    child: Text(
+                      '${node['text']}',
+                      style: TextStyle(
+                        fontSize: d == 0 ? 14.5 : (d == 1 ? 13.5 : 13),
+                        fontWeight: d <= 1 ? FontWeight.bold : FontWeight.normal,
+                        color: textColor,
+                        height: 1.3,
+                      ),
+                    ),
+                  ),
+                  if (col && ch.isNotEmpty) ...[
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                      decoration: BoxDecoration(
+                        color: d == 0 ? Colors.white24 : const Color(0xFFE0E7FF),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        '+${ch.length}',
+                        style: TextStyle(fontSize: 10, color: d == 0 ? Colors.white : const Color(0xFF4F46E5), fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
           ),
-      ],
+
+          const SizedBox(width: 6),
+          // 紧凑型操作按钮（添加子节点 & 删除当前节点）
+          InkWell(
+            borderRadius: BorderRadius.circular(12),
+            onTap: () => _addNode(mmId, root, node),
+            child: const Padding(
+              padding: EdgeInsets.all(4),
+              child: Icon(Icons.add_circle_outline, size: 17, color: Color(0xFF64748B)),
+            ),
+          ),
+          if (d > 0)
+            InkWell(
+              borderRadius: BorderRadius.circular(12),
+              onTap: () async {
+                _rm(root, id);
+                await _save(mmId, root);
+              },
+              child: const Padding(
+                padding: EdgeInsets.all(4),
+                child: Icon(Icons.close, size: 16, color: Colors.redAccent),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  void _confirmDeleteMindmap(int mmId, String title) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除规划'),
+        content: Text('确定删除整张规划「$title」吗？'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          FilledButton(
+            onPressed: () async {
+              await widget.db.delete('mindmaps', where: 'id = ?', whereArgs: [mmId]);
+              if (mounted) Navigator.pop(ctx);
+              setState(() {});
+            },
+            child: const Text('删除'),
+          ),
+        ],
+      ),
     );
   }
 
@@ -1233,13 +1565,14 @@ class _PlanPageState extends State<PlanPage> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('添加子节点'),
-        content: TextField(controller: ctrl, autofocus: true),
+        content: TextField(controller: ctrl, autofocus: true, minLines: 1, maxLines: 3),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
           FilledButton(
             onPressed: () async {
               if (ctrl.text.trim().isEmpty) return;
               (pNode['children'] as List).add({'id': _uuid.v4(), 'text': ctrl.text.trim(), 'children': []});
+              _col.remove('${pNode['id']}');
               if (mounted) Navigator.pop(ctx);
               await _save(mmId, root);
             },
@@ -1256,7 +1589,7 @@ class _PlanPageState extends State<PlanPage> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('修改节点内容'),
-        content: TextField(controller: ctrl, autofocus: true),
+        content: TextField(controller: ctrl, autofocus: true, minLines: 1, maxLines: 4),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
           FilledButton(
