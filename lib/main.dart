@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'package:archive/archive_io.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
@@ -59,7 +61,6 @@ class AppDatabase {
     );
   }
 
-  /// 读取持久化的 UI 折叠/展开状态
   static Future<String?> getUiState(Database db, String key) async {
     try {
       final rows = await db.query('ui_states', where: 'state_key = ?', whereArgs: [key]);
@@ -68,7 +69,6 @@ class AppDatabase {
     return null;
   }
 
-  /// 保存 UI 折叠/展开状态
   static Future<void> setUiState(Database db, String key, String val) async {
     try {
       await db.insert(
@@ -234,7 +234,6 @@ class _TodayPageState extends State<TodayPage> {
     _restoreTodayUiState();
   }
 
-  /// 启动或进入页面时恢复上次调整的缩略/折叠状态
   Future<void> _restoreTodayUiState() async {
     final raw = await AppDatabase.getUiState(widget.db, 'today_ui_state');
     if (raw != null && raw.isNotEmpty) {
@@ -254,7 +253,6 @@ class _TodayPageState extends State<TodayPage> {
     if (mounted) setState(() => _uiLoaded = true);
   }
 
-  /// 每次调整缩略状态时自动持久化保存
   Future<void> _saveTodayUiState() async {
     final data = jsonEncode({
       'foldSummary': _foldSummary,
@@ -332,15 +330,298 @@ class _TodayPageState extends State<TodayPage> {
     return [trimmed];
   }
 
+  // ==================== 新增：解析并导入每日记录 Word (.docx)（含多日期、分列条目与原图提取） ====================
+  String _unescapeXml(String s) {
+    return s
+        .replaceAll('&amp;', '&')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&apos;', "'");
+  }
+
+  Future<int> _ensureStatusItem(String name, String type) async {
+    final existing = await widget.db.query('status_items', where: 'name = ?', whereArgs: [name]);
+    if (existing.isNotEmpty) return existing.first['id'] as int;
+    // 兼容“状态与异状”和“状态和异状”同义归并
+    if (name == '状态与异状' || name == '状态和异状') {
+      final alt = await widget.db.query('status_items', where: 'name IN (?, ?)', whereArgs: ['状态与异状', '状态和异状']);
+      if (alt.isNotEmpty) return alt.first['id'] as int;
+    }
+    final all = await widget.db.query('status_items');
+    return await widget.db.insert('status_items', {
+      'name': name,
+      'type': type,
+      'sort_order': all.length,
+    });
+  }
+
+  Future<void> _importDailyDocx() async {
+    try {
+      final res = await FilePicker.platform.pickFiles(type: FileType.any);
+      if (res == null || res.files.single.path == null) return;
+      final filePath = res.files.single.path!;
+      final bytes = await File(filePath).readAsBytes();
+      final archive = ZipDecoder().decodeBytes(bytes);
+
+      ArchiveFile? docXmlFile;
+      ArchiveFile? relsXmlFile;
+      final mediaFiles = <String, ArchiveFile>{};
+
+      for (final f in archive) {
+        if (!f.isFile) continue;
+        if (f.name == 'word/document.xml') {
+          docXmlFile = f;
+        } else if (f.name == 'word/_rels/document.xml.rels') {
+          relsXmlFile = f;
+        } else if (f.name.startsWith('word/media/')) {
+          mediaFiles[f.name] = f;
+        }
+      }
+
+      if (docXmlFile == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('未识别到标准 Word (.docx) 结构，请确认文件格式')));
+        }
+        return;
+      }
+
+      // 1. 解析 rId -> word/media/xxx 图片映射关系
+      final relMap = <String, String>{};
+      if (relsXmlFile != null) {
+        final relsXml = utf8.decode(relsXmlFile.content as List<int>, allowMalformed: true);
+        final relMatches = RegExp(r'<Relationship\b[^>]*>').allMatches(relsXml);
+        for (final m in relMatches) {
+          final tag = m.group(0)!;
+          final idM = RegExp(r'Id="([^"]+)"').firstMatch(tag);
+          final targetM = RegExp(r'Target="([^"]+)"').firstMatch(tag);
+          if (idM != null && targetM != null) {
+            var target = targetM.group(1)!;
+            if (target.startsWith('/')) {
+              target = target.substring(1);
+            } else if (!target.startsWith('word/')) {
+              target = 'word/$target';
+            }
+            relMap[idM.group(1)!] = target;
+          }
+        }
+      }
+
+      // 2. 逐段解析 word/document.xml
+      final docXml = utf8.decode(docXmlFile.content as List<int>, allowMalformed: true);
+      final pMatches = RegExp(r'<w:p\b[^>]*>([\s\S]*?)<\/w:p>').allMatches(docXml);
+
+      String currentDate = _date;
+      String? lastimportedDate;
+      String? currentField;
+      final dateTextData = <String, Map<String, List<String>>>{};
+      final dateImages = <String, List<String>>{};
+
+      void addTextLine(String dateKey, String fieldName, String val) {
+        final v = val.trim();
+        if (v.isEmpty) return;
+        dateTextData.putIfAbsent(dateKey, () => {});
+        dateTextData[dateKey]!.putIfAbsent(fieldName, () => []);
+        dateTextData[dateKey]![fieldName]!.add(v);
+      }
+
+      final dateHeaderRegex = RegExp(r'^【\s*(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]\s*】');
+      final topFields = [
+        '基础数据',
+        '核心目标',
+        '饮食记录',
+        '打卡进度',
+        '状态与异状',
+        '状态和异状',
+        'AI 深度异状分析',
+        'AI深度异状分析',
+        '复盘与分析',
+        '今日总结',
+      ];
+
+      for (final pm in pMatches) {
+        final pXml = pm.group(1)!;
+        // 提取段落文字
+        final tMatches = RegExp(r'<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>').allMatches(pXml);
+        final rawText = _unescapeXml(tMatches.map((m) => m.group(1)!).join('')).trim();
+
+        // 提取段落内嵌图片 r:embed / v:imagedata
+        final blipMatches = RegExp(r'r:(?:embed|id)="([^"]+)"').allMatches(pXml);
+        for (final bm in blipMatches) {
+          final rId = bm.group(1)!;
+          final mediaPath = relMap[rId];
+          if (mediaPath != null && mediaFiles.containsKey(mediaPath)) {
+            dateImages.putIfAbsent(currentDate, () => []);
+            if (!dateImages[currentDate]!.contains(mediaPath)) {
+              dateImages[currentDate]!.add(mediaPath);
+            }
+          }
+        }
+
+        if (rawText.isEmpty || rawText == '每日记录') continue;
+
+        // 检查是否为【X月X日】日期标题
+        final dm = dateHeaderRegex.firstMatch(rawText);
+        if (dm != null) {
+          final year = dm.group(1) != null ? int.parse(dm.group(1)!) : DateTime.parse(_date).year;
+          final month = int.parse(dm.group(2)!);
+          final day = int.parse(dm.group(3)!);
+          currentDate = '$year-${month.toString().padLeft(2, '0')}-${day.toString().padLeft(2, '0')}';
+          lastimportedDate = currentDate;
+          currentField = null;
+          continue;
+        }
+
+        // 清理前导项目符号（●、•、◦、▪、□ 等）
+        final cleanLine = rawText.replaceFirst(RegExp(r'^[\u25CF\u2022\u25E6\u25AA\u25A1\u25B6\uF0B7\uF0A7\-\*]+\s*'), '').trim();
+        if (cleanLine.isEmpty) continue;
+
+        // 检查是否命中顶层状态字段（如“基础数据：...”、“饮食记录：”）
+        String? matchedField;
+        String remainder = '';
+        final colonIdx = cleanLine.indexOf(RegExp(r'[:：]'));
+        if (colonIdx > 0 && colonIdx <= 14) {
+          final prefix = cleanLine.substring(0, colonIdx).trim();
+          final after = cleanLine.substring(colonIdx + 1).trim();
+          // 若前缀是已知顶层字段，或不是子项编号（如 a. / b. / i. / iv. / 早餐 / 午餐 / 晚餐）
+          final isSubItemPrefix = RegExp(r'^([a-zA-Z]{1,4}[\.、]|早餐|午餐|下午茶|晚餐|夜宵|加餐|上午|下午|晚上|\d+[\.、])').hasMatch(cleanLine);
+          if (topFields.contains(prefix) || (!isSubItemPrefix && currentField == null)) {
+            matchedField = prefix;
+            remainder = after;
+          }
+        }
+
+        if (matchedField != null) {
+          if (matchedField == '基础数据') {
+            currentField = null;
+            // 拆分“体重 80.6 kg | 运动：无”
+            final parts = remainder.split(RegExp(r'[|｜；;]'));
+            for (final part in parts) {
+              final pTrim = part.trim();
+              if (pTrim.isEmpty) continue;
+              if (pTrim.contains('体重')) {
+                final numM = RegExp(r'(\d+(?:\.\d+)?)').firstMatch(pTrim);
+                if (numM != null) {
+                  addTextLine(currentDate, '体重/kg', numM.group(1)!);
+                }
+              } else if (pTrim.contains('运动')) {
+                final subColon = pTrim.indexOf(RegExp(r'[:：]'));
+                final sportVal = subColon >= 0 ? pTrim.substring(subColon + 1).trim() : pTrim.replaceFirst('运动', '').trim();
+                addTextLine(currentDate, '运动量', sportVal);
+              } else {
+                final subColon = pTrim.indexOf(RegExp(r'[:：]'));
+                if (subColon > 0) {
+                  addTextLine(currentDate, pTrim.substring(0, subColon).trim(), pTrim.substring(subColon + 1).trim());
+                }
+              }
+            }
+          } else {
+            currentField = matchedField;
+            if (remainder.isNotEmpty) {
+              addTextLine(currentDate, currentField!, remainder);
+            }
+          }
+        } else {
+          // 归属到当前激活的字段下作为独立分列行（例如饮食记录下的早餐/午餐/晚餐，或 AI 分析下的 a./b./c./iv.）
+          final targetField = currentField ?? '状态与异状';
+          addTextLine(currentDate, targetField, cleanLine);
+        }
+      }
+
+      // 3. 将解析出的文本与图片写入 SQLite 数据库
+      int importedDays = 0;
+      int importedImgs = 0;
+      final allDates = <String>{...dateTextData.keys, ...dateImages.keys};
+      final appDir = await getApplicationDocumentsDirectory();
+
+      for (final dKey in allDates) {
+        importedDays++;
+        final fieldsMap = dateTextData[dKey] ?? {};
+        for (final entry in fieldsMap.entries) {
+          final fName = entry.key;
+          final fLines = entry.value;
+          if (fLines.isEmpty) continue;
+
+          final isNumber = fName.contains('体重') && fLines.length == 1 && double.tryParse(fLines.first) != null;
+          final itemId = await _ensureStatusItem(fName, isNumber ? 'number' : 'text');
+          final joinedVal = fLines.join('\n');
+
+          await widget.db.insert(
+            'status_records',
+            {'item_id': itemId, 'date': dKey, 'value': joinedVal},
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
+        }
+
+        // 处理该日期下提取出的内嵌原图
+        final imgList = dateImages[dKey] ?? [];
+        if (imgList.isNotEmpty) {
+          final imgItemId = await _ensureStatusItem('今日图片', 'image');
+          await widget.db.insert(
+            'status_records',
+            {'item_id': imgItemId, 'date': dKey, 'value': ''},
+            conflictAlgorithm: ConflictAlgorithm.ignore,
+          );
+          final recs = await widget.db.query(
+            'status_records',
+            where: 'item_id = ? AND date = ?',
+            whereArgs: [imgItemId, dKey],
+          );
+          final recId = recs.first['id'] as int;
+
+          final dFolder = dKey.replaceAll('-', '');
+          final targetDir = Directory(p.join(appDir.path, 'images', 'status', dFolder));
+          if (!await targetDir.exists()) await targetDir.create(recursive: true);
+
+          final existingImgs = await widget.db.query('status_images', where: 'record_id = ?', whereArgs: [recId]);
+          int nextSort = existingImgs.length;
+
+          for (final mediaKey in imgList) {
+            final archFile = mediaFiles[mediaKey]!;
+            final ext = p.extension(mediaKey).isNotEmpty ? p.extension(mediaKey) : '.jpg';
+            final fileName = '${recId}_${nextSort}_${DateTime.now().millisecondsSinceEpoch}$ext';
+            final relPath = p.join('images', 'status', dFolder, fileName);
+            await File(p.join(appDir.path, relPath)).writeAsBytes(archFile.content as List<int>);
+            await widget.db.insert('status_images', {
+              'record_id': recId,
+              'file_path': relPath,
+              'sort_order': nextSort++,
+            });
+            importedImgs++;
+          }
+        }
+      }
+
+      if (lastimportedDate != null) {
+        _date = lastimportedDate;
+      }
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('🎉 导入完成：共导入 $importedDays 天记录、$importedImgs 张内嵌图片！')),
+      );
+      setState(() {});
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('导入 Word 失败：$e')));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         toolbarHeight: 46,
-        title: Text(_date == _today ? '今天 · $_date' : _date, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+        title: Text(_date == _today ? '今天 · $_date' : _date, style: const TextStyle(fontSize: 16.5, fontWeight: FontWeight.bold)),
         actions: [
+          TextButton.icon(
+            onPressed: _importDailyDocx,
+            icon: const Icon(Icons.description_outlined, size: 17),
+            label: const Text('导入Word', style: TextStyle(fontSize: 13)),
+          ),
           IconButton(
             icon: const Icon(Icons.date_range, size: 20),
+            tooltip: '切换日期',
             onPressed: () async {
               final d = await showDatePicker(context: context, initialDate: DateTime.parse(_date), firstDate: DateTime(2020), lastDate: DateTime(2035));
               if (d != null) setState(() => _date = DateFormat('yyyy-MM-dd').format(d));
@@ -386,7 +667,7 @@ class _TodayPageState extends State<TodayPage> {
                   child: items.isEmpty
                       ? const Padding(
                           padding: EdgeInsets.all(16),
-                          child: Center(child: Text('暂无状态条目，点击右上角「+ 新条目」添加', style: TextStyle(color: Colors.grey, fontSize: 13))),
+                          child: Center(child: Text('暂无状态条目，可点击右上角「导入Word」或「+ 新条目」', style: TextStyle(color: Colors.grey, fontSize: 13))),
                         )
                       : Column(
                           children: [
@@ -590,7 +871,7 @@ class _TodayPageState extends State<TodayPage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(
-            width: 76,
+            width: 82,
             child: Text('$name：', style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold, color: Color(0xFF334155))),
           ),
           Expanded(
@@ -616,7 +897,7 @@ class _TodayPageState extends State<TodayPage> {
               children: cols.map((colText) {
                 final colonIdx = colText.indexOf(RegExp(r'[:：]'));
                 Widget content;
-                if (colonIdx > 0 && colonIdx < 8) {
+                if (colonIdx > 0 && colonIdx < 14) {
                   final k = colText.substring(0, colonIdx);
                   final v = colText.substring(colonIdx + 1).trim();
                   content = RichText(
@@ -803,7 +1084,7 @@ class _TodayPageState extends State<TodayPage> {
                       children: cols.map((colText) {
                         final colonIdx = colText.indexOf(RegExp(r'[:：]'));
                         Widget inner;
-                        if (colonIdx > 0 && colonIdx < 8) {
+                        if (colonIdx > 0 && colonIdx < 14) {
                           final label = colText.substring(0, colonIdx);
                           final body = colText.substring(colonIdx + 1).trim();
                           inner = RichText(
