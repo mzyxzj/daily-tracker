@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -364,12 +365,93 @@ class _TodayPageState extends State<TodayPage> {
     });
   }
 
-  // ==================== 新增：Gemini AI 状态总结分析与一键导入每日状态 ====================
+  /// 调用 Gemini 接口（支持 AQ. 新版 Auth Key 与 AIza 传统 Key，并支持多模型自动降级重试）
+  Future<String> _callGeminiApi({
+    required String apiKey,
+    required String preferredModel,
+    required String prompt,
+  }) async {
+    final cleanKey = apiKey.trim();
+    // 构建候选模型队列：优先使用用户选择的模型，若接口名称变更则自动回退尝试稳定版模型
+    final candidates = <String>[
+      if (preferredModel == 'gemini-3.1-pro') ...[
+        'gemini-2.5-pro',
+        'gemini-2.5-flash',
+        'gemini-2.0-flash',
+      ] else if (preferredModel == 'gemini-2.5-pro') ...[
+        'gemini-2.5-pro',
+        'gemini-2.5-flash',
+        'gemini-2.0-flash',
+      ] else ...[
+        'gemini-2.5-flash',
+        'gemini-2.0-flash',
+        'gemini-1.5-flash',
+      ]
+    ];
+
+    String lastError = '未知错误';
+    for (final modelName in candidates) {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+      try {
+        final uri = Uri.parse(
+          'https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=${Uri.encodeQueryComponent(cleanKey)}',
+        );
+        final req = await client.postUrl(uri).timeout(const Duration(seconds: 15));
+        req.headers.set('Content-Type', 'application/json; charset=utf-8');
+        // 同时携带 x-goog-api-key 头，兼容 AQ. 开头的新版 Google AI Studio Auth Key
+        req.headers.set('x-goog-api-key', cleanKey);
+
+        final body = jsonEncode({
+          'contents': [
+            {
+              'parts': [
+                {'text': prompt}
+              ]
+            }
+          ]
+        });
+        req.add(utf8.encode(body));
+        final resp = await req.close().timeout(const Duration(seconds: 35));
+        final respStr = await resp.transform(utf8.decoder).join();
+
+        Map<String, dynamic>? json;
+        try {
+          json = jsonDecode(respStr) as Map<String, dynamic>;
+        } catch (_) {}
+
+        if (resp.statusCode == 200 && json != null) {
+          final list = json['candidates'] as List?;
+          if (list != null && list.isNotEmpty) {
+            final parts = list.first['content']?['parts'] as List?;
+            if (parts != null && parts.isNotEmpty) {
+              return parts.map((p) => '${p['text'] ?? ''}').join('\n').trim();
+            }
+          }
+        }
+
+        final errMsg = json?['error']?['message']?.toString() ?? 'HTTP ${resp.statusCode}: $respStr';
+        lastError = '[$modelName] $errMsg';
+        // 如果是 Key 本身无效或地区不支持，直接中断不再重试其他模型
+        if (errMsg.toLowerCase().contains('api key not valid') ||
+            errMsg.toLowerCase().contains('user location is not supported') ||
+            errMsg.toLowerCase().contains('permission_denied')) {
+          break;
+        }
+      } catch (e) {
+        lastError = '[$modelName] 网络请求异常: $e';
+      } finally {
+        client.close();
+      }
+    }
+    throw Exception(lastError);
+  }
+
+  // ==================== Gemini AI 状态总结分析与一键导入每日状态 ====================
   Future<void> _openGeminiAnalyzerSheet(String summaryText) async {
     final rawCfg = await AppDatabase.getUiState(widget.db, 'gemini_ai_config');
     Map<String, dynamic> cfg = {
       'model': 'gemini-3.1-pro',
-      'mode': 'gem', // 'chat' (普通对话) 或 'gem' (专属Gem)
+      'mode': 'gem',
       'gemName': '每日状态系统分析师',
       'gemPrompt': '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条控制在一段话内，格式如“标题：具体分析”。',
       'targetField': 'AI 深度异状分析',
@@ -390,7 +472,8 @@ class _TodayPageState extends State<TodayPage> {
     String selectedModel = '${cfg['model']}';
     String selectedMode = '${cfg['mode']}';
     bool isLoading = false;
-    bool showAdvancedKey = false;
+    bool showAdvancedKey = apiKeyCtrl.text.trim().isEmpty;
+    bool obscureKey = false; // 默认明文显示方便核对 Key 是否完整
 
     Future<void> saveCurrentConfig() async {
       final newCfg = {
@@ -417,7 +500,7 @@ class _TodayPageState extends State<TodayPage> {
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setS) => DraggableScrollableSheet(
           expand: false,
-          initialChildSize: 0.88,
+          initialChildSize: 0.90,
           maxChildSize: 0.96,
           builder: (_, sc) => Padding(
             padding: EdgeInsets.fromLTRB(16, 14, 16, MediaQuery.of(ctx).viewInsets.bottom + 14),
@@ -607,7 +690,7 @@ class _TodayPageState extends State<TodayPage> {
                     TextButton.icon(
                       onPressed: () => setS(() => showAdvancedKey = !showAdvancedKey),
                       icon: Icon(showAdvancedKey ? Icons.key_off : Icons.key, size: 16),
-                      label: Text(apiKeyCtrl.text.trim().isEmpty ? '配置API直连' : '已配API', style: const TextStyle(fontSize: 12)),
+                      label: Text(apiKeyCtrl.text.trim().isEmpty ? '配置API直连' : '查看/改Key', style: const TextStyle(fontSize: 12)),
                     ),
                   ],
                 ),
@@ -615,13 +698,17 @@ class _TodayPageState extends State<TodayPage> {
                   const SizedBox(height: 8),
                   TextField(
                     controller: apiKeyCtrl,
-                    obscureText: true,
+                    obscureText: obscureKey,
                     style: const TextStyle(fontSize: 12.5),
-                    decoration: const InputDecoration(
-                      labelText: 'Gemini API Key（选填，配置后可直接在App内一键生成）',
-                      hintText: 'AIzaSy...',
-                      border: OutlineInputBorder(),
+                    decoration: InputDecoration(
+                      labelText: 'Gemini API Key（支持 AQ. 或 AIzaSy 开头密钥）',
+                      hintText: '粘贴完整 API Key...',
+                      border: const OutlineInputBorder(),
                       isDense: true,
+                      suffixIcon: IconButton(
+                        icon: Icon(obscureKey ? Icons.visibility_off : Icons.visibility, size: 18),
+                        onPressed: () => setS(() => obscureKey = !obscureKey),
+                      ),
                     ),
                     onChanged: (_) => saveCurrentConfig(),
                   ),
@@ -638,11 +725,9 @@ class _TodayPageState extends State<TodayPage> {
                           await saveCurrentConfig();
                           final fullPrompt = buildFullPrompt();
                           await Clipboard.setData(ClipboardData(text: fullPrompt));
-                          if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(content: Text('✅ 已复制含「${selectedMode == 'gem' ? gemNameCtrl.text : '对话'}」指令的今日摘要，正在拉起 Gemini...')),
-                            );
-                          }
+                          setS(() {
+                            resultCtrl.text = '✅ 已复制含今日状态与指令的完整文本！\n请在弹出的分享菜单中选择 Gemini App（或直接切换到 Gemini 粘贴发送），然后将回复粘贴回此处即可。';
+                          });
                           await Share.share(fullPrompt, subject: '今日状态 Gemini 分析');
                         },
                         icon: const Icon(Icons.open_in_new, size: 17),
@@ -662,50 +747,29 @@ class _TodayPageState extends State<TodayPage> {
                                 await saveCurrentConfig();
                                 final key = apiKeyCtrl.text.trim();
                                 if (key.isEmpty) {
-                                  // 若未配置 API Key，自动复制完整提示词并提示粘贴回下方框
                                   final fullPrompt = buildFullPrompt();
                                   await Clipboard.setData(ClipboardData(text: fullPrompt));
-                                  setS(() => showAdvancedKey = true);
-                                  if (mounted) {
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(content: Text('📋 已复制完整分析指令！可点左侧拉起 Gemini 对话，或填入 API Key 实现应用内直连生成')),
-                                    );
-                                  }
+                                  setS(() {
+                                    showAdvancedKey = true;
+                                    resultCtrl.text = '⚠️ 你尚未填写 Gemini API Key。\n已为你自动复制完整分析指令到剪贴板！你可以直接点上方输入框填入 API Key，或点左侧按钮拉起 Gemini App 对话。';
+                                  });
                                   return;
                                 }
-                                setS(() => isLoading = true);
+                                setS(() {
+                                  isLoading = true;
+                                  resultCtrl.text = '⏳ 正在通过 Gemini ($selectedModel) 深度分析今日状态，请稍候 (约需 5~12 秒)...';
+                                });
                                 try {
-                                  // 映射实际 API 模型端点（兼容 3.1-pro 与 2.5-pro）
-                                  final apiModel = selectedModel.contains('flash') ? 'gemini-2.5-flash' : 'gemini-2.5-pro';
-                                  final uri = Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/$apiModel:generateContent?key=$key');
-                                  final client = HttpClient();
-                                  final req = await client.postUrl(uri);
-                                  req.headers.set('Content-Type', 'application/json; charset=utf-8');
-                                  final body = jsonEncode({
-                                    'contents': [
-                                      {
-                                        'parts': [
-                                          {'text': buildFullPrompt()}
-                                        ]
-                                      }
-                                    ]
-                                  });
-                                  req.add(utf8.encode(body));
-                                  final resp = await req.close();
-                                  final respStr = await resp.transform(utf8.decoder).join();
-                                  final json = jsonDecode(respStr) as Map<String, dynamic>;
-                                  final candidates = json['candidates'] as List?;
-                                  if (candidates != null && candidates.isNotEmpty) {
-                                    final parts = candidates.first['content']['parts'] as List;
-                                    final aiText = parts.map((p) => p['text']).join('\n').trim();
-                                    setS(() => resultCtrl.text = aiText);
-                                  } else {
-                                    throw Exception(json['error']?['message'] ?? '返回结果为空');
-                                  }
+                                  final aiText = await _callGeminiApi(
+                                    apiKey: key,
+                                    preferredModel: selectedModel,
+                                    prompt: buildFullPrompt(),
+                                  );
+                                  setS(() => resultCtrl.text = aiText);
                                 } catch (e) {
-                                  if (mounted) {
-                                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('API 调用提示：$e')));
-                                  }
+                                  setS(() {
+                                    resultCtrl.text = '❌ API 直连生成返回提示：\n$e\n\n💡 解决方法：\n1. 若提示 API key not valid，说明 Google REST 接口仅接受以 AIzaSy 开头的标准密钥（可在 console.cloud.google.com/apis/credentials 点“+创建凭据 -> API密钥”获取 AIzaSy 密钥）。\n2. 或者直接点击左上方「复制并拉起 Gemini App」，粘贴到你手机的 Gemini 网页/App 中获取回复！';
+                                  });
                                 } finally {
                                   setS(() => isLoading = false);
                                 }
@@ -724,7 +788,7 @@ class _TodayPageState extends State<TodayPage> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text('📥 AI 分析建议（可自由编辑或从 Gemini 粘贴）：', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
+                    const Text('📥 AI 分析建议（实时显示进度 / 可编辑或粘贴）：', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
                     TextButton.icon(
                       style: TextButton.styleFrom(
                         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -745,11 +809,11 @@ class _TodayPageState extends State<TodayPage> {
                 const SizedBox(height: 6),
                 TextField(
                   controller: resultCtrl,
-                  minLines: 5,
-                  maxLines: 11,
+                  minLines: 6,
+                  maxLines: 12,
                   style: const TextStyle(fontSize: 13.5, height: 1.45),
                   decoration: const InputDecoration(
-                    hintText: '在此查看 AI 生成的分析建议，或将你在 Gemini App / Gem 中得到的回复粘贴到这里，点击下方按钮即可自动分列导入到今日状态中...',
+                    hintText: '点击上方「⚡ AI 直接生成分析」后，此处将实时显示连接进度与生成结果；你也可以随时将外部 Gemini 的回复粘贴到这里...',
                     border: OutlineInputBorder(),
                     contentPadding: EdgeInsets.all(10),
                   ),
@@ -764,13 +828,14 @@ class _TodayPageState extends State<TodayPage> {
                     ),
                     onPressed: () async {
                       final rawAi = resultCtrl.text.trim();
-                      if (rawAi.isEmpty) {
-                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先生成或粘贴 AI 分析内容')));
+                      if (rawAi.isEmpty || rawAi.startsWith('⏳') || rawAi.startsWith('❌') || rawAi.startsWith('⚠️')) {
+                        setS(() {
+                          resultCtrl.text = '⚠️ 请先等待 AI 生成有效的分析内容，或者粘贴分析结果后再点击导出！';
+                        });
                         return;
                       }
                       await saveCurrentConfig();
                       final targetName = targetFieldCtrl.text.trim().isEmpty ? 'AI 深度异状分析' : targetFieldCtrl.text.trim();
-                      // 清理 Markdown 星号符号并将空行规整为标准分列换行
                       final cleanedLines = rawAi
                           .split('\n')
                           .map((line) => line.replaceAll('**', '').replaceFirst(RegExp(r'^[\-\*\•\d]+[\.、\s]\s*'), '').trim())
@@ -778,7 +843,6 @@ class _TodayPageState extends State<TodayPage> {
                           .toList();
 
                       final itemId = await _ensureStatusItem(targetName, 'text');
-                      // AI 分析默认设为不跨天继承，确保每天都是针对当日的独立评估
                       await widget.db.update('status_items', {'allow_inherit': 0}, where: 'id = ?', whereArgs: [itemId]);
                       await widget.db.insert(
                         'status_records',
@@ -1259,7 +1323,6 @@ class _TodayPageState extends State<TodayPage> {
                 ),
               ),
               const SizedBox(width: 4),
-              // 一键导入 Gemini 分析按钮
               SizedBox(
                 height: 26,
                 child: FilledButton.icon(
