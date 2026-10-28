@@ -20,6 +20,7 @@ void main() async {
   runApp(DailyTrackerApp(db: db));
 }
 
+// ==================== 数据库层 (SQLite v8 支持标题组拖拽排序与成员标识) ====================
 class AppDatabase {
   static final AppDatabase instance = AppDatabase._();
   static Database? _db;
@@ -30,7 +31,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
-      version: 7,
+      version: 8,
       onCreate: (db, v) async {
         await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, allow_inherit INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE status_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, value TEXT DEFAULT "", UNIQUE(item_id, date))');
@@ -39,13 +40,33 @@ class AppDatabase {
         await db.execute('CREATE TABLE schedule_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, done INTEGER DEFAULT 0, UNIQUE(item_id, date))');
         await db.execute('CREATE TABLE modules (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, parent_id INTEGER, is_member INTEGER DEFAULT 0, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE module_entries (id INTEGER PRIMARY KEY AUTOINCREMENT, module_id INTEGER NOT NULL, seq INTEGER NOT NULL, content TEXT NOT NULL, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)');
-        await db.execute('CREATE TABLE module_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, module_ids TEXT NOT NULL, created_at TEXT NOT NULL)');
+        await db.execute('CREATE TABLE module_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, module_ids TEXT NOT NULL, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE mindmaps (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, root_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE ui_states (state_key TEXT PRIMARY KEY, state_val TEXT NOT NULL)');
       },
       onUpgrade: (db, oldV, newV) async {
+        if (oldV < 2) {
+          try { await db.execute("ALTER TABLE schedule_items ADD COLUMN plan_info TEXT DEFAULT ''"); } catch (_) {}
+        }
+        if (oldV < 3) {
+          try { await db.execute("ALTER TABLE modules ADD COLUMN parent_id INTEGER"); } catch (_) {}
+          try { await db.execute("ALTER TABLE modules ADD COLUMN sort_order INTEGER DEFAULT 0"); } catch (_) {}
+          try { await db.execute("ALTER TABLE module_entries ADD COLUMN sort_order INTEGER DEFAULT 0"); } catch (_) {}
+        }
+        if (oldV < 4) {
+          try { await db.execute("ALTER TABLE schedule_items ADD COLUMN parent_id INTEGER"); } catch (_) {}
+        }
+        if (oldV < 5) {
+          try { await db.execute('CREATE TABLE IF NOT EXISTS ui_states (state_key TEXT PRIMARY KEY, state_val TEXT NOT NULL)'); } catch (_) {}
+        }
+        if (oldV < 6) {
+          try { await db.execute("ALTER TABLE status_items ADD COLUMN allow_inherit INTEGER DEFAULT 1"); } catch (_) {}
+        }
         if (oldV < 7) {
           try { await db.execute("ALTER TABLE modules ADD COLUMN is_member INTEGER DEFAULT 0"); } catch (_) {}
+        }
+        if (oldV < 8) {
+          try { await db.execute("ALTER TABLE module_groups ADD COLUMN sort_order INTEGER DEFAULT 0"); } catch (_) {}
         }
       },
     );
@@ -160,7 +181,11 @@ class DailyTrackerApp extends StatelessWidget {
     return MaterialApp(
       title: '每日记录',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF4F46E5)), useMaterial3: true),
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF4F46E5)),
+        scaffoldBackgroundColor: const Color(0xFFF1F5F9),
+        useMaterial3: true,
+      ),
       home: MainShell(db: db),
     );
   }
@@ -211,7 +236,11 @@ class _TodayPageState extends State<TodayPage> {
   bool _foldStatusSection = false;
   bool _foldSchedSection = false;
   bool _uiLoaded = false;
-  List<String> _sectionOrder = ['summary', 'status', 'schedule']; // 今日页大模块拖拽排序顺序
+  List<String> _sectionOrder = ['summary', 'status', 'schedule'];
+
+  // 日程打卡三区拖拽状态（与家庭模块一致：up=排到上方, inside=变为其子日程, down=排到下方）
+  int? _hoverSchedTargetId;
+  String? _hoverSchedZone;
 
   String get _today => DateFormat('yyyy-MM-dd').format(DateTime.now());
 
@@ -230,7 +259,11 @@ class _TodayPageState extends State<TodayPage> {
         _foldStatusSection = map['foldStatusSection'] == true;
         _foldSchedSection = map['foldSchedSection'] == true;
         if (map['sectionOrder'] is List) {
-          _sectionOrder = (map['sectionOrder'] as List).map((e) => '$e').toList();
+          final loadedOrder = (map['sectionOrder'] as List).map((e) => '$e').toList();
+          for (final k in ['summary', 'status', 'schedule']) {
+            if (!loadedOrder.contains(k)) loadedOrder.add(k);
+          }
+          _sectionOrder = loadedOrder;
         }
         _collapsedStatusIds
           ..clear()
@@ -257,7 +290,9 @@ class _TodayPageState extends State<TodayPage> {
 
   Future<Map<String, dynamic>> _load() async {
     if (!_uiLoaded) await _restoreTodayUiState();
-    final items = await widget.db.query('status_items', orderBy: 'sort_order ASC, id ASC');
+    final items = List<Map<String, dynamic>>.from(
+      await widget.db.query('status_items', orderBy: 'sort_order ASC, id ASC'),
+    );
     final disp = <int, Map<String, dynamic>>{};
     final appDir = await getApplicationDocumentsDirectory();
 
@@ -275,7 +310,9 @@ class _TodayPageState extends State<TodayPage> {
         if (prev.isNotEmpty) disp[id] = {'recordId': null, 'value': prev.first['value'], 'images': <String>[], 'isInherited': true, 'inheritedFrom': prev.first['date']};
       }
     }
-    final scheds = await widget.db.query('schedule_items', orderBy: 'sort_order ASC, id ASC');
+    final scheds = List<Map<String, dynamic>>.from(
+      await widget.db.query('schedule_items', orderBy: 'sort_order ASC, id ASC'),
+    );
     final doneMap = <int, bool>{};
     for (final s in scheds) {
       final sid = s['id'] as int;
@@ -283,22 +320,6 @@ class _TodayPageState extends State<TodayPage> {
       doneMap[sid] = r.isNotEmpty && (r.first['done'] as int) == 1;
     }
     return {'items': items, 'disp': disp, 'scheds': scheds, 'done': doneMap};
-  }
-
-  Future<List<({String path, String name})>> _loadPlans() async {
-    final mms = await widget.db.query('mindmaps', orderBy: 'id DESC');
-    final res = <({String path, String name})>[];
-    void walk(Map<String, dynamic> n, String pre) {
-      final t = (n['text'] as String? ?? '').trim();
-      if (t.isEmpty) return;
-      final cur = pre.isEmpty ? t : '$pre > $t';
-      res.add((path: cur, name: t));
-      for (final c in ((n['children'] as List?)?.cast<Map<String, dynamic>>() ?? [])) walk(c, cur);
-    }
-    for (final m in mms) {
-      try { walk(jsonDecode(m['root_json'] as String) as Map<String, dynamic>, ''); } catch (_) {}
-    }
-    return res;
   }
 
   List<String> _splitColumns(String raw) {
@@ -346,6 +367,116 @@ class _TodayPageState extends State<TodayPage> {
       'allow_inherit': 1,
       'sort_order': all.length,
     });
+  }
+
+  // ==================== 日程打卡：参照家庭模块实现父子拖拽切换与排序 ====================
+  bool _isSchedDescendant(int dragId, int targetId, List<Map<String, dynamic>> all) {
+    if (dragId == targetId) return true;
+    int? cur = targetId;
+    final visited = <int>{};
+    while (cur != null && !visited.contains(cur)) {
+      visited.add(cur);
+      if (cur == dragId) return true;
+      final row = all.where((m) => m['id'] == cur).firstOrNull;
+      cur = row?['parent_id'] as int?;
+    }
+    return false;
+  }
+
+  Future<void> _handleScheduleDrop({
+    required int dragId,
+    required int targetId,
+    required String zone,
+    required List<Map<String, dynamic>> allScheds,
+  }) async {
+    if (_isSchedDescendant(dragId, targetId, allScheds)) return;
+    final target = allScheds.firstWhere((m) => m['id'] == targetId);
+
+    if (zone == 'inside') {
+      final siblings = allScheds.where((m) => m['parent_id'] == targetId && m['id'] != dragId).toList();
+      await widget.db.update(
+        'schedule_items',
+        {'parent_id': targetId, 'sort_order': siblings.length},
+        where: 'id = ?',
+        whereArgs: [dragId],
+      );
+      _collapsedSchedParents.remove(targetId);
+      await _saveTodayUiState();
+    } else {
+      final newParentId = target['parent_id'] as int?;
+      final siblings = allScheds.where((m) => m['parent_id'] == newParentId && m['id'] != dragId).toList();
+      final tIdx = siblings.indexWhere((m) => m['id'] == targetId);
+      final insertIdx = zone == 'up' ? math.max(0, tIdx) : math.min(siblings.length, tIdx + 1);
+
+      final dragMap = allScheds.firstWhere((m) => m['id'] == dragId);
+      siblings.insert(insertIdx, dragMap);
+
+      for (int i = 0; i < siblings.length; i++) {
+        await widget.db.update(
+          'schedule_items',
+          {'parent_id': newParentId, 'sort_order': i},
+          where: 'id = ?',
+          whereArgs: [siblings[i]['id']],
+        );
+      }
+    }
+    if (mounted) setState(() {});
+  }
+
+  // ==================== 日程打卡：父子双向勾选自动同步 ====================
+  Future<void> _toggleScheduleCheckbox(
+    int sid,
+    bool targetDone,
+    List<Map<String, dynamic>> allScheds,
+    Map<int, bool> doneMap,
+  ) async {
+    List<Map<String, dynamic>> childrenOf(int pid) =>
+        allScheds.where((s) => s['parent_id'] == pid).toList();
+
+    // 1. 更新当前节点状态
+    doneMap[sid] = targetDone;
+    await widget.db.insert(
+      'schedule_records',
+      {'item_id': sid, 'date': _date, 'done': targetDone ? 1 : 0},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+
+    // 2. 向下递归：主日程勾选/取消时，所有子孙日程同步勾选/取消
+    Future<void> cascadeDown(int pId, bool d) async {
+      for (final sub in childrenOf(pId)) {
+        final subId = sub['id'] as int;
+        doneMap[subId] = d;
+        await widget.db.insert(
+          'schedule_records',
+          {'item_id': subId, 'date': _date, 'done': d ? 1 : 0},
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+        await cascadeDown(subId, d);
+      }
+    }
+    await cascadeDown(sid, targetDone);
+
+    // 3. 向上递归：若某主日程下的所有子日程均已勾选，则主日程自动勾选；若有任一未勾选，则主日程自动取消勾选
+    final currentItem = allScheds.where((s) => s['id'] == sid).firstOrNull;
+    int? pId = currentItem?['parent_id'] as int?;
+    final visited = <int>{};
+    while (pId != null && !visited.contains(pId)) {
+      visited.add(pId);
+      final siblings = childrenOf(pId);
+      if (siblings.isNotEmpty) {
+        final allSiblingsDone = siblings.every((c) => doneMap[c['id'] as int] == true);
+        doneMap[pId] = allSiblingsDone;
+        await widget.db.insert(
+          'schedule_records',
+          {'item_id': pId, 'date': _date, 'done': allSiblingsDone ? 1 : 0},
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+      final parentItem = allScheds.where((s) => s['id'] == pId).firstOrNull;
+      pId = parentItem?['parent_id'] as int?;
+    }
+
+    if (mounted) setState(() {});
   }
 
   Future<String> _callGeminiApi({
@@ -417,7 +548,7 @@ class _TodayPageState extends State<TodayPage> {
           break;
         }
       } catch (e) {
-        lastError = '[$modelName] 网络连接异常(请检查代理节点是否为非香港节点): $e';
+        lastError = '[$modelName] 网络连接异常: $e';
       } finally {
         client.close();
       }
@@ -608,6 +739,20 @@ class _TodayPageState extends State<TodayPage> {
                               prompt: '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条格式如“标题：具体分析”。',
                             ),
                             child: Text('💎 客观理性系统分析师'),
+                          ),
+                          const PopupMenuItem(
+                            value: (
+                              name: '代谢与营养精算师',
+                              prompt: '请聚焦我今日的饮食结构（碳水/蛋白质/钠摄入）与体重变化、体能训练表现，分析水肿或热量缺口情况，并给出明日三餐调整方案。每条格式如“标题：具体分析”。',
+                            ),
+                            child: Text('🥗 代谢与营养精算师'),
+                          ),
+                          const PopupMenuItem(
+                            value: (
+                              name: '精力与日程效能教练',
+                              prompt: '请结合我今日的已完成/未完成日程与核心目标，分析精力分配与决策疲劳点，给出明日单线程减法行动建议。每条格式如“标题：具体分析”。',
+                            ),
+                            child: Text('⚡ 精力与日程效能教练'),
                           ),
                         ],
                       ),
@@ -1034,6 +1179,8 @@ class _TodayPageState extends State<TodayPage> {
     return Scaffold(
       appBar: AppBar(
         toolbarHeight: 46,
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.white,
         title: Text(_date == _today ? '今天 · $_date' : _date, style: const TextStyle(fontSize: 16.5, fontWeight: FontWeight.bold)),
         actions: [
           TextButton.icon(
@@ -1060,37 +1207,57 @@ class _TodayPageState extends State<TodayPage> {
           final scheds = snap.data!['scheds'] as List<Map<String, dynamic>>;
           final doneMap = snap.data!['done'] as Map<int, bool>;
 
+          // 自动同步一次主日程与子日程完成状态
+          for (final s in scheds) {
+            final sid = s['id'] as int;
+            final ch = scheds.where((c) => c['parent_id'] == sid).toList();
+            if (ch.isNotEmpty) {
+              doneMap[sid] = ch.every((c) => doneMap[c['id'] as int] == true);
+            }
+          }
+
           final doneCount = doneMap.values.where((v) => v).length;
 
-          // 核心重构：支持「今日状态摘要」、「每日状态」、「日程打卡」大模块自由上下拖拽排序
-          final sectionWidgets = <String, Widget>{
-            'summary': _buildSummary(items, disp, scheds, doneMap),
-            'status': Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _buildSectionHeader(
-                  icon: '📊',
-                  title: '每日状态 (${items.length})',
-                  isFolded: _foldStatusSection,
-                  onToggleFold: () {
-                    setState(() => _foldStatusSection = !_foldStatusSection);
-                    _saveTodayUiState();
-                  },
-                  actionLabel: '新条目',
-                  onAction: () => _addOrEditStatusItemDialog(),
-                ),
-                if (!_foldStatusSection)
-                  Card(
-                    margin: const EdgeInsets.only(bottom: 12),
-                    elevation: 0,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      side: const BorderSide(color: Color(0xFFE2E8F0)),
-                    ),
+          return ReorderableListView.builder(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 24),
+            buildDefaultDragHandles: false,
+            itemCount: _sectionOrder.length,
+            onReorder: (oldIdx, newIdx) async {
+              if (newIdx > oldIdx) newIdx -= 1;
+              final moved = _sectionOrder.removeAt(oldIdx);
+              _sectionOrder.insert(newIdx, moved);
+              await _saveTodayUiState();
+              setState(() {});
+            },
+            itemBuilder: (ctx, secIdx) {
+              final secKey = _sectionOrder[secIdx];
+              if (secKey == 'summary') {
+                return Container(
+                  key: const ValueKey('sec_summary'),
+                  margin: const EdgeInsets.only(bottom: 14),
+                  child: _buildSummaryCard(secIdx, items, disp, scheds, doneMap),
+                );
+              } else if (secKey == 'status') {
+                return Container(
+                  key: const ValueKey('sec_status'),
+                  margin: const EdgeInsets.only(bottom: 14),
+                  child: _buildMajorSectionCard(
+                    dragIndex: secIdx,
+                    accentColor: const Color(0xFF4F46E5),
+                    headerBgColor: const Color(0xFFEEF2FF),
+                    icon: '📊',
+                    title: '每日状态 (${items.length})',
+                    isFolded: _foldStatusSection,
+                    onToggleFold: () {
+                      setState(() => _foldStatusSection = !_foldStatusSection);
+                      _saveTodayUiState();
+                    },
+                    actionLabel: '新条目',
+                    onAction: () => _addOrEditStatusItemDialog(),
                     child: items.isEmpty
                         ? const Padding(
-                            padding: EdgeInsets.all(16),
-                            child: Center(child: Text('暂无状态条目', style: TextStyle(color: Colors.grey, fontSize: 13))),
+                            padding: EdgeInsets.all(20),
+                            child: Center(child: Text('暂无状态条目，点击右上角「+ 新条目」添加', style: TextStyle(color: Colors.grey, fontSize: 13))),
                           )
                         : ReorderableListView.builder(
                             shrinkWrap: true,
@@ -1110,143 +1277,176 @@ class _TodayPageState extends State<TodayPage> {
                               return Container(
                                 key: ValueKey('status_item_${items[i]['id']}'),
                                 decoration: BoxDecoration(
-                                  border: i > 0 ? const Border(top: BorderSide(color: Color(0xFFF1F5F9))) : null,
+                                  color: Colors.white,
+                                  border: i > 0 ? const Border(top: BorderSide(color: Color(0xFFE2E8F0), width: 0.8)) : null,
                                 ),
-                                child: Row(
-                                  children: [
-                                    Expanded(child: _buildCompactStatusRow(items[i], disp[items[i]['id'] as int])),
-                                    ReorderableDragStartListener(
-                                      index: i,
-                                      child: const Padding(
-                                        padding: EdgeInsets.symmetric(horizontal: 10),
-                                        child: Icon(Icons.drag_handle, color: Colors.grey, size: 18),
-                                      ),
-                                    ),
-                                  ],
-                                ),
+                                child: _buildCompactStatusRow(items[i], disp[items[i]['id'] as int], i),
                               );
                             },
                           ),
                   ),
-              ],
-            ),
-            'schedule': Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _buildSectionHeader(
-                  icon: '📅',
-                  title: '日程打卡 ($doneCount/${scheds.length})',
-                  isFolded: _foldSchedSection,
-                  onToggleFold: () {
-                    setState(() => _foldSchedSection = !_foldSchedSection);
-                    _saveTodayUiState();
-                  },
-                  actionLabel: '新日程',
-                  onAction: () => _addOrEditSchedDialog(),
-                ),
-                if (!_foldSchedSection)
-                  Card(
-                    margin: const EdgeInsets.only(bottom: 16),
-                    elevation: 0,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      side: const BorderSide(color: Color(0xFFE2E8F0)),
-                    ),
+                );
+              } else {
+                return Container(
+                  key: const ValueKey('sec_schedule'),
+                  margin: const EdgeInsets.only(bottom: 14),
+                  child: _buildMajorSectionCard(
+                    dragIndex: secIdx,
+                    accentColor: const Color(0xFF0D9488),
+                    headerBgColor: const Color(0xFFF0FDFA),
+                    icon: '📅',
+                    title: '日程打卡 ($doneCount/${scheds.length})',
+                    isFolded: _foldSchedSection,
+                    onToggleFold: () {
+                      setState(() => _foldSchedSection = !_foldSchedSection);
+                      _saveTodayUiState();
+                    },
+                    actionLabel: '新日程',
+                    onAction: () => _addOrEditSchedDialog(),
                     child: scheds.isEmpty
                         ? const Padding(
-                            padding: EdgeInsets.all(16),
-                            child: Center(child: Text('暂无日程', style: TextStyle(color: Colors.grey, fontSize: 13))),
+                            padding: EdgeInsets.all(20),
+                            child: Center(child: Text('暂无日程，点击右上角「+ 新日程」添加', style: TextStyle(color: Colors.grey, fontSize: 13))),
                           )
                         : Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 4),
-                            child: _buildScheduleTree(scheds, doneMap),
+                            padding: const EdgeInsets.fromLTRB(8, 8, 8, 10),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Padding(
+                                  padding: EdgeInsets.only(left: 4, bottom: 6),
+                                  child: Text(
+                                    '💡 长按右侧 ☰ 自由拖动：拖到其他日程中央变为其子日程，拖到上下边缘调序或升为主日程',
+                                    style: TextStyle(fontSize: 11, color: Color(0xFF64748B)),
+                                  ),
+                                ),
+                                _buildScheduleTree(scheds, doneMap),
+                              ],
+                            ),
                           ),
                   ),
-              ],
-            ),
-          };
-
-          return ReorderableListView(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            buildDefaultDragHandles: false,
-            shrinkWrap: true,
-            physics: const AlwaysScrollableScrollPhysics(),
-            onReorder: (oldIdx, newIdx) async {
-              if (newIdx > oldIdx) newIdx -= 1;
-              final moved = _sectionOrder.removeAt(oldIdx);
-              _sectionOrder.insert(newIdx, moved);
-              await _saveTodayUiState();
-              setState(() {});
+                );
+              }
             },
-            children: List.generate(_sectionOrder.length, (i) {
-              final secKey = _sectionOrder[i];
-              return Container(
-                key: ValueKey('section_$secKey'),
-                margin: const EdgeInsets.only(bottom: 8),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Expanded(child: sectionWidgets[secKey]!),
-                    ReorderableDragStartListener(
-                      index: i,
-                      child: Container(
-                        padding: const EdgeInsets.only(left: 6, top: 12),
-                        child: const Icon(Icons.drag_indicator, color: Colors.grey, size: 20),
-                      ),
-                    ),
-                  ],
-                ),
-              );
-            }),
           );
         },
       ),
     );
   }
 
-  Widget _buildSectionHeader({
+  // ==================== 清晰美化的三大模块独立卡片容器（带顶部色带与拖拽手柄） ====================
+  Widget _buildMajorSectionCard({
+    required int dragIndex,
+    required Color accentColor,
+    required Color headerBgColor,
     required String icon,
     required String title,
     required bool isFolded,
     required VoidCallback onToggleFold,
     required String actionLabel,
     required VoidCallback onAction,
+    required Widget child,
   }) {
-    return Padding(
-      padding: const EdgeInsets.only(top: 4, bottom: 4),
-      child: Row(
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: accentColor.withOpacity(0.32), width: 1.3),
+        boxShadow: [
+          BoxShadow(
+            color: accentColor.withOpacity(0.06),
+            blurRadius: 10,
+            offset: const Offset(0, 3),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          InkWell(
-            borderRadius: BorderRadius.circular(6),
-            onTap: onToggleFold,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
-              child: Row(
-                children: [
-                  Icon(isFolded ? Icons.chevron_right : Icons.expand_more, size: 20, color: const Color(0xFF475569)),
-                  const SizedBox(width: 2),
-                  Text('$icon $title', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Color(0xFF1E293B))),
-                ],
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: headerBgColor,
+              borderRadius: BorderRadius.vertical(
+                top: const Radius.circular(12.5),
+                bottom: isFolded ? const Radius.circular(12.5) : Radius.zero,
               ),
+              border: isFolded
+                  ? null
+                  : Border(bottom: BorderSide(color: accentColor.withOpacity(0.18), width: 1)),
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 4,
+                  height: 16,
+                  decoration: BoxDecoration(
+                    color: accentColor,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(6),
+                    onTap: onToggleFold,
+                    child: Row(
+                      children: [
+                        Icon(isFolded ? Icons.chevron_right : Icons.expand_more, size: 20, color: accentColor),
+                        const SizedBox(width: 2),
+                        Flexible(
+                          child: Text(
+                            '$icon $title',
+                            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Color(0xFF0F172A)),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                SizedBox(
+                  height: 28,
+                  child: FilledButton.tonalIcon(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: Colors.white,
+                      foregroundColor: accentColor,
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      minimumSize: Size.zero,
+                    ),
+                    onPressed: onAction,
+                    icon: const Icon(Icons.add, size: 15),
+                    label: Text(actionLabel, style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
+                  ),
+                ),
+                const SizedBox(width: 4),
+                ReorderableDragStartListener(
+                  index: dragIndex,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                    child: Icon(Icons.drag_indicator, size: 20, color: accentColor.withOpacity(0.7)),
+                  ),
+                ),
+              ],
             ),
           ),
-          const Spacer(),
-          TextButton.icon(
-            style: TextButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              minimumSize: Size.zero,
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          if (!isFolded)
+            ClipRRect(
+              borderRadius: const BorderRadius.vertical(bottom: Radius.circular(12.5)),
+              child: child,
             ),
-            onPressed: onAction,
-            icon: const Icon(Icons.add, size: 16),
-            label: Text(actionLabel, style: const TextStyle(fontSize: 13)),
-          ),
         ],
       ),
     );
   }
 
-  Widget _buildSummary(List<Map<String, dynamic>> items, Map<int, Map<String, dynamic>> disp, List<Map<String, dynamic>> scheds, Map<int, bool> doneMap) {
+  Widget _buildSummaryCard(
+    int dragIndex,
+    List<Map<String, dynamic>> items,
+    Map<int, Map<String, dynamic>> disp,
+    List<Map<String, dynamic>> scheds,
+    Map<int, bool> doneMap,
+  ) {
     final copyLines = <String>[];
     final summaryRows = <Widget>[];
 
@@ -1274,8 +1474,6 @@ class _TodayPageState extends State<TodayPage> {
       }
     }
 
-    if (summaryRows.isEmpty && scheds.isEmpty) return const SizedBox.shrink();
-
     String fmtSched(Map<String, dynamic> s) {
       final p = (s['plan_info'] as String? ?? '').trim();
       return p.isEmpty ? '${s['title']}' : '${s['title']} ($p)';
@@ -1291,79 +1489,131 @@ class _TodayPageState extends State<TodayPage> {
       copyText += '\n⬜ 未完成日程：${todoList.isEmpty ? "无" : "\n${todoList.map((s) => "  • $s").join("\n")}"}';
     }
 
+    const accentColor = Color(0xFFD97706);
+    const headerBgColor = Color(0xFFFFFBEB);
+
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: const Color(0xFFCBD5E1)),
-        boxShadow: const [BoxShadow(color: Color(0x0A000000), blurRadius: 6, offset: Offset(0, 2))],
+        border: Border.all(color: accentColor.withOpacity(0.35), width: 1.3),
+        boxShadow: [
+          BoxShadow(
+            color: accentColor.withOpacity(0.06),
+            blurRadius: 10,
+            offset: const Offset(0, 3),
+          ),
+        ],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Expanded(
-                child: GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: () {
-                    setState(() => _foldSummary = !_foldSummary);
-                    _saveTodayUiState();
-                  },
-                  child: Row(
-                    children: [
-                      Icon(_foldSummary ? Icons.chevron_right : Icons.expand_more, size: 18, color: const Color(0xFF475569)),
-                      const SizedBox(width: 3),
-                      Flexible(
-                        child: Text(
-                          '📋 今日状态摘要 · $_date',
-                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5, color: Color(0xFF1E293B)),
-                          overflow: TextOverflow.ellipsis,
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: headerBgColor,
+              borderRadius: BorderRadius.vertical(
+                top: const Radius.circular(12.5),
+                bottom: _foldSummary ? const Radius.circular(12.5) : Radius.zero,
+              ),
+              border: _foldSummary
+                  ? null
+                  : Border(bottom: BorderSide(color: accentColor.withOpacity(0.2), width: 1)),
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 4,
+                  height: 16,
+                  decoration: BoxDecoration(color: accentColor, borderRadius: BorderRadius.circular(2)),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () {
+                      setState(() => _foldSummary = !_foldSummary);
+                      _saveTodayUiState();
+                    },
+                    child: Row(
+                      children: [
+                        Icon(_foldSummary ? Icons.chevron_right : Icons.expand_more, size: 20, color: accentColor),
+                        const SizedBox(width: 2),
+                        Flexible(
+                          child: Text(
+                            '📋 今日状态摘要 · $_date',
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14.5, color: Color(0xFF0F172A)),
+                            overflow: TextOverflow.ellipsis,
+                          ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
-              ),
-              const SizedBox(width: 4),
-              SizedBox(
-                height: 26,
-                child: FilledButton.icon(
-                  style: FilledButton.styleFrom(
-                    backgroundColor: const Color(0xFF4F46E5),
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
-                    minimumSize: Size.zero,
+                const SizedBox(width: 4),
+                SizedBox(
+                  height: 26,
+                  child: FilledButton.icon(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF4F46E5),
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      minimumSize: Size.zero,
+                    ),
+                    onPressed: () => _openGeminiAnalyzerSheet(copyText),
+                    icon: const Icon(Icons.auto_awesome, size: 13),
+                    label: const Text('Gemini分析', style: TextStyle(fontSize: 11.5)),
                   ),
-                  onPressed: () => _openGeminiAnalyzerSheet(copyText),
-                  icon: const Icon(Icons.auto_awesome, size: 13),
-                  label: const Text('Gemini分析', style: TextStyle(fontSize: 11.5)),
                 ),
-              ),
-              const SizedBox(width: 6),
-              SizedBox(
-                height: 26,
-                child: FilledButton.tonal(
-                  style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 9), minimumSize: Size.zero),
-                  onPressed: () {
-                    Clipboard.setData(ClipboardData(text: copyText));
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已复制摘要到剪贴板')));
-                  },
-                  child: const Text('复制', style: TextStyle(fontSize: 11.5)),
+                const SizedBox(width: 5),
+                SizedBox(
+                  height: 26,
+                  child: FilledButton.tonal(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      minimumSize: Size.zero,
+                    ),
+                    onPressed: () {
+                      Clipboard.setData(ClipboardData(text: copyText));
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已复制摘要到剪贴板')));
+                    },
+                    child: const Text('复制', style: TextStyle(fontSize: 11.5)),
+                  ),
                 ),
-              ),
-            ],
+                const SizedBox(width: 2),
+                ReorderableDragStartListener(
+                  index: dragIndex,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                    child: Icon(Icons.drag_indicator, size: 20, color: accentColor.withOpacity(0.75)),
+                  ),
+                ),
+              ],
+            ),
           ),
-          if (!_foldSummary) ...[
-            const Divider(height: 14),
-            ...summaryRows,
-            if (scheds.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              _buildSummaryScheduleBlock('✅ 已完成日程', doneList, const Color(0xFF10B981)),
-              const SizedBox(height: 6),
-              _buildSummaryScheduleBlock('⬜ 未完成日程', todoList, const Color(0xFF64748B)),
-            ],
-          ],
+          if (!_foldSummary)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+              child: (summaryRows.isEmpty && scheds.isEmpty)
+                  ? const Center(
+                      child: Padding(
+                        padding: EdgeInsets.all(8.0),
+                        child: Text('今日暂无状态或日程记录', style: TextStyle(fontSize: 12.5, color: Colors.grey)),
+                      ),
+                    )
+                  : Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        ...summaryRows,
+                        if (scheds.isNotEmpty) ...[
+                          const SizedBox(height: 8),
+                          _buildSummaryScheduleBlock('✅ 已完成日程', doneList, const Color(0xFF10B981)),
+                          const SizedBox(height: 6),
+                          _buildSummaryScheduleBlock('⬜ 未完成日程', todoList, const Color(0xFF64748B)),
+                        ],
+                      ],
+                    ),
+            ),
         ],
       ),
     );
@@ -1471,7 +1721,7 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  Widget _buildCompactStatusRow(Map<String, dynamic> it, Map<String, dynamic>? d) {
+  Widget _buildCompactStatusRow(Map<String, dynamic> it, Map<String, dynamic>? d, int dragIndex) {
     final id = it['id'] as int, name = it['name'] as String, type = it['type'] as String;
     final inh = d?['isInherited'] == true, val = d?['value'] as String? ?? '';
     final imgs = (d?['images'] as List<String>?) ?? [];
@@ -1480,7 +1730,7 @@ class _TodayPageState extends State<TodayPage> {
     final isItemFolded = _collapsedStatusIds.contains(id);
 
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      padding: const EdgeInsets.fromLTRB(10, 8, 6, 8),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1567,15 +1817,22 @@ class _TodayPageState extends State<TodayPage> {
               InkWell(
                 onTap: () => _confirmDeleteStatusItem(id, name),
                 child: const Padding(
-                  padding: EdgeInsets.only(left: 4, top: 2, bottom: 2),
+                  padding: EdgeInsets.symmetric(horizontal: 4, vertical: 2),
                   child: Icon(Icons.delete_outline, size: 17, color: Colors.redAccent),
+                ),
+              ),
+              ReorderableDragStartListener(
+                index: dragIndex,
+                child: const Padding(
+                  padding: EdgeInsets.only(left: 4, right: 2, top: 2, bottom: 2),
+                  child: Icon(Icons.drag_handle, size: 18, color: Colors.grey),
                 ),
               ),
             ],
           ),
           if (!isItemFolded && type != 'image' && (cols.length > 1 || val.length > 18))
             Padding(
-              padding: const EdgeInsets.only(top: 6),
+              padding: const EdgeInsets.only(top: 6, right: 6),
               child: GestureDetector(
                 onTap: () => _editValDialog(id, name, type, val),
                 child: LayoutBuilder(
@@ -1634,7 +1891,7 @@ class _TodayPageState extends State<TodayPage> {
             ),
           if (!isItemFolded && type == 'image' && imgs.isNotEmpty)
             Padding(
-              padding: const EdgeInsets.only(top: 6),
+              padding: const EdgeInsets.only(top: 6, right: 6),
               child: _buildGrid(recId, imgs),
             ),
         ],
@@ -1642,7 +1899,7 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  /// 核心更新：支持日程主日程与子日程双向勾选联动、上下拖拽切换及树形展示
+  // ==================== 日程打卡树：支持三区拖拽自由切换父子日程 + 勾选自动联动 ====================
   Widget _buildScheduleTree(List<Map<String, dynamic>> allScheds, Map<int, bool> doneMap) {
     final validIds = allScheds.map((s) => s['id'] as int).toSet();
     final roots = allScheds.where((s) {
@@ -1654,224 +1911,251 @@ class _TodayPageState extends State<TodayPage> {
       return allScheds.where((s) => s['parent_id'] == pid).toList();
     }
 
-    // 递归判定：若子日程全部完成，主日程自动完成
-    bool checkAllChildrenDone(int parentId) {
-      final ch = childrenOf(parentId);
-      if (ch.isEmpty) return false;
-      return ch.every((c) => doneMap[c['id'] as int] == true);
-    }
-
-    Widget buildNode(Map<String, dynamic> s, int depth, {int? parentId, required List<Map<String, dynamic>> currentList, required int index}) {
+    Widget buildNode(Map<String, dynamic> s, int depth) {
       final sid = s['id'] as int;
       final children = childrenOf(sid);
       final hasChildren = children.isNotEmpty;
-
-      // 如果有子日程且全部完成，自动确保主日程状态为 true
-      bool done = doneMap[sid] ?? false;
-      if (hasChildren && checkAllChildrenDone(sid) && !done) {
-        done = true;
-        doneMap[sid] = true;
-      }
-
+      final done = doneMap[sid] ?? false;
       final plan = (s['plan_info'] as String? ?? '').trim();
       final isCollapsed = _collapsedSchedParents.contains(sid);
       final doneChildrenCount = children.where((c) => doneMap[c['id'] as int] == true).length;
 
-      return Container(
-        key: ValueKey('sched_$sid'),
-        decoration: BoxDecoration(
-          border: depth > 0 && index > 0 ? const Border(top: BorderSide(color: Color(0xFFF1F5F9))) : null,
-        ),
-        child: Padding(
-          padding: EdgeInsets.only(left: depth * 18.0 + 4, right: 4, top: 4, bottom: 4),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  if (hasChildren)
-                    GestureDetector(
-                      onTap: () {
-                        setState(() => isCollapsed ? _collapsedSchedParents.remove(sid) : _collapsedSchedParents.add(sid));
-                        _saveTodayUiState();
-                      },
-                      child: Padding(
-                        padding: const EdgeInsets.only(right: 2),
-                        child: Icon(isCollapsed ? Icons.chevron_right : Icons.expand_more, size: 19, color: const Color(0xFF4F46E5)),
+      final isHover = _hoverSchedTargetId == sid;
+      final zone = isHover ? _hoverSchedZone : null;
+
+      return Column(
+        key: ValueKey('sched_tree_$sid'),
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: EdgeInsets.only(left: depth * 18.0, bottom: 5),
+            child: Builder(
+              builder: (itemCtx) => DragTarget<int>(
+                onWillAcceptWithDetails: (details) {
+                  final dragId = details.data;
+                  return !_isSchedDescendant(dragId, sid, allScheds);
+                },
+                onMove: (details) {
+                  final box = itemCtx.findRenderObject() as RenderBox?;
+                  if (box == null) return;
+                  final localY = box.globalToLocal(details.offset).dy;
+                  final h = box.size.height;
+                  String z;
+                  if (localY < h * 0.28) {
+                    z = 'up';
+                  } else if (localY > h * 0.72) {
+                    z = 'down';
+                  } else {
+                    z = 'inside';
+                  }
+                  if (_hoverSchedTargetId != sid || _hoverSchedZone != z) {
+                    setState(() {
+                      _hoverSchedTargetId = sid;
+                      _hoverSchedZone = z;
+                    });
+                  }
+                },
+                onLeave: (_) {
+                  if (_hoverSchedTargetId == sid) {
+                    setState(() {
+                      _hoverSchedTargetId = null;
+                      _hoverSchedZone = null;
+                    });
+                  }
+                },
+                onAcceptWithDetails: (details) async {
+                  final z = _hoverSchedZone ?? 'inside';
+                  setState(() {
+                    _hoverSchedTargetId = null;
+                    _hoverSchedZone = null;
+                  });
+                  await _handleScheduleDrop(
+                    dragId: details.data,
+                    targetId: sid,
+                    zone: z,
+                    allScheds: allScheds,
+                  );
+                },
+                builder: (ctx, cand, rej) {
+                  return Container(
+                    decoration: BoxDecoration(
+                      color: zone == 'inside'
+                          ? const Color(0xFFCCFBF1)
+                          : (depth == 0 ? const Color(0xFFF8FAFC) : Colors.white),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border(
+                        top: BorderSide(
+                          color: zone == 'up' ? const Color(0xFF0D9488) : const Color(0xFFE2E8F0),
+                          width: zone == 'up' ? 3.0 : 1.0,
+                        ),
+                        bottom: BorderSide(
+                          color: zone == 'down' ? const Color(0xFF0D9488) : const Color(0xFFE2E8F0),
+                          width: zone == 'down' ? 3.0 : 1.0,
+                        ),
+                        left: BorderSide(
+                          color: zone == 'inside'
+                              ? const Color(0xFF0D9488)
+                              : (depth == 0 ? const Color(0xFF0D9488) : const Color(0xFFE2E8F0)),
+                          width: zone == 'inside' ? 2.0 : (depth == 0 ? 3.5 : 1.0),
+                        ),
+                        right: BorderSide(
+                          color: zone == 'inside' ? const Color(0xFF0D9488) : const Color(0xFFE2E8F0),
+                          width: zone == 'inside' ? 2.0 : 1.0,
+                        ),
                       ),
-                    )
-                  else if (depth > 0)
-                    const Padding(
-                      padding: EdgeInsets.only(right: 4),
-                      child: Icon(Icons.subdirectory_arrow_right, size: 15, color: Colors.grey),
-                    )
-                  else
-                    const SizedBox(width: 4),
-                  SizedBox(
-                    width: 26,
-                    height: 26,
-                    child: Checkbox(
-                      value: done,
-                      visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
-                      onChanged: (v) async {
-                        final targetDone = v ?? false;
-                        // 1. 更新当前日程
-                        await widget.db.insert(
-                          'schedule_records',
-                          {'item_id': sid, 'date': _date, 'done': targetDone ? 1 : 0},
-                          conflictAlgorithm: ConflictAlgorithm.replace,
-                        );
-                        // 2. 如果勾选/取消主日程，其下所有子日程全部同步勾选/取消
-                        void cascade(int pId, bool d) {
-                          for (final sub in childrenOf(pId)) {
-                            final subId = sub['id'] as int;
-                            widget.db.insert(
-                              'schedule_records',
-                              {'item_id': subId, 'date': _date, 'done': d ? 1 : 0},
-                              conflictAlgorithm: ConflictAlgorithm.replace,
-                            );
-                            cascade(subId, d);
-                          }
-                        }
-                        cascade(sid, targetDone);
-                        setState(() {});
-                      },
                     ),
-                  ),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: () => _addOrEditSchedDialog(editSched: s),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  '${s['title']}',
-                                  style: TextStyle(
-                                    fontSize: depth == 0 ? 14 : 13,
-                                    fontWeight: depth == 0 ? FontWeight.w500 : FontWeight.normal,
-                                    decoration: done ? TextDecoration.lineThrough : null,
-                                    color: done ? Colors.grey : const Color(0xFF1E293B),
-                                  ),
-                                ),
-                              ),
-                              if (hasChildren)
-                                Container(
-                                  margin: const EdgeInsets.only(left: 4),
-                                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                                  decoration: BoxDecoration(
-                                    color: const Color(0xFFEEF2FF),
-                                    borderRadius: BorderRadius.circular(4),
-                                  ),
-                                  child: Text(
-                                    '$doneChildrenCount/${children.length}',
-                                    style: const TextStyle(fontSize: 10.5, color: Color(0xFF4F46E5)),
-                                  ),
-                                ),
-                            ],
-                          ),
-                          if (plan.isNotEmpty)
-                            Padding(
-                              padding: const EdgeInsets.only(top: 1),
-                              child: Text(
-                                '🎯 $plan',
-                                style: const TextStyle(fontSize: 11, color: Color(0xFF4F46E5)),
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                              ),
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        if (hasChildren)
+                          GestureDetector(
+                            onTap: () {
+                              setState(() => isCollapsed ? _collapsedSchedParents.remove(sid) : _collapsedSchedParents.add(sid));
+                              _saveTodayUiState();
+                            },
+                            child: Padding(
+                              padding: const EdgeInsets.only(right: 2),
+                              child: Icon(isCollapsed ? Icons.chevron_right : Icons.expand_more, size: 19, color: const Color(0xFF0D9488)),
                             ),
-                        ],
-                      ),
+                          )
+                        else if (depth > 0)
+                          const Padding(
+                            padding: EdgeInsets.only(right: 4),
+                            child: Icon(Icons.subdirectory_arrow_right, size: 15, color: Colors.grey),
+                          )
+                        else
+                          const SizedBox(width: 4),
+                        SizedBox(
+                          width: 26,
+                          height: 26,
+                          child: Checkbox(
+                            value: done,
+                            activeColor: const Color(0xFF0D9488),
+                            visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
+                            onChanged: (v) => _toggleScheduleCheckbox(sid, v ?? false, allScheds, doneMap),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: () => _addOrEditSchedDialog(editSched: s),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: Text(
+                                        '${s['title']}',
+                                        style: TextStyle(
+                                          fontSize: depth == 0 ? 14 : 13,
+                                          fontWeight: depth == 0 ? FontWeight.w600 : FontWeight.normal,
+                                          decoration: done ? TextDecoration.lineThrough : null,
+                                          color: done ? Colors.grey : const Color(0xFF1E293B),
+                                        ),
+                                      ),
+                                    ),
+                                    if (hasChildren)
+                                      Container(
+                                        margin: const EdgeInsets.only(left: 4),
+                                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                                        decoration: BoxDecoration(
+                                          color: const Color(0xFFCCFBF1),
+                                          borderRadius: BorderRadius.circular(4),
+                                        ),
+                                        child: Text(
+                                          '$doneChildrenCount/${children.length}',
+                                          style: const TextStyle(fontSize: 10.5, fontWeight: FontWeight.bold, color: Color(0xFF0F766E)),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                                if (plan.isNotEmpty)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 2),
+                                    child: Text(
+                                      '🎯 $plan',
+                                      style: const TextStyle(fontSize: 11, color: Color(0xFF4F46E5), height: 1.3),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        InkWell(
+                          onTap: () => _addOrEditSchedDialog(parentId: sid, parentTitle: '${s['title']}'),
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+                            child: Icon(Icons.add_circle_outline, size: 17, color: Color(0xFF0D9488)),
+                          ),
+                        ),
+                        InkWell(
+                          onTap: () => _addOrEditSchedDialog(editSched: s),
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 3, vertical: 3),
+                            child: Icon(Icons.edit_outlined, size: 16, color: Colors.blueGrey),
+                          ),
+                        ),
+                        InkWell(
+                          onTap: () async {
+                            final subIds = <int>[sid];
+                            void collect(int p) {
+                              for (final c in childrenOf(p)) {
+                                final cid = c['id'] as int;
+                                subIds.add(cid);
+                                collect(cid);
+                              }
+                            }
+                            collect(sid);
+                            for (final did in subIds) {
+                              await widget.db.delete('schedule_records', where: 'item_id = ?', whereArgs: [did]);
+                              await widget.db.delete('schedule_items', where: 'id = ?', whereArgs: [did]);
+                            }
+                            setState(() {});
+                          },
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 3, vertical: 3),
+                            child: Icon(Icons.delete_outline, size: 17, color: Colors.redAccent),
+                          ),
+                        ),
+                        LongPressDraggable<int>(
+                          data: sid,
+                          feedback: Material(
+                            elevation: 8,
+                            borderRadius: BorderRadius.circular(10),
+                            child: Container(
+                              width: 220,
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFCCFBF1),
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(color: const Color(0xFF0D9488), width: 1.5),
+                              ),
+                              child: Text('${s['title']}', style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.bold)),
+                            ),
+                          ),
+                          child: const Padding(
+                            padding: EdgeInsets.only(left: 4, right: 2, top: 3, bottom: 3),
+                            child: Icon(Icons.drag_handle, size: 18, color: Colors.grey),
+                          ),
+                        ),
+                      ],
                     ),
-                  ),
-                  InkWell(
-                    onTap: () => _addOrEditSchedDialog(parentId: sid, parentTitle: '${s['title']}'),
-                    child: const Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 4, vertical: 3),
-                      child: Icon(Icons.add_circle_outline, size: 17, color: Color(0xFF4F46E5)),
-                    ),
-                  ),
-                  InkWell(
-                    onTap: () => _addOrEditSchedDialog(editSched: s),
-                    child: const Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 3, vertical: 3),
-                      child: Icon(Icons.edit_outlined, size: 16, color: Colors.blueGrey),
-                    ),
-                  ),
-                  InkWell(
-                    onTap: () async {
-                      final subIds = <int>[sid];
-                      void collect(int p) {
-                        for (final c in childrenOf(p)) {
-                          final cid = c['id'] as int;
-                          subIds.add(cid);
-                          collect(cid);
-                        }
-                      }
-                      collect(sid);
-                      for (final did in subIds) {
-                        await widget.db.delete('schedule_records', where: 'item_id = ?', whereArgs: [did]);
-                        await widget.db.delete('schedule_items', where: 'id = ?', whereArgs: [did]);
-                      }
-                      setState(() {});
-                    },
-                    child: const Padding(
-                      padding: EdgeInsets.only(left: 3, right: 2, top: 3, bottom: 3),
-                      child: Icon(Icons.delete_outline, size: 17, color: Colors.redAccent),
-                    ),
-                  ),
-                  ReorderableDragStartListener(
-                    index: index,
-                    child: const Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 4),
-                      child: Icon(Icons.drag_handle, size: 18, color: Colors.grey),
-                    ),
-                  ),
-                ],
+                  );
+                },
               ),
-              if (hasChildren && !isCollapsed)
-                ReorderableListView.builder(
-                  shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  buildDefaultDragHandles: false,
-                  itemCount: children.length,
-                  onReorder: (oldIdx, newIdx) async {
-                    if (newIdx > oldIdx) newIdx -= 1;
-                    final moved = children.removeAt(oldIdx);
-                    children.insert(newIdx, moved);
-                    for (int i = 0; i < children.length; i++) {
-                      await widget.db.update('schedule_items', {'sort_order': i}, where: 'id = ?', whereArgs: [children[i]['id']]);
-                    }
-                    setState(() {});
-                  },
-                  itemBuilder: (ctx, ci) => buildNode(children[ci], depth + 1, parentId: sid, currentList: children, index: ci),
-                ),
-            ],
+            ),
           ),
-        ),
+          if (hasChildren && !isCollapsed)
+            ...children.map((c) => buildNode(c, depth + 1)),
+        ],
       );
     }
 
-    return ReorderableListView.builder(
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      buildDefaultDragHandles: false,
-      itemCount: roots.length,
-      onReorder: (oldIdx, newIdx) async {
-        if (newIdx > oldIdx) newIdx -= 1;
-        final moved = roots.removeAt(oldIdx);
-        roots.insert(newIdx, moved);
-        for (int i = 0; i < roots.length; i++) {
-          await widget.db.update('schedule_items', {'sort_order': i}, where: 'id = ?', whereArgs: [roots[i]['id']]);
-        }
-        setState(() {});
-      },
-      itemBuilder: (ctx, i) => buildNode(roots[i], 0, parentId: null, currentList: roots, index: i),
+    return Column(
+      children: roots.map((r) => buildNode(r, 0)).toList(),
     );
   }
 
@@ -2074,7 +2358,7 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  /// 核心优化：日程关联规划时采用类似查找页的树形折叠选择与长路径自动换行
+  // ==================== 日程关联规划：采用类似查找页标题组的分级折叠与自动换行格式 ====================
   Future<void> _addOrEditSchedDialog({Map<String, dynamic>? editSched, int? parentId, String? parentTitle}) async {
     final mms = await widget.db.query('mindmaps', orderBy: 'id DESC');
     if (!mounted) return;
@@ -2083,6 +2367,23 @@ class _TodayPageState extends State<TodayPage> {
     final ctrl = TextEditingController(text: isEdit ? '${editSched['title']}' : '');
     String selPlan = isEdit ? ('${editSched['plan_info'] ?? ''}') : '';
     final Set<String> expandedPaths = {};
+
+    // 默认展开第一层根节点及当前已选路径的父级
+    for (final m in mms) {
+      try {
+        final root = jsonDecode(m['root_json'] as String) as Map<String, dynamic>;
+        final rt = (root['text'] as String? ?? '').trim();
+        if (rt.isNotEmpty) expandedPaths.add(rt);
+      } catch (_) {}
+    }
+    if (selPlan.isNotEmpty) {
+      final parts = selPlan.split(' > ');
+      String acc = '';
+      for (int i = 0; i < parts.length - 1; i++) {
+        acc = acc.isEmpty ? parts[i] : '$acc > ${parts[i]}';
+        expandedPaths.add(acc);
+      }
+    }
 
     showDialog(
       context: context,
@@ -2101,40 +2402,89 @@ class _TodayPageState extends State<TodayPage> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 InkWell(
+                  borderRadius: BorderRadius.circular(8),
                   onTap: () {
                     setS(() => selPlan = path);
                     if (ctrl.text.trim().isEmpty) ctrl.text = t;
                   },
                   child: Container(
                     width: double.infinity,
-                    padding: EdgeInsets.fromLTRB(12.0 + depth * 14.0, 6, 8, 6),
-                    color: isSelected ? const Color(0xFFEEF2FF) : Colors.transparent,
+                    margin: EdgeInsets.only(left: depth * 14.0, bottom: 3),
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+                    decoration: BoxDecoration(
+                      color: isSelected ? const Color(0xFFEEF2FF) : Colors.transparent,
+                      borderRadius: BorderRadius.circular(8),
+                      border: isSelected ? Border.all(color: const Color(0xFF4F46E5)) : null,
+                    ),
                     child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         if (hasChildren)
                           GestureDetector(
                             behavior: HitTestBehavior.opaque,
                             onTap: () => setS(() => isExpanded ? expandedPaths.remove(path) : expandedPaths.add(path)),
                             child: Padding(
-                              padding: const EdgeInsets.only(right: 4),
-                              child: Icon(isExpanded ? Icons.arrow_drop_down : Icons.arrow_right, size: 20, color: const Color(0xFF4F46E5)),
+                              padding: const EdgeInsets.only(right: 4, top: 1),
+                              child: Icon(
+                                isExpanded ? Icons.arrow_drop_down_circle : Icons.arrow_right,
+                                size: 19,
+                                color: const Color(0xFF4F46E5),
+                              ),
                             ),
                           )
                         else
-                          const SizedBox(width: 24),
-                        const Icon(Icons.subdirectory_arrow_right, size: 15, color: Colors.blueGrey),
-                        const SizedBox(width: 4),
-                        Expanded(
-                          child: Text(
-                            path,
-                            style: TextStyle(
-                              fontSize: 13,
-                              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                              color: isSelected ? const Color(0xFF4F46E5) : const Color(0xFF1E293B),
+                          Padding(
+                            padding: const EdgeInsets.only(right: 4, top: 2),
+                            child: Icon(
+                              depth == 0 ? Icons.folder_outlined : Icons.subdirectory_arrow_right,
+                              size: 15,
+                              color: Colors.blueGrey,
                             ),
                           ),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                t,
+                                softWrap: true,
+                                style: TextStyle(
+                                  fontSize: 13.5,
+                                  height: 1.3,
+                                  fontWeight: isSelected || depth == 0 ? FontWeight.bold : FontWeight.normal,
+                                  color: isSelected ? const Color(0xFF4F46E5) : const Color(0xFF1E293B),
+                                ),
+                              ),
+                              if (depth > 0)
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 2),
+                                  child: Text(
+                                    path,
+                                    softWrap: true,
+                                    style: const TextStyle(fontSize: 10.5, color: Color(0xFF64748B), height: 1.25),
+                                  ),
+                                ),
+                            ],
+                          ),
                         ),
-                        if (isSelected) const Icon(Icons.check, size: 16, color: Color(0xFF4F46E5)),
+                        if (hasChildren)
+                          GestureDetector(
+                            onTap: () => setS(() => isExpanded ? expandedPaths.remove(path) : expandedPaths.add(path)),
+                            child: Container(
+                              margin: const EdgeInsets.only(left: 4, right: 4),
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFF1F5F9),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Text('子项(${children.length})', style: const TextStyle(fontSize: 10.5, color: Color(0xFF475569))),
+                            ),
+                          ),
+                        Icon(
+                          isSelected ? Icons.check_box : Icons.check_box_outline_blank,
+                          size: 19,
+                          color: isSelected ? const Color(0xFF4F46E5) : Colors.grey[400],
+                        ),
                       ],
                     ),
                   ),
@@ -2146,48 +2496,105 @@ class _TodayPageState extends State<TodayPage> {
           }
 
           return AlertDialog(
-            title: Text(isEdit ? '编辑日程' : (parentId != null ? '在「$parentTitle」下添加子日程' : '添加日程'), style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            insetPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 20),
+            title: Text(
+              isEdit ? '编辑日程' : (parentId != null ? '在「$parentTitle」下添加子日程' : '添加日程'),
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
             content: SizedBox(
               width: double.maxFinite,
-              height: MediaQuery.of(ctx).size.height * 0.65,
-              child: ListView(
+              height: MediaQuery.of(ctx).size.height * 0.68,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   TextField(
                     controller: ctrl,
                     autofocus: true,
                     minLines: 1,
                     maxLines: 3,
-                    decoration: const InputDecoration(labelText: '日程内容', border: OutlineInputBorder(), isDense: true),
+                    decoration: const InputDecoration(
+                      labelText: '日程内容（支持多行自动换行）',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
                   ),
-                  const SizedBox(height: 12),
-                  const Text('关联规划（分级折叠选择）：', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 4),
-                  InkWell(
-                    onTap: () => setS(() => selPlan = ''),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                      color: selPlan.isEmpty ? const Color(0xFFEEF2FF) : Colors.transparent,
+                  const SizedBox(height: 10),
+                  if (selPlan.isNotEmpty)
+                    Container(
+                      width: double.infinity,
+                      margin: const EdgeInsets.only(bottom: 8),
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFEEF2FF),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: const Color(0xFFC7D2FE)),
+                      ),
                       child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const Text('❌ 不关联规划', style: TextStyle(fontSize: 13, color: Colors.grey)),
-                          const Spacer(),
-                          if (selPlan.isEmpty) const Icon(Icons.check, size: 16, color: Color(0xFF4F46E5)),
+                          const Text('🎯 已选规划：', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF4F46E5))),
+                          Expanded(
+                            child: Text(
+                              selPlan,
+                              softWrap: true,
+                              style: const TextStyle(fontSize: 12, color: Color(0xFF1E293B), height: 1.3),
+                            ),
+                          ),
+                          InkWell(
+                            onTap: () => setS(() => selPlan = ''),
+                            child: const Icon(Icons.clear, size: 16, color: Colors.grey),
+                          ),
                         ],
                       ),
                     ),
+                  const Text(
+                    '💡 选择关联规划（点击左侧箭头分级展开，长路径自动换行显示）：',
+                    style: TextStyle(fontSize: 11.5, color: Colors.grey),
                   ),
-                  const Divider(height: 6),
-                  if (mms.isEmpty)
-                    const Padding(padding: EdgeInsets.all(12), child: Text('暂无规划，请先在规划页导入 XMind', style: TextStyle(fontSize: 12, color: Colors.grey)))
-                  else
-                    ...mms.map((m) {
-                      try {
-                        final root = jsonDecode(m['root_json'] as String) as Map<String, dynamic>;
-                        return buildTreePickerNode(root, '', 0);
-                      } catch (_) {
-                        return const SizedBox.shrink();
-                      }
-                    }),
+                  const Divider(height: 10),
+                  Expanded(
+                    child: ListView(
+                      children: [
+                        InkWell(
+                          borderRadius: BorderRadius.circular(8),
+                          onTap: () => setS(() => selPlan = ''),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                            decoration: BoxDecoration(
+                              color: selPlan.isEmpty ? const Color(0xFFEEF2FF) : Colors.transparent,
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Row(
+                              children: [
+                                const Text('🚫 不关联规划', style: TextStyle(fontSize: 13, color: Colors.blueGrey)),
+                                const Spacer(),
+                                Icon(
+                                  selPlan.isEmpty ? Icons.check_box : Icons.check_box_outline_blank,
+                                  size: 19,
+                                  color: selPlan.isEmpty ? const Color(0xFF4F46E5) : Colors.grey[400],
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        if (mms.isEmpty)
+                          const Padding(
+                            padding: EdgeInsets.all(16),
+                            child: Text('暂无规划，请先在「规划」页创建或导入 XMind', style: TextStyle(fontSize: 12.5, color: Colors.grey)),
+                          )
+                        else
+                          ...mms.map((m) {
+                            try {
+                              final root = jsonDecode(m['root_json'] as String) as Map<String, dynamic>;
+                              return buildTreePickerNode(root, '', 0);
+                            } catch (_) {
+                              return const SizedBox.shrink();
+                            }
+                          }),
+                      ],
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -2197,9 +2604,20 @@ class _TodayPageState extends State<TodayPage> {
                 onPressed: () async {
                   if (ctrl.text.trim().isEmpty) return;
                   if (isEdit) {
-                    await widget.db.update('schedule_items', {'title': ctrl.text.trim(), 'plan_info': selPlan}, where: 'id = ?', whereArgs: [editSched['id']]);
+                    await widget.db.update(
+                      'schedule_items',
+                      {'title': ctrl.text.trim(), 'plan_info': selPlan},
+                      where: 'id = ?',
+                      whereArgs: [editSched['id']],
+                    );
                   } else {
-                    await widget.db.insert('schedule_items', {'title': ctrl.text.trim(), 'plan_info': selPlan, 'parent_id': parentId});
+                    final all = await widget.db.query('schedule_items');
+                    await widget.db.insert('schedule_items', {
+                      'title': ctrl.text.trim(),
+                      'plan_info': selPlan,
+                      'parent_id': parentId,
+                      'sort_order': all.length,
+                    });
                     if (parentId != null) {
                       _collapsedSchedParents.remove(parentId);
                       _saveTodayUiState();
