@@ -10,7 +10,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:sqflite/sqflite.dart';
 
-// ==================== 1. 查找与备份页面 (含搜索框 + 标题组上下拖拽排序 + 树形勾选) ====================
+// ==================== 1. 查找与备份页面 ====================
 class SearchPage extends StatefulWidget {
   final Database db;
   const SearchPage({super.key, required this.db});
@@ -57,9 +57,6 @@ class _SearchPageState extends State<SearchPage> {
         [like],
       )) {
         hits.add({'tag': '家庭 · ${e['title']}', 'title': '${e['seq']}. ${e['content']}', 'sub': ''});
-      }
-      for (final s in await widget.db.query('schedule_items', where: 'title LIKE ? OR plan_info LIKE ?', whereArgs: [like, like])) {
-        hits.add({'tag': '日程打卡', 'title': '${s['title']}', 'sub': '${s['plan_info'] ?? ''}'});
       }
     }
     return {'groups': groups, 'hits': hits};
@@ -445,7 +442,6 @@ class _SearchPageState extends State<SearchPage> {
           return ListView(
             padding: const EdgeInsets.all(12),
             children: [
-              // 1. 全文检索搜索框
               TextField(
                 controller: _searchCtrl,
                 decoration: InputDecoration(
@@ -475,8 +471,6 @@ class _SearchPageState extends State<SearchPage> {
                 onChanged: (v) => setState(() => _kw = v),
               ),
               const SizedBox(height: 12),
-
-              // 2. 搜索结果展示
               if (_kw.trim().isNotEmpty) ...[
                 Text('🔎 搜索结果 (${hits.length})：', style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.bold, color: Color(0xFF475569))),
                 const SizedBox(height: 6),
@@ -504,8 +498,6 @@ class _SearchPageState extends State<SearchPage> {
                       )),
                 const Divider(height: 24),
               ],
-
-              // 3. 标题组操作与上下拖动排序列表
               Row(
                 children: [
                   Expanded(
@@ -645,7 +637,7 @@ class _SearchPageState extends State<SearchPage> {
   }
 }
 
-// ==================== 2. 家庭模块页面 (6套差异炫彩高定成员卡片 + 加高防重叠 + 仅按序号拆分) ====================
+// ==================== 2. 家庭模块页面 ====================
 class _MemberPalette {
   final List<Color> bgGradient;
   final List<Color> avatarGradient;
@@ -677,9 +669,7 @@ class _FamilyPageState extends State<FamilyPage> {
   String? _hoverZone;
   bool _uiLoaded = false;
 
-  // 6套高定差异化炫彩主题（根据不同成员自动分配或匹配专属色彩）
   static const List<_MemberPalette> _memberPalettes = [
-    // 0: 梦幻流光粉紫（霓虹玫瑰 -> 皇家紫）
     _MemberPalette(
       bgGradient: [Color(0xFFFFF1F2), Color(0xFFF5F3FF), Color(0xFFFDF2F8)],
       avatarGradient: [Color(0xFFEC4899), Color(0xFF8B5CF6)],
@@ -688,7 +678,6 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFFDB2777),
       titleColor: Color(0xFF831843),
     ),
-    // 1: 赛博极光蓝青（深海蓝 -> 极光青）
     _MemberPalette(
       bgGradient: [Color(0xFFEFF6FF), Color(0xFFECFEFF), Color(0xFFF0F9FF)],
       avatarGradient: [Color(0xFF2563EB), Color(0xFF06B6D4)],
@@ -697,7 +686,6 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFF0284C7),
       titleColor: Color(0xFF0C4A6E),
     ),
-    // 2: 落日流金琥珀（暖阳金 -> 珊瑚橙）
     _MemberPalette(
       bgGradient: [Color(0xFFFFFBEB), Color(0xFFFFF7ED), Color(0xFFFEF2F2)],
       avatarGradient: [Color(0xFFF59E0B), Color(0xFFEF4444)],
@@ -706,7 +694,6 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFFD97706),
       titleColor: Color(0xFF78350F),
     ),
-    // 3: 翡翠森系极光（祖母绿 -> 薄荷青）
     _MemberPalette(
       bgGradient: [Color(0xFFECFDF5), Color(0xFFF0FDFA), Color(0xFFF0FDF4)],
       avatarGradient: [Color(0xFF10B981), Color(0xFF0D9488)],
@@ -715,7 +702,6 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFF059669),
       titleColor: Color(0xFF064E3B),
     ),
-    // 4: 星河魅影紫蓝（星云紫 -> 靛青蓝）
     _MemberPalette(
       bgGradient: [Color(0xFFF5F3FF), Color(0xFFEEF2FF), Color(0xFFFAF5FF)],
       avatarGradient: [Color(0xFF7C3AED), Color(0xFF4F46E5)],
@@ -724,7 +710,6 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFF6D28D9),
       titleColor: Color(0xFF311068),
     ),
-    // 5: 绯红霓虹珊瑚（火烈鸟红 -> 蜜桃粉）
     _MemberPalette(
       bgGradient: [Color(0xFFFFF1F2), Color(0xFFFFF5F5), Color(0xFFFFF7ED)],
       avatarGradient: [Color(0xFFE11D48), Color(0xFFFB7185)],
@@ -736,9 +721,9 @@ class _FamilyPageState extends State<FamilyPage> {
   ];
 
   _MemberPalette _paletteForMember(String title, int memberOrderIndex, int id) {
-    if (title.contains('梦')) return _memberPalettes[0]; // 专属梦幻粉紫
-    if (title.contains('雁') || title.contains('冰') || title.contains('我')) return _memberPalettes[1]; // 专属极光蓝青
-    if (title.contains('球') || title.contains('宠') || title.contains('狗')) return _memberPalettes[2]; // 专属暖阳流金
+    if (title.contains('梦')) return _memberPalettes[0];
+    if (title.contains('雁') || title.contains('冰') || title.contains('我')) return _memberPalettes[1];
+    if (title.contains('球') || title.contains('宠') || title.contains('狗')) return _memberPalettes[2];
     if (title.contains('爸') || title.contains('父') || title.contains('妈') || title.contains('母')) return _memberPalettes[3];
     return _memberPalettes[(memberOrderIndex + id) % _memberPalettes.length];
   }
@@ -1090,7 +1075,6 @@ class _FamilyPageState extends State<FamilyPage> {
     return false;
   }
 
-  // ==================== 家庭模块内容详情抽屉（支持完整路径显示 + 仅按序号拆分，换行保留一体） ====================
   Future<void> _moduleEntriesDialog(Map<String, dynamic> mod, List<Map<String, dynamic>> allMods) async {
     final modId = mod['id'] as int;
     final modMap = {for (final m in allMods) m['id'] as int: m};
@@ -1186,7 +1170,6 @@ class _FamilyPageState extends State<FamilyPage> {
                         final raw = ctrl.text.trim();
                         if (raw.isEmpty) return;
 
-                        // 核心需求 ⑥：去掉换行自动拆分成两条，将其当作一体输入，仅按照显式序号拆分！
                         final itemsToInsert = <String>[];
                         final seqRegex = RegExp(
                           r'(?:^|\n)\s*(?:\d+[\.、]|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]|[一二三四五六七八九十]+[、\.])\s*',
@@ -1235,7 +1218,6 @@ class _FamilyPageState extends State<FamilyPage> {
                   child: entries.isEmpty
                       ? const Center(child: Text('暂无内容条目，请在上方输入框添加', style: TextStyle(color: Colors.grey)))
                       : ReorderableListView.builder(
-                          controller: sc,
                           buildDefaultDragHandles: false,
                           itemCount: entries.length,
                           onReorder: (oldIdx, newIdx) async {
@@ -1473,7 +1455,6 @@ class _FamilyPageState extends State<FamilyPage> {
           List<Map<String, dynamic>> childrenOf(int pid) =>
               mods.where((m) => m['parent_id'] == pid).toList();
 
-          // 计算每个成员的序号，确保不同成员呈现差异化的高定炫彩配色
           final memberIdList = mods.where((m) => (m['is_member'] as int? ?? 0) == 1).map((m) => m['id'] as int).toList();
 
           Widget buildNode(Map<String, dynamic> m, int depth) {
@@ -1484,7 +1465,6 @@ class _FamilyPageState extends State<FamilyPage> {
             final hasChildren = children.isNotEmpty;
             final isCollapsed = _collapsedIds.contains(id);
 
-            // 显示子标题数量或内部条目数量
             final subBadgeCount = hasChildren ? children.length : (entryCounts[id] ?? 0);
 
             final isHover = _hoverTargetId == id;
@@ -1548,7 +1528,6 @@ class _FamilyPageState extends State<FamilyPage> {
                       },
                       builder: (ctx, cand, rej) {
                         if (isMember) {
-                          // ==================== 差异炫彩高定成员卡片（上下加宽 + 绝不重叠） ====================
                           return Container(
                             decoration: BoxDecoration(
                               gradient: LinearGradient(
@@ -1585,7 +1564,6 @@ class _FamilyPageState extends State<FamilyPage> {
                                 ),
                               ],
                             ),
-                            // 上下宽度调宽（vertical: 15），视觉舒展大气
                             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 15),
                             child: Row(
                               crossAxisAlignment: CrossAxisAlignment.center,
@@ -1613,7 +1591,6 @@ class _FamilyPageState extends State<FamilyPage> {
                                   )
                                 else
                                   const SizedBox(width: 6),
-                                // 炫彩渐变圆形头像
                                 Container(
                                   width: 38,
                                   height: 38,
@@ -1639,7 +1616,6 @@ class _FamilyPageState extends State<FamilyPage> {
                                   ),
                                 ),
                                 const SizedBox(width: 10),
-                                // 左侧自适应流式标题与徽章区（彻底防止“4项”与右侧图标重叠）
                                 Expanded(
                                   child: GestureDetector(
                                     behavior: HitTestBehavior.opaque,
@@ -1686,7 +1662,6 @@ class _FamilyPageState extends State<FamilyPage> {
                                   ),
                                 ),
                                 const SizedBox(width: 6),
-                                // 右侧独立操作按钮区（间距充足，绝不重叠）
                                 InkWell(
                                   onTap: () => _addOrEditModuleDialog(parentId: id, forceMember: false),
                                   child: Padding(
@@ -1749,7 +1724,6 @@ class _FamilyPageState extends State<FamilyPage> {
                           );
                         }
 
-                        // ==================== 普通层级标题卡片 ====================
                         return Container(
                           decoration: BoxDecoration(
                             color: zone == 'inside' ? const Color(0xFFEEF2FF) : Colors.white,
@@ -1924,7 +1898,7 @@ class _FamilyPageState extends State<FamilyPage> {
     );
   }
 }
-// ==================== 3. 规划与思维导图页面 (支持 XMind 导入 + 画布缩放 + 节点长按拖拽移动) ====================
+// ==================== 3. 规划与思维导图页面 (支持 XMind 导入 + 节点长按拖拽移动) ====================
 class PlanPage extends StatefulWidget {
   final Database db;
   const PlanPage({super.key, required this.db});
@@ -2260,7 +2234,6 @@ class _PlanPageState extends State<PlanPage> {
   }
 }
 
-// ==================== 思维导图交互画布页 (还原红粉正交连线 + 支持节点长按三区拖拽移动) ====================
 class _NodeLayoutInfo {
   final String id;
   final Map<String, dynamic> node;
@@ -2303,7 +2276,6 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
   bool _isLandscape = false;
   bool _allExpanded = true;
 
-  // 节点拖拽悬停状态 (up=排到目标上方, inside=变为目标的子节点, down=排到目标下方)
   String? _hoverTargetId;
   String? _hoverZone;
 
@@ -2368,7 +2340,6 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
     }
   }
 
-  // 检查 targetId 是否为 dragId 的子孙节点（防止父节点拖进自己内部造成死循环）
   bool _isDescendantInTree(String dragId, String targetId) {
     if (dragId == targetId) return true;
     Map<String, dynamic>? findNode(Map<String, dynamic> cur, String id) {
@@ -2385,7 +2356,6 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
     return findNode(dragNode, targetId) != null;
   }
 
-  // 核心功能：执行思维导图节点间的拖拽移动（支持变为子节点或同级上下调序）
   Future<void> _moveMindmapNode({
     required String dragId,
     required String targetId,
@@ -2417,7 +2387,7 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
           final children = (cur['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
           children.add(removedNode!);
           cur['children'] = children;
-          cur['collapsed'] = false; // 自动展开目标节点
+          cur['collapsed'] = false;
           return true;
         }
         for (final c in ((cur['children'] as List?)?.cast<Map<String, dynamic>>() ?? [])) {
@@ -2466,7 +2436,7 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
               },
             ),
             ListTile(
-              leading: const Icon(Icons.Subdirectory_arrow_right, color: Color(0xFF4F46E5)),
+              leading: const Icon(Icons.subdirectory_arrow_right, color: Color(0xFF4F46E5)),
               title: const Text('添加子节点'),
               onTap: () {
                 Navigator.pop(ctx);
@@ -2630,7 +2600,6 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
     return false;
   }
 
-  // 计算每个节点的宽高与树形坐标
   Size _measureNodeSize(String text, int depth) {
     final tp = TextPainter(
       text: TextSpan(
@@ -2832,14 +2801,11 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
                 child: Stack(
                   clipBehavior: Clip.none,
                   children: [
-                    // 1. 底层正交连接线画布
                     Positioned.fill(
                       child: CustomPaint(
                         painter: _MindmapLinePainter(nodes: layout.nodes, nodeMap: nodeMap),
                       ),
                     ),
-
-                    // 2. 节点卡片与长按三区拖拽目标
                     ...layout.nodes.map((info) {
                       final isRoot = info.depth == 0;
                       final children = (info.node['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
@@ -2922,8 +2888,6 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
                                 },
                               ),
                             ),
-
-                            // 右侧展开/收起圆标按钮 (还原 (-) 与红色数字徽章)
                             if (hasChildren)
                               GestureDetector(
                                 behavior: HitTestBehavior.opaque,
@@ -2999,14 +2963,12 @@ class _MindmapLinePainter extends CustomPainter {
       final parent = nodeMap[info.parentId!];
       if (parent == null) continue;
 
-      // 从父节点右侧展开按钮处连出正交折线至子节点左侧中央
       final startX = parent.rect.right + 34.0;
       final startY = parent.rect.center.dy;
       final endX = info.rect.left;
       final endY = info.rect.center.dy;
       final midX = startX + (endX - startX) * 0.45;
 
-      // 父节点右边到 (-) 按钮的短横线
       canvas.drawLine(
         Offset(parent.rect.right, startY),
         Offset(parent.rect.right + 10.0, startY),
