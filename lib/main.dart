@@ -20,7 +20,6 @@ void main() async {
   runApp(DailyTrackerApp(db: db));
 }
 
-// ==================== 数据库层 (SQLite v7 含成员标识与 AI 配置持久化) ====================
 class AppDatabase {
   static final AppDatabase instance = AppDatabase._();
   static Database? _db;
@@ -45,23 +44,6 @@ class AppDatabase {
         await db.execute('CREATE TABLE ui_states (state_key TEXT PRIMARY KEY, state_val TEXT NOT NULL)');
       },
       onUpgrade: (db, oldV, newV) async {
-        if (oldV < 2) {
-          try { await db.execute("ALTER TABLE schedule_items ADD COLUMN plan_info TEXT DEFAULT ''"); } catch (_) {}
-        }
-        if (oldV < 3) {
-          try { await db.execute("ALTER TABLE modules ADD COLUMN parent_id INTEGER"); } catch (_) {}
-          try { await db.execute("ALTER TABLE modules ADD COLUMN sort_order INTEGER DEFAULT 0"); } catch (_) {}
-          try { await db.execute("ALTER TABLE module_entries ADD COLUMN sort_order INTEGER DEFAULT 0"); } catch (_) {}
-        }
-        if (oldV < 4) {
-          try { await db.execute("ALTER TABLE schedule_items ADD COLUMN parent_id INTEGER"); } catch (_) {}
-        }
-        if (oldV < 5) {
-          try { await db.execute('CREATE TABLE IF NOT EXISTS ui_states (state_key TEXT PRIMARY KEY, state_val TEXT NOT NULL)'); } catch (_) {}
-        }
-        if (oldV < 6) {
-          try { await db.execute("ALTER TABLE status_items ADD COLUMN allow_inherit INTEGER DEFAULT 1"); } catch (_) {}
-        }
         if (oldV < 7) {
           try { await db.execute("ALTER TABLE modules ADD COLUMN is_member INTEGER DEFAULT 0"); } catch (_) {}
         }
@@ -79,11 +61,7 @@ class AppDatabase {
 
   static Future<void> setUiState(Database db, String key, String val) async {
     try {
-      await db.insert(
-        'ui_states',
-        {'state_key': key, 'state_val': val},
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
+      await db.insert('ui_states', {'state_key': key, 'state_val': val}, conflictAlgorithm: ConflictAlgorithm.replace);
     } catch (_) {}
   }
 }
@@ -233,6 +211,7 @@ class _TodayPageState extends State<TodayPage> {
   bool _foldStatusSection = false;
   bool _foldSchedSection = false;
   bool _uiLoaded = false;
+  List<String> _sectionOrder = ['summary', 'status', 'schedule']; // 今日页大模块拖拽排序顺序
 
   String get _today => DateFormat('yyyy-MM-dd').format(DateTime.now());
 
@@ -250,6 +229,9 @@ class _TodayPageState extends State<TodayPage> {
         _foldSummary = map['foldSummary'] == true;
         _foldStatusSection = map['foldStatusSection'] == true;
         _foldSchedSection = map['foldSchedSection'] == true;
+        if (map['sectionOrder'] is List) {
+          _sectionOrder = (map['sectionOrder'] as List).map((e) => '$e').toList();
+        }
         _collapsedStatusIds
           ..clear()
           ..addAll(((map['collapsedStatusIds'] as List?) ?? []).map((e) => e as int));
@@ -266,6 +248,7 @@ class _TodayPageState extends State<TodayPage> {
       'foldSummary': _foldSummary,
       'foldStatusSection': _foldStatusSection,
       'foldSchedSection': _foldSchedSection,
+      'sectionOrder': _sectionOrder,
       'collapsedStatusIds': _collapsedStatusIds.toList(),
       'collapsedSchedParents': _collapsedSchedParents.toList(),
     });
@@ -365,14 +348,12 @@ class _TodayPageState extends State<TodayPage> {
     });
   }
 
-  /// 调用 Gemini 接口（支持 AQ. 新版 Auth Key 与 AIza 传统 Key，并支持多模型自动降级重试）
   Future<String> _callGeminiApi({
     required String apiKey,
     required String preferredModel,
     required String prompt,
   }) async {
     final cleanKey = apiKey.trim();
-    // 构建候选模型队列：优先使用用户选择的模型，若接口名称变更则自动回退尝试稳定版模型
     final candidates = <String>[
       if (preferredModel == 'gemini-3.1-pro') ...[
         'gemini-2.5-pro',
@@ -398,7 +379,6 @@ class _TodayPageState extends State<TodayPage> {
         );
         final req = await client.postUrl(uri).timeout(const Duration(seconds: 15));
         req.headers.set('Content-Type', 'application/json; charset=utf-8');
-        // 同时携带 x-goog-api-key 头，兼容 AQ. 开头的新版 Google AI Studio Auth Key
         req.headers.set('x-goog-api-key', cleanKey);
 
         final body = jsonEncode({
@@ -431,14 +411,13 @@ class _TodayPageState extends State<TodayPage> {
 
         final errMsg = json?['error']?['message']?.toString() ?? 'HTTP ${resp.statusCode}: $respStr';
         lastError = '[$modelName] $errMsg';
-        // 如果是 Key 本身无效或地区不支持，直接中断不再重试其他模型
         if (errMsg.toLowerCase().contains('api key not valid') ||
             errMsg.toLowerCase().contains('user location is not supported') ||
             errMsg.toLowerCase().contains('permission_denied')) {
           break;
         }
       } catch (e) {
-        lastError = '[$modelName] 网络请求异常: $e';
+        lastError = '[$modelName] 网络连接异常(请检查代理节点是否为非香港节点): $e';
       } finally {
         client.close();
       }
@@ -446,14 +425,13 @@ class _TodayPageState extends State<TodayPage> {
     throw Exception(lastError);
   }
 
-  // ==================== Gemini AI 状态总结分析与一键导入每日状态 ====================
   Future<void> _openGeminiAnalyzerSheet(String summaryText) async {
     final rawCfg = await AppDatabase.getUiState(widget.db, 'gemini_ai_config');
     Map<String, dynamic> cfg = {
       'model': 'gemini-3.1-pro',
       'mode': 'gem',
       'gemName': '每日状态系统分析师',
-      'gemPrompt': '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条控制在一段话内，格式如“标题：具体分析”。',
+      'gemPrompt': '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条格式如“标题：具体分析”。',
       'targetField': 'AI 深度异状分析',
       'apiKey': '',
     };
@@ -473,7 +451,7 @@ class _TodayPageState extends State<TodayPage> {
     String selectedMode = '${cfg['mode']}';
     bool isLoading = false;
     bool showAdvancedKey = apiKeyCtrl.text.trim().isEmpty;
-    bool obscureKey = false; // 默认明文显示方便核对 Key 是否完整
+    bool obscureKey = false;
 
     Future<void> saveCurrentConfig() async {
       final newCfg = {
@@ -530,8 +508,6 @@ class _TodayPageState extends State<TodayPage> {
                 const SizedBox(height: 4),
                 const Text('💡 自动记忆上次选用的模型、对话模式与 Gem 设定，支持直接生成或拉起外部 Gemini', style: TextStyle(fontSize: 11.5, color: Colors.grey)),
                 const Divider(height: 16),
-
-                // 1. 模型选择 & 对话/Gem 模式切换
                 Row(
                   children: [
                     Expanded(
@@ -583,8 +559,6 @@ class _TodayPageState extends State<TodayPage> {
                   ],
                 ),
                 const SizedBox(height: 10),
-
-                // 2. Gem 设定（当选择专属 Gem 时展示）
                 if (selectedMode == 'gem') ...[
                   Row(
                     children: [
@@ -635,20 +609,6 @@ class _TodayPageState extends State<TodayPage> {
                             ),
                             child: Text('💎 客观理性系统分析师'),
                           ),
-                          const PopupMenuItem(
-                            value: (
-                              name: '代谢与营养精算师',
-                              prompt: '请聚焦我今日的饮食结构（碳水/蛋白质/钠摄入）与体重变化、体能训练表现，分析水肿或热量缺口情况，并给出明日三餐调整方案。每条格式如“标题：具体分析”。',
-                            ),
-                            child: Text('🥗 代谢与营养精算师'),
-                          ),
-                          const PopupMenuItem(
-                            value: (
-                              name: '精力与日程效能教练',
-                              prompt: '请结合我今日的已完成/未完成日程与核心目标，分析精力分配与决策疲劳点，给出明日单线程减法行动建议。每条格式如“标题：具体分析”。',
-                            ),
-                            child: Text('⚡ 精力与日程效能教练'),
-                          ),
                         ],
                       ),
                     ],
@@ -660,7 +620,7 @@ class _TodayPageState extends State<TodayPage> {
                     maxLines: 4,
                     style: const TextStyle(fontSize: 12.5, height: 1.35),
                     decoration: const InputDecoration(
-                      labelText: 'Gem 专属分析指令（自动保存）',
+                      labelText: 'Gem 专属分析指令',
                       border: OutlineInputBorder(),
                       contentPadding: EdgeInsets.all(8),
                     ),
@@ -668,8 +628,6 @@ class _TodayPageState extends State<TodayPage> {
                   ),
                   const SizedBox(height: 10),
                 ],
-
-                // 3. 导出目标条目设置 & API Key 折叠配置
                 Row(
                   children: [
                     Expanded(
@@ -678,7 +636,6 @@ class _TodayPageState extends State<TodayPage> {
                         style: const TextStyle(fontSize: 13),
                         decoration: const InputDecoration(
                           labelText: '导出到每日状态的条目名称',
-                          hintText: '如：AI 深度异状分析',
                           border: OutlineInputBorder(),
                           isDense: true,
                           contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -702,7 +659,6 @@ class _TodayPageState extends State<TodayPage> {
                     style: const TextStyle(fontSize: 12.5),
                     decoration: InputDecoration(
                       labelText: 'Gemini API Key（支持 AQ. 或 AIzaSy 开头密钥）',
-                      hintText: '粘贴完整 API Key...',
                       border: const OutlineInputBorder(),
                       isDense: true,
                       suffixIcon: IconButton(
@@ -714,8 +670,6 @@ class _TodayPageState extends State<TodayPage> {
                   ),
                 ],
                 const SizedBox(height: 12),
-
-                // 4. 操作按钮栏：方式A（复制并跳转 Gemini App/对话） & 方式B（API 内置一键生成）
                 Row(
                   children: [
                     Expanded(
@@ -726,12 +680,12 @@ class _TodayPageState extends State<TodayPage> {
                           final fullPrompt = buildFullPrompt();
                           await Clipboard.setData(ClipboardData(text: fullPrompt));
                           setS(() {
-                            resultCtrl.text = '✅ 已复制含今日状态与指令的完整文本！\n请在弹出的分享菜单中选择 Gemini App（或直接切换到 Gemini 粘贴发送），然后将回复粘贴回此处即可。';
+                            resultCtrl.text = '✅ 已复制含今日状态与指令的完整文本，正在拉起外部 Gemini...';
                           });
                           await Share.share(fullPrompt, subject: '今日状态 Gemini 分析');
                         },
                         icon: const Icon(Icons.open_in_new, size: 17),
-                        label: const Text('复制并拉起 Gemini App', style: TextStyle(fontSize: 12.5)),
+                        label: const Text('复制并拉起外部 Gemini', style: TextStyle(fontSize: 12.5)),
                       ),
                     ),
                     const SizedBox(width: 8),
@@ -751,13 +705,13 @@ class _TodayPageState extends State<TodayPage> {
                                   await Clipboard.setData(ClipboardData(text: fullPrompt));
                                   setS(() {
                                     showAdvancedKey = true;
-                                    resultCtrl.text = '⚠️ 你尚未填写 Gemini API Key。\n已为你自动复制完整分析指令到剪贴板！你可以直接点上方输入框填入 API Key，或点左侧按钮拉起 Gemini App 对话。';
+                                    resultCtrl.text = '⚠️ 尚未填写 API Key，已自动复制指令到剪贴板！';
                                   });
                                   return;
                                 }
                                 setS(() {
                                   isLoading = true;
-                                  resultCtrl.text = '⏳ 正在通过 Gemini ($selectedModel) 深度分析今日状态，请稍候 (约需 5~12 秒)...';
+                                  resultCtrl.text = '⏳ 正在通过 Gemini ($selectedModel) 深度分析今日状态，请稍候...';
                                 });
                                 try {
                                   final aiText = await _callGeminiApi(
@@ -767,9 +721,7 @@ class _TodayPageState extends State<TodayPage> {
                                   );
                                   setS(() => resultCtrl.text = aiText);
                                 } catch (e) {
-                                  setS(() {
-                                    resultCtrl.text = '❌ API 直连生成返回提示：\n$e\n\n💡 解决方法：\n1. 若提示 API key not valid，说明 Google REST 接口仅接受以 AIzaSy 开头的标准密钥（可在 console.cloud.google.com/apis/credentials 点“+创建凭据 -> API密钥”获取 AIzaSy 密钥）。\n2. 或者直接点击左上方「复制并拉起 Gemini App」，粘贴到你手机的 Gemini 网页/App 中获取回复！';
-                                  });
+                                  setS(() => resultCtrl.text = '❌ API 直连生成返回提示：\n$e');
                                 } finally {
                                   setS(() => isLoading = false);
                                 }
@@ -783,12 +735,10 @@ class _TodayPageState extends State<TodayPage> {
                   ],
                 ),
                 const SizedBox(height: 12),
-
-                // 5. AI 分析结果预览 / 粘贴框 + 一键导出至每日状态
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text('📥 AI 分析建议（实时显示进度 / 可编辑或粘贴）：', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
+                    const Text('📥 AI 分析建议：', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
                     TextButton.icon(
                       style: TextButton.styleFrom(
                         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -813,7 +763,7 @@ class _TodayPageState extends State<TodayPage> {
                   maxLines: 12,
                   style: const TextStyle(fontSize: 13.5, height: 1.45),
                   decoration: const InputDecoration(
-                    hintText: '点击上方「⚡ AI 直接生成分析」后，此处将实时显示连接进度与生成结果；你也可以随时将外部 Gemini 的回复粘贴到这里...',
+                    hintText: '在此查看生成结果或粘贴外部回复...',
                     border: OutlineInputBorder(),
                     contentPadding: EdgeInsets.all(10),
                   ),
@@ -829,9 +779,7 @@ class _TodayPageState extends State<TodayPage> {
                     onPressed: () async {
                       final rawAi = resultCtrl.text.trim();
                       if (rawAi.isEmpty || rawAi.startsWith('⏳') || rawAi.startsWith('❌') || rawAi.startsWith('⚠️')) {
-                        setS(() {
-                          resultCtrl.text = '⚠️ 请先等待 AI 生成有效的分析内容，或者粘贴分析结果后再点击导出！';
-                        });
+                        setS(() => resultCtrl.text = '⚠️ 请先获取有效的分析内容后再点击导出！');
                         return;
                       }
                       await saveCurrentConfig();
@@ -935,18 +883,7 @@ class _TodayPageState extends State<TodayPage> {
       }
 
       final dateHeaderRegex = RegExp(r'^【\s*(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]\s*】');
-      final topFields = [
-        '基础数据',
-        '核心目标',
-        '饮食记录',
-        '打卡进度',
-        '状态与异状',
-        '状态和异状',
-        'AI 深度异状分析',
-        'AI深度异状分析',
-        '复盘与分析',
-        '今日总结',
-      ];
+      final topFields = ['基础数据', '核心目标', '饮食记录', '打卡进度', '状态与异状', '状态和异状', 'AI 深度异状分析', 'AI深度异状分析', '复盘与分析', '今日总结'];
 
       for (final pm in pMatches) {
         final pXml = pm.group(1)!;
@@ -1125,75 +1062,142 @@ class _TodayPageState extends State<TodayPage> {
 
           final doneCount = doneMap.values.where((v) => v).length;
 
-          return ListView(
+          // 核心重构：支持「今日状态摘要」、「每日状态」、「日程打卡」大模块自由上下拖拽排序
+          final sectionWidgets = <String, Widget>{
+            'summary': _buildSummary(items, disp, scheds, doneMap),
+            'status': Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildSectionHeader(
+                  icon: '📊',
+                  title: '每日状态 (${items.length})',
+                  isFolded: _foldStatusSection,
+                  onToggleFold: () {
+                    setState(() => _foldStatusSection = !_foldStatusSection);
+                    _saveTodayUiState();
+                  },
+                  actionLabel: '新条目',
+                  onAction: () => _addOrEditStatusItemDialog(),
+                ),
+                if (!_foldStatusSection)
+                  Card(
+                    margin: const EdgeInsets.only(bottom: 12),
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      side: const BorderSide(color: Color(0xFFE2E8F0)),
+                    ),
+                    child: items.isEmpty
+                        ? const Padding(
+                            padding: EdgeInsets.all(16),
+                            child: Center(child: Text('暂无状态条目', style: TextStyle(color: Colors.grey, fontSize: 13))),
+                          )
+                        : ReorderableListView.builder(
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            buildDefaultDragHandles: false,
+                            itemCount: items.length,
+                            onReorder: (oldIdx, newIdx) async {
+                              if (newIdx > oldIdx) newIdx -= 1;
+                              final moved = items.removeAt(oldIdx);
+                              items.insert(newIdx, moved);
+                              for (int i = 0; i < items.length; i++) {
+                                await widget.db.update('status_items', {'sort_order': i}, where: 'id = ?', whereArgs: [items[i]['id']]);
+                              }
+                              setState(() {});
+                            },
+                            itemBuilder: (ctx, i) {
+                              return Container(
+                                key: ValueKey('status_item_${items[i]['id']}'),
+                                decoration: BoxDecoration(
+                                  border: i > 0 ? const Border(top: BorderSide(color: Color(0xFFF1F5F9))) : null,
+                                ),
+                                child: Row(
+                                  children: [
+                                    Expanded(child: _buildCompactStatusRow(items[i], disp[items[i]['id'] as int])),
+                                    ReorderableDragStartListener(
+                                      index: i,
+                                      child: const Padding(
+                                        padding: EdgeInsets.symmetric(horizontal: 10),
+                                        child: Icon(Icons.drag_handle, color: Colors.grey, size: 18),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+              ],
+            ),
+            'schedule': Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildSectionHeader(
+                  icon: '📅',
+                  title: '日程打卡 ($doneCount/${scheds.length})',
+                  isFolded: _foldSchedSection,
+                  onToggleFold: () {
+                    setState(() => _foldSchedSection = !_foldSchedSection);
+                    _saveTodayUiState();
+                  },
+                  actionLabel: '新日程',
+                  onAction: () => _addOrEditSchedDialog(),
+                ),
+                if (!_foldSchedSection)
+                  Card(
+                    margin: const EdgeInsets.only(bottom: 16),
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      side: const BorderSide(color: Color(0xFFE2E8F0)),
+                    ),
+                    child: scheds.isEmpty
+                        ? const Padding(
+                            padding: EdgeInsets.all(16),
+                            child: Center(child: Text('暂无日程', style: TextStyle(color: Colors.grey, fontSize: 13))),
+                          )
+                        : Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 4),
+                            child: _buildScheduleTree(scheds, doneMap),
+                          ),
+                  ),
+              ],
+            ),
+          };
+
+          return ReorderableListView(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            children: [
-              _buildSummary(items, disp, scheds, doneMap),
-
-              _buildSectionHeader(
-                icon: '📊',
-                title: '每日状态 (${items.length})',
-                isFolded: _foldStatusSection,
-                onToggleFold: () {
-                  setState(() => _foldStatusSection = !_foldStatusSection);
-                  _saveTodayUiState();
-                },
-                actionLabel: '新条目',
-                onAction: () => _addOrEditStatusItemDialog(),
-              ),
-              if (!_foldStatusSection)
-                Card(
-                  margin: const EdgeInsets.only(bottom: 10),
-                  elevation: 0,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                    side: const BorderSide(color: Color(0xFFE2E8F0)),
-                  ),
-                  child: items.isEmpty
-                      ? const Padding(
-                          padding: EdgeInsets.all(16),
-                          child: Center(child: Text('暂无状态条目，可点击右上角「导入Word」或「+ 新条目」', style: TextStyle(color: Colors.grey, fontSize: 13))),
-                        )
-                      : Column(
-                          children: [
-                            for (int i = 0; i < items.length; i++) ...[
-                              if (i > 0) const Divider(height: 1, color: Color(0xFFF1F5F9)),
-                              _buildCompactStatusRow(items[i], disp[items[i]['id'] as int]),
-                            ],
-                          ],
-                        ),
+            buildDefaultDragHandles: false,
+            shrinkWrap: true,
+            physics: const AlwaysScrollableScrollPhysics(),
+            onReorder: (oldIdx, newIdx) async {
+              if (newIdx > oldIdx) newIdx -= 1;
+              final moved = _sectionOrder.removeAt(oldIdx);
+              _sectionOrder.insert(newIdx, moved);
+              await _saveTodayUiState();
+              setState(() {});
+            },
+            children: List.generate(_sectionOrder.length, (i) {
+              final secKey = _sectionOrder[i];
+              return Container(
+                key: ValueKey('section_$secKey'),
+                margin: const EdgeInsets.only(bottom: 8),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(child: sectionWidgets[secKey]!),
+                    ReorderableDragStartListener(
+                      index: i,
+                      child: Container(
+                        padding: const EdgeInsets.only(left: 6, top: 12),
+                        child: const Icon(Icons.drag_indicator, color: Colors.grey, size: 20),
+                      ),
+                    ),
+                  ],
                 ),
-
-              _buildSectionHeader(
-                icon: '📅',
-                title: '日程打卡 ($doneCount/${scheds.length})',
-                isFolded: _foldSchedSection,
-                onToggleFold: () {
-                  setState(() => _foldSchedSection = !_foldSchedSection);
-                  _saveTodayUiState();
-                },
-                actionLabel: '新日程',
-                onAction: () => _addOrEditSchedDialog(),
-              ),
-              if (!_foldSchedSection)
-                Card(
-                  margin: const EdgeInsets.only(bottom: 16),
-                  elevation: 0,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                    side: const BorderSide(color: Color(0xFFE2E8F0)),
-                  ),
-                  child: scheds.isEmpty
-                      ? const Padding(
-                          padding: EdgeInsets.all(16),
-                          child: Center(child: Text('暂无日程，点击右上角「+ 新日程」添加', style: TextStyle(color: Colors.grey, fontSize: 13))),
-                        )
-                      : Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 4),
-                          child: _buildScheduleTree(scheds, doneMap),
-                        ),
-                ),
-            ],
+              );
+            }),
           );
         },
       ),
@@ -1209,7 +1213,7 @@ class _TodayPageState extends State<TodayPage> {
     required VoidCallback onAction,
   }) {
     return Padding(
-      padding: const EdgeInsets.only(top: 2, bottom: 4),
+      padding: const EdgeInsets.only(top: 4, bottom: 4),
       child: Row(
         children: [
           InkWell(
@@ -1221,7 +1225,7 @@ class _TodayPageState extends State<TodayPage> {
                 children: [
                   Icon(isFolded ? Icons.chevron_right : Icons.expand_more, size: 20, color: const Color(0xFF475569)),
                   const SizedBox(width: 2),
-                  Text('$icon $title', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+                  Text('$icon $title', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Color(0xFF1E293B))),
                 ],
               ),
             ),
@@ -1288,12 +1292,12 @@ class _TodayPageState extends State<TodayPage> {
     }
 
     return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
-        color: const Color(0xFFF8FAFC),
-        borderRadius: BorderRadius.circular(10),
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
         border: Border.all(color: const Color(0xFFCBD5E1)),
+        boxShadow: const [BoxShadow(color: Color(0x0A000000), blurRadius: 6, offset: Offset(0, 2))],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1314,7 +1318,7 @@ class _TodayPageState extends State<TodayPage> {
                       Flexible(
                         child: Text(
                           '📋 今日状态摘要 · $_date',
-                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5, color: Color(0xFF1E293B)),
                           overflow: TextOverflow.ellipsis,
                         ),
                       ),
@@ -1340,13 +1344,10 @@ class _TodayPageState extends State<TodayPage> {
               SizedBox(
                 height: 26,
                 child: FilledButton.tonal(
-                  style: FilledButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 9),
-                    minimumSize: Size.zero,
-                  ),
+                  style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 9), minimumSize: Size.zero),
                   onPressed: () {
                     Clipboard.setData(ClipboardData(text: copyText));
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已按分列格式复制摘要到剪贴板')));
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已复制摘要到剪贴板')));
                   },
                   child: const Text('复制', style: TextStyle(fontSize: 11.5)),
                 ),
@@ -1354,12 +1355,12 @@ class _TodayPageState extends State<TodayPage> {
             ],
           ),
           if (!_foldSummary) ...[
-            const Divider(height: 12),
+            const Divider(height: 14),
             ...summaryRows,
             if (scheds.isNotEmpty) ...[
-              const SizedBox(height: 6),
+              const SizedBox(height: 8),
               _buildSummaryScheduleBlock('✅ 已完成日程', doneList, const Color(0xFF10B981)),
-              const SizedBox(height: 4),
+              const SizedBox(height: 6),
               _buildSummaryScheduleBlock('⬜ 未完成日程', todoList, const Color(0xFF64748B)),
             ],
           ],
@@ -1421,7 +1422,7 @@ class _TodayPageState extends State<TodayPage> {
                   margin: const EdgeInsets.only(bottom: 3),
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                   decoration: BoxDecoration(
-                    color: Colors.white,
+                    color: const Color(0xFFF8FAFC),
                     borderRadius: BorderRadius.circular(5),
                     border: Border.all(color: const Color(0xFFE2E8F0)),
                   ),
@@ -1458,7 +1459,7 @@ class _TodayPageState extends State<TodayPage> {
               margin: const EdgeInsets.only(bottom: 2.5),
               padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
               decoration: BoxDecoration(
-                color: Colors.white,
+                color: const Color(0xFFF8FAFC),
                 borderRadius: BorderRadius.circular(5),
                 border: Border(left: BorderSide(color: accentColor, width: 3)),
               ),
@@ -1572,7 +1573,6 @@ class _TodayPageState extends State<TodayPage> {
               ),
             ],
           ),
-
           if (!isItemFolded && type != 'image' && (cols.length > 1 || val.length > 18))
             Padding(
               padding: const EdgeInsets.only(top: 6),
@@ -1632,7 +1632,6 @@ class _TodayPageState extends State<TodayPage> {
                 ),
               ),
             ),
-
           if (!isItemFolded && type == 'image' && imgs.isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 6),
@@ -1643,6 +1642,7 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
+  /// 核心更新：支持日程主日程与子日程双向勾选联动、上下拖拽切换及树形展示
   Widget _buildScheduleTree(List<Map<String, dynamic>> allScheds, Map<int, bool> doneMap) {
     final validIds = allScheds.map((s) => s['id'] as int).toSet();
     final roots = allScheds.where((s) {
@@ -1654,160 +1654,224 @@ class _TodayPageState extends State<TodayPage> {
       return allScheds.where((s) => s['parent_id'] == pid).toList();
     }
 
-    Widget buildNode(Map<String, dynamic> s, int depth) {
+    // 递归判定：若子日程全部完成，主日程自动完成
+    bool checkAllChildrenDone(int parentId) {
+      final ch = childrenOf(parentId);
+      if (ch.isEmpty) return false;
+      return ch.every((c) => doneMap[c['id'] as int] == true);
+    }
+
+    Widget buildNode(Map<String, dynamic> s, int depth, {int? parentId, required List<Map<String, dynamic>> currentList, required int index}) {
       final sid = s['id'] as int;
-      final done = doneMap[sid] ?? false;
-      final plan = (s['plan_info'] as String? ?? '').trim();
       final children = childrenOf(sid);
       final hasChildren = children.isNotEmpty;
+
+      // 如果有子日程且全部完成，自动确保主日程状态为 true
+      bool done = doneMap[sid] ?? false;
+      if (hasChildren && checkAllChildrenDone(sid) && !done) {
+        done = true;
+        doneMap[sid] = true;
+      }
+
+      final plan = (s['plan_info'] as String? ?? '').trim();
       final isCollapsed = _collapsedSchedParents.contains(sid);
       final doneChildrenCount = children.where((c) => doneMap[c['id'] as int] == true).length;
 
-      return Column(
+      return Container(
         key: ValueKey('sched_$sid'),
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Padding(
-            padding: EdgeInsets.only(left: depth * 18.0 + 6, right: 6, top: 3, bottom: 3),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                if (hasChildren)
-                  GestureDetector(
-                    onTap: () {
-                      setState(() => isCollapsed ? _collapsedSchedParents.remove(sid) : _collapsedSchedParents.add(sid));
-                      _saveTodayUiState();
-                    },
-                    child: Padding(
-                      padding: const EdgeInsets.only(right: 2),
-                      child: Icon(isCollapsed ? Icons.chevron_right : Icons.expand_more, size: 19, color: const Color(0xFF4F46E5)),
+        decoration: BoxDecoration(
+          border: depth > 0 && index > 0 ? const Border(top: BorderSide(color: Color(0xFFF1F5F9))) : null,
+        ),
+        child: Padding(
+          padding: EdgeInsets.only(left: depth * 18.0 + 4, right: 4, top: 4, bottom: 4),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  if (hasChildren)
+                    GestureDetector(
+                      onTap: () {
+                        setState(() => isCollapsed ? _collapsedSchedParents.remove(sid) : _collapsedSchedParents.add(sid));
+                        _saveTodayUiState();
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.only(right: 2),
+                        child: Icon(isCollapsed ? Icons.chevron_right : Icons.expand_more, size: 19, color: const Color(0xFF4F46E5)),
+                      ),
+                    )
+                  else if (depth > 0)
+                    const Padding(
+                      padding: EdgeInsets.only(right: 4),
+                      child: Icon(Icons.subdirectory_arrow_right, size: 15, color: Colors.grey),
+                    )
+                  else
+                    const SizedBox(width: 4),
+                  SizedBox(
+                    width: 26,
+                    height: 26,
+                    child: Checkbox(
+                      value: done,
+                      visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
+                      onChanged: (v) async {
+                        final targetDone = v ?? false;
+                        // 1. 更新当前日程
+                        await widget.db.insert(
+                          'schedule_records',
+                          {'item_id': sid, 'date': _date, 'done': targetDone ? 1 : 0},
+                          conflictAlgorithm: ConflictAlgorithm.replace,
+                        );
+                        // 2. 如果勾选/取消主日程，其下所有子日程全部同步勾选/取消
+                        void cascade(int pId, bool d) {
+                          for (final sub in childrenOf(pId)) {
+                            final subId = sub['id'] as int;
+                            widget.db.insert(
+                              'schedule_records',
+                              {'item_id': subId, 'date': _date, 'done': d ? 1 : 0},
+                              conflictAlgorithm: ConflictAlgorithm.replace,
+                            );
+                            cascade(subId, d);
+                          }
+                        }
+                        cascade(sid, targetDone);
+                        setState(() {});
+                      },
                     ),
-                  )
-                else if (depth > 0)
-                  const Padding(
-                    padding: EdgeInsets.only(right: 4),
-                    child: Icon(Icons.subdirectory_arrow_right, size: 15, color: Colors.grey),
-                  )
-                else
-                  const SizedBox(width: 4),
-                SizedBox(
-                  width: 26,
-                  height: 26,
-                  child: Checkbox(
-                    value: done,
-                    visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
-                    onChanged: (v) async {
-                      await widget.db.insert(
-                        'schedule_records',
-                        {'item_id': sid, 'date': _date, 'done': (v ?? false) ? 1 : 0},
-                        conflictAlgorithm: ConflictAlgorithm.replace,
-                      );
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => _addOrEditSchedDialog(editSched: s),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  '${s['title']}',
+                                  style: TextStyle(
+                                    fontSize: depth == 0 ? 14 : 13,
+                                    fontWeight: depth == 0 ? FontWeight.w500 : FontWeight.normal,
+                                    decoration: done ? TextDecoration.lineThrough : null,
+                                    color: done ? Colors.grey : const Color(0xFF1E293B),
+                                  ),
+                                ),
+                              ),
+                              if (hasChildren)
+                                Container(
+                                  margin: const EdgeInsets.only(left: 4),
+                                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFFEEF2FF),
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: Text(
+                                    '$doneChildrenCount/${children.length}',
+                                    style: const TextStyle(fontSize: 10.5, color: Color(0xFF4F46E5)),
+                                  ),
+                                ),
+                            ],
+                          ),
+                          if (plan.isNotEmpty)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 1),
+                              child: Text(
+                                '🎯 $plan',
+                                style: const TextStyle(fontSize: 11, color: Color(0xFF4F46E5)),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  InkWell(
+                    onTap: () => _addOrEditSchedDialog(parentId: sid, parentTitle: '${s['title']}'),
+                    child: const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+                      child: Icon(Icons.add_circle_outline, size: 17, color: Color(0xFF4F46E5)),
+                    ),
+                  ),
+                  InkWell(
+                    onTap: () => _addOrEditSchedDialog(editSched: s),
+                    child: const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 3, vertical: 3),
+                      child: Icon(Icons.edit_outlined, size: 16, color: Colors.blueGrey),
+                    ),
+                  ),
+                  InkWell(
+                    onTap: () async {
+                      final subIds = <int>[sid];
+                      void collect(int p) {
+                        for (final c in childrenOf(p)) {
+                          final cid = c['id'] as int;
+                          subIds.add(cid);
+                          collect(cid);
+                        }
+                      }
+                      collect(sid);
+                      for (final did in subIds) {
+                        await widget.db.delete('schedule_records', where: 'item_id = ?', whereArgs: [did]);
+                        await widget.db.delete('schedule_items', where: 'id = ?', whereArgs: [did]);
+                      }
                       setState(() {});
                     },
-                  ),
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTap: () => _addOrEditSchedDialog(editSched: s),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Expanded(
-                              child: Text(
-                                '${s['title']}',
-                                style: TextStyle(
-                                  fontSize: depth == 0 ? 14 : 13,
-                                  fontWeight: depth == 0 ? FontWeight.w500 : FontWeight.normal,
-                                  decoration: done ? TextDecoration.lineThrough : null,
-                                  color: done ? Colors.grey : const Color(0xFF1E293B),
-                                ),
-                              ),
-                            ),
-                            if (hasChildren)
-                              Container(
-                                margin: const EdgeInsets.only(left: 4),
-                                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFFEEF2FF),
-                                  borderRadius: BorderRadius.circular(4),
-                                ),
-                                child: Text(
-                                  '$doneChildrenCount/${children.length}',
-                                  style: const TextStyle(fontSize: 10.5, color: Color(0xFF4F46E5)),
-                                ),
-                              ),
-                          ],
-                        ),
-                        if (plan.isNotEmpty)
-                          Padding(
-                            padding: const EdgeInsets.only(top: 1),
-                            child: Text(
-                              '🎯 $plan',
-                              style: const TextStyle(fontSize: 11, color: Color(0xFF4F46E5)),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                      ],
+                    child: const Padding(
+                      padding: EdgeInsets.only(left: 3, right: 2, top: 3, bottom: 3),
+                      child: Icon(Icons.delete_outline, size: 17, color: Colors.redAccent),
                     ),
                   ),
-                ),
-                InkWell(
-                  onTap: () => _addOrEditSchedDialog(parentId: sid, parentTitle: '${s['title']}'),
-                  child: const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 5, vertical: 3),
-                    child: Icon(Icons.add_circle_outline, size: 17, color: Color(0xFF4F46E5)),
+                  ReorderableDragStartListener(
+                    index: index,
+                    child: const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 4),
+                      child: Icon(Icons.drag_handle, size: 18, color: Colors.grey),
+                    ),
                   ),
-                ),
-                InkWell(
-                  onTap: () => _addOrEditSchedDialog(editSched: s),
-                  child: const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 4, vertical: 3),
-                    child: Icon(Icons.edit_outlined, size: 16, color: Colors.blueGrey),
-                  ),
-                ),
-                InkWell(
-                  onTap: () async {
-                    final subIds = <int>[sid];
-                    void collect(int p) {
-                      for (final c in childrenOf(p)) {
-                        final cid = c['id'] as int;
-                        subIds.add(cid);
-                        collect(cid);
-                      }
-                    }
-                    collect(sid);
-                    for (final did in subIds) {
-                      await widget.db.delete('schedule_records', where: 'item_id = ?', whereArgs: [did]);
-                      await widget.db.delete('schedule_items', where: 'id = ?', whereArgs: [did]);
+                ],
+              ),
+              if (hasChildren && !isCollapsed)
+                ReorderableListView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  buildDefaultDragHandles: false,
+                  itemCount: children.length,
+                  onReorder: (oldIdx, newIdx) async {
+                    if (newIdx > oldIdx) newIdx -= 1;
+                    final moved = children.removeAt(oldIdx);
+                    children.insert(newIdx, moved);
+                    for (int i = 0; i < children.length; i++) {
+                      await widget.db.update('schedule_items', {'sort_order': i}, where: 'id = ?', whereArgs: [children[i]['id']]);
                     }
                     setState(() {});
                   },
-                  child: const Padding(
-                    padding: EdgeInsets.only(left: 4, right: 2, top: 3, bottom: 3),
-                    child: Icon(Icons.delete_outline, size: 17, color: Colors.redAccent),
-                  ),
+                  itemBuilder: (ctx, ci) => buildNode(children[ci], depth + 1, parentId: sid, currentList: children, index: ci),
                 ),
-              ],
-            ),
+            ],
           ),
-          if (hasChildren && !isCollapsed)
-            ...children.map((c) => buildNode(c, depth + 1)),
-        ],
+        ),
       );
     }
 
-    return Column(
-      children: [
-        for (int i = 0; i < roots.length; i++) ...[
-          if (i > 0) const Divider(height: 1, color: Color(0xFFF1F5F9)),
-          buildNode(roots[i], 0),
-        ],
-      ],
+    return ReorderableListView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      buildDefaultDragHandles: false,
+      itemCount: roots.length,
+      onReorder: (oldIdx, newIdx) async {
+        if (newIdx > oldIdx) newIdx -= 1;
+        final moved = roots.removeAt(oldIdx);
+        roots.insert(newIdx, moved);
+        for (int i = 0; i < roots.length; i++) {
+          await widget.db.update('schedule_items', {'sort_order': i}, where: 'id = ?', whereArgs: [roots[i]['id']]);
+        }
+        setState(() {});
+      },
+      itemBuilder: (ctx, i) => buildNode(roots[i], 0, parentId: null, currentList: roots, index: i),
     );
   }
 
@@ -1897,7 +1961,7 @@ class _TodayPageState extends State<TodayPage> {
               TextField(
                 controller: ctrl,
                 autofocus: true,
-                decoration: const InputDecoration(labelText: '条目名称（如：体重/kg、饮食记录）'),
+                decoration: const InputDecoration(labelText: '条目名称'),
               ),
               const SizedBox(height: 10),
               DropdownButtonFormField<String>(
@@ -1916,7 +1980,6 @@ class _TodayPageState extends State<TodayPage> {
                 value: allowInherit,
                 contentPadding: EdgeInsets.zero,
                 title: const Text('允许跨天继承历史数据', style: TextStyle(fontSize: 13.5)),
-                subtitle: const Text('关闭后，若当天未填写则自动清空（不显示历史继承值）', style: TextStyle(fontSize: 11, color: Colors.grey)),
                 onChanged: (v) => setS(() => allowInherit = v ?? true),
               ),
             ],
@@ -1925,20 +1988,13 @@ class _TodayPageState extends State<TodayPage> {
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
             FilledButton(
               onPressed: () async {
-                if (ctrl.text.trim().isEmpty) return;
+                final txt = ctrl.text.trim();
+                if (txt.isEmpty) return;
                 if (isEdit) {
-                  await widget.db.update(
-                    'status_items',
-                    {'name': ctrl.text.trim(), 'type': type, 'allow_inherit': allowInherit ? 1 : 0},
-                    where: 'id = ?',
-                    whereArgs: [editItem['id']],
-                  );
+                  await widget.db.update('status_items', {'name': txt, 'type': type, 'allow_inherit': allowInherit ? 1 : 0}, where: 'id = ?', whereArgs: [editItem['id']]);
                 } else {
-                  await widget.db.insert('status_items', {
-                    'name': ctrl.text.trim(),
-                    'type': type,
-                    'allow_inherit': allowInherit ? 1 : 0,
-                  });
+                  final all = await widget.db.query('status_items');
+                  await widget.db.insert('status_items', {'name': txt, 'type': type, 'allow_inherit': allowInherit ? 1 : 0, 'sort_order': all.length});
                 }
                 if (mounted) Navigator.pop(ctx);
                 setState(() {});
@@ -1979,27 +2035,14 @@ class _TodayPageState extends State<TodayPage> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               if (type == 'text') ...[
-                const Text('💡 每一行（或用 | 、句号分隔）会自动在卡片与摘要中独立分列展示：', style: TextStyle(fontSize: 11.5, color: Colors.grey)),
+                const Text('💡 每一行会自动分列展示：', style: TextStyle(fontSize: 11.5, color: Colors.grey)),
                 const SizedBox(height: 6),
                 Wrap(
                   spacing: 6,
                   runSpacing: 4,
                   children: [
-                    ActionChip(
-                      visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
-                      label: const Text('+ 新增分列行', style: TextStyle(fontSize: 11.5)),
-                      onPressed: () => appendTemplate('项目：'),
-                    ),
-                    ActionChip(
-                      visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
-                      label: const Text('早/午/晚餐模板', style: TextStyle(fontSize: 11.5)),
-                      onPressed: () => appendTemplate('早餐：\n午餐：\n晚餐：'),
-                    ),
-                    ActionChip(
-                      visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
-                      label: const Text('上/下/晚模板', style: TextStyle(fontSize: 11.5)),
-                      onPressed: () => appendTemplate('上午：\n下午：\n晚上：'),
-                    ),
+                    ActionChip(visualDensity: const VisualDensity(horizontal: -4, vertical: -4), label: const Text('+ 新增分列行'), onPressed: () => appendTemplate('项目：')),
+                    ActionChip(visualDensity: const VisualDensity(horizontal: -4, vertical: -4), label: const Text('早/午/晚模板'), onPressed: () => appendTemplate('早餐：\n午餐：\n晚餐：')),
                   ],
                 ),
                 const SizedBox(height: 8),
@@ -2011,11 +2054,7 @@ class _TodayPageState extends State<TodayPage> {
                 keyboardType: type == 'number' ? const TextInputType.numberWithOptions(decimal: true) : TextInputType.multiline,
                 autofocus: true,
                 style: const TextStyle(fontSize: 14, height: 1.45),
-                decoration: InputDecoration(
-                  hintText: type == 'number' ? '输入数值...' : '输入内容（换行即可自动分列展示）...',
-                  contentPadding: const EdgeInsets.all(10),
-                  border: const OutlineInputBorder(),
-                ),
+                decoration: const InputDecoration(contentPadding: EdgeInsets.all(10), border: OutlineInputBorder()),
               ),
             ],
           ),
@@ -2035,104 +2074,145 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
+  /// 核心优化：日程关联规划时采用类似查找页的树形折叠选择与长路径自动换行
   Future<void> _addOrEditSchedDialog({Map<String, dynamic>? editSched, int? parentId, String? parentTitle}) async {
-    final plans = await _loadPlans();
+    final mms = await widget.db.query('mindmaps', orderBy: 'id DESC');
     if (!mounted) return;
 
     final isEdit = editSched != null;
     final ctrl = TextEditingController(text: isEdit ? '${editSched['title']}' : '');
     String selPlan = isEdit ? ('${editSched['plan_info'] ?? ''}') : '';
-    if (selPlan.isNotEmpty && !plans.any((p) => p.path == selPlan)) {
-      plans.insert(0, (path: selPlan, name: selPlan.split(' > ').last));
-    }
-
-    final dlgTitle = isEdit
-        ? '编辑日程'
-        : (parentId != null ? '在「$parentTitle」下添加子日程' : '添加日程');
+    final Set<String> expandedPaths = {};
 
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setS) => AlertDialog(
-          title: Text(dlgTitle, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
+        builder: (ctx, setS) {
+          Widget buildTreePickerNode(Map<String, dynamic> node, String currentPath, int depth) {
+            final t = (node['text'] as String? ?? '').trim();
+            if (t.isEmpty) return const SizedBox.shrink();
+            final path = currentPath.isEmpty ? t : '$currentPath > $t';
+            final children = ((node['children'] as List?)?.cast<Map<String, dynamic>>() ?? []);
+            final hasChildren = children.isNotEmpty;
+            final isExpanded = expandedPaths.contains(path);
+            final isSelected = selPlan == path;
+
+            return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                TextField(
-                  controller: ctrl,
-                  autofocus: true,
-                  minLines: 1,
-                  maxLines: 3,
-                  decoration: const InputDecoration(
-                    labelText: '日程内容',
-                    hintText: '如：晨跑30分钟',
-                    border: OutlineInputBorder(),
-                    isDense: true,
+                InkWell(
+                  onTap: () {
+                    setS(() => selPlan = path);
+                    if (ctrl.text.trim().isEmpty) ctrl.text = t;
+                  },
+                  child: Container(
+                    width: double.infinity,
+                    padding: EdgeInsets.fromLTRB(12.0 + depth * 14.0, 6, 8, 6),
+                    color: isSelected ? const Color(0xFFEEF2FF) : Colors.transparent,
+                    child: Row(
+                      children: [
+                        if (hasChildren)
+                          GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: () => setS(() => isExpanded ? expandedPaths.remove(path) : expandedPaths.add(path)),
+                            child: Padding(
+                              padding: const EdgeInsets.only(right: 4),
+                              child: Icon(isExpanded ? Icons.arrow_drop_down : Icons.arrow_right, size: 20, color: const Color(0xFF4F46E5)),
+                            ),
+                          )
+                        else
+                          const SizedBox(width: 24),
+                        const Icon(Icons.subdirectory_arrow_right, size: 15, color: Colors.blueGrey),
+                        const SizedBox(width: 4),
+                        Expanded(
+                          child: Text(
+                            path,
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                              color: isSelected ? const Color(0xFF4F46E5) : const Color(0xFF1E293B),
+                            ),
+                          ),
+                        ),
+                        if (isSelected) const Icon(Icons.check, size: 16, color: Color(0xFF4F46E5)),
+                      ],
+                    ),
                   ),
                 ),
-                const SizedBox(height: 12),
-                const Text('关联规划（确保符合规划）：', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
-                const SizedBox(height: 6),
-                if (plans.isEmpty)
-                  const Text('暂无规划可关联，可先在「规划」页创建或导入 XMind', style: TextStyle(fontSize: 12, color: Colors.grey))
-                else
-                  DropdownButtonFormField<String>(
-                    value: selPlan,
-                    isExpanded: true,
-                    decoration: const InputDecoration(
-                      border: OutlineInputBorder(),
-                      isDense: true,
-                      contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                if (hasChildren && isExpanded)
+                  ...children.map((c) => buildTreePickerNode(c, path, depth + 1)),
+              ],
+            );
+          }
+
+          return AlertDialog(
+            title: Text(isEdit ? '编辑日程' : (parentId != null ? '在「$parentTitle」下添加子日程' : '添加日程'), style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            content: SizedBox(
+              width: double.maxFinite,
+              height: MediaQuery.of(ctx).size.height * 0.65,
+              child: ListView(
+                children: [
+                  TextField(
+                    controller: ctrl,
+                    autofocus: true,
+                    minLines: 1,
+                    maxLines: 3,
+                    decoration: const InputDecoration(labelText: '日程内容', border: OutlineInputBorder(), isDense: true),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text('关联规划（分级折叠选择）：', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  InkWell(
+                    onTap: () => setS(() => selPlan = ''),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                      color: selPlan.isEmpty ? const Color(0xFFEEF2FF) : Colors.transparent,
+                      child: Row(
+                        children: [
+                          const Text('❌ 不关联规划', style: TextStyle(fontSize: 13, color: Colors.grey)),
+                          const Spacer(),
+                          if (selPlan.isEmpty) const Icon(Icons.check, size: 16, color: Color(0xFF4F46E5)),
+                        ],
+                      ),
                     ),
-                    items: [
-                      const DropdownMenuItem(value: '', child: Text('不关联规划', style: TextStyle(fontSize: 13))),
-                      ...plans.map((n) => DropdownMenuItem(
-                            value: n.path,
-                            child: Text(n.path, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12.5)),
-                          )),
-                    ],
-                    onChanged: (v) => setS(() {
-                      selPlan = v ?? '';
-                      if (selPlan.isNotEmpty && ctrl.text.trim().isEmpty) {
-                        ctrl.text = plans.firstWhere((e) => e.path == selPlan).name;
+                  ),
+                  const Divider(height: 6),
+                  if (mms.isEmpty)
+                    const Padding(padding: EdgeInsets.all(12), child: Text('暂无规划，请先在规划页导入 XMind', style: TextStyle(fontSize: 12, color: Colors.grey)))
+                  else
+                    ...mms.map((m) {
+                      try {
+                        final root = jsonDecode(m['root_json'] as String) as Map<String, dynamic>;
+                        return buildTreePickerNode(root, '', 0);
+                      } catch (_) {
+                        return const SizedBox.shrink();
                       }
                     }),
-                  ),
-              ],
+                ],
+              ),
             ),
-          ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-            FilledButton(
-              onPressed: () async {
-                if (ctrl.text.trim().isEmpty) return;
-                if (isEdit) {
-                  await widget.db.update(
-                    'schedule_items',
-                    {'title': ctrl.text.trim(), 'plan_info': selPlan},
-                    where: 'id = ?',
-                    whereArgs: [editSched['id']],
-                  );
-                } else {
-                  await widget.db.insert('schedule_items', {
-                    'title': ctrl.text.trim(),
-                    'plan_info': selPlan,
-                    'parent_id': parentId,
-                  });
-                  if (parentId != null) {
-                    _collapsedSchedParents.remove(parentId);
-                    _saveTodayUiState();
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+              FilledButton(
+                onPressed: () async {
+                  if (ctrl.text.trim().isEmpty) return;
+                  if (isEdit) {
+                    await widget.db.update('schedule_items', {'title': ctrl.text.trim(), 'plan_info': selPlan}, where: 'id = ?', whereArgs: [editSched['id']]);
+                  } else {
+                    await widget.db.insert('schedule_items', {'title': ctrl.text.trim(), 'plan_info': selPlan, 'parent_id': parentId});
+                    if (parentId != null) {
+                      _collapsedSchedParents.remove(parentId);
+                      _saveTodayUiState();
+                    }
                   }
-                }
-                if (mounted) Navigator.pop(ctx);
-                setState(() {});
-              },
-              child: Text(isEdit ? '保存' : '添加'),
-            ),
-          ],
-        ),
+                  if (mounted) Navigator.pop(ctx);
+                  setState(() {});
+                },
+                child: Text(isEdit ? '保存' : '添加'),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
