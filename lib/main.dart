@@ -238,7 +238,6 @@ class _TodayPageState extends State<TodayPage> {
   bool _uiLoaded = false;
   List<String> _sectionOrder = ['summary', 'status', 'schedule'];
 
-  // 日程打卡三区拖拽状态（与家庭模块一致：up=排到上方, inside=变为其子日程, down=排到下方）
   int? _hoverSchedTargetId;
   String? _hoverSchedZone;
 
@@ -433,7 +432,6 @@ class _TodayPageState extends State<TodayPage> {
     List<Map<String, dynamic>> childrenOf(int pid) =>
         allScheds.where((s) => s['parent_id'] == pid).toList();
 
-    // 1. 更新当前节点状态
     doneMap[sid] = targetDone;
     await widget.db.insert(
       'schedule_records',
@@ -441,7 +439,6 @@ class _TodayPageState extends State<TodayPage> {
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
 
-    // 2. 向下递归：主日程勾选/取消时，所有子孙日程同步勾选/取消
     Future<void> cascadeDown(int pId, bool d) async {
       for (final sub in childrenOf(pId)) {
         final subId = sub['id'] as int;
@@ -456,7 +453,6 @@ class _TodayPageState extends State<TodayPage> {
     }
     await cascadeDown(sid, targetDone);
 
-    // 3. 向上递归：若某主日程下的所有子日程均已勾选，则主日程自动勾选；若有任一未勾选，则主日程自动取消勾选
     final currentItem = allScheds.where((s) => s['id'] == sid).firstOrNull;
     int? pId = currentItem?['parent_id'] as int?;
     final visited = <int>{};
@@ -479,83 +475,7 @@ class _TodayPageState extends State<TodayPage> {
     if (mounted) setState(() {});
   }
 
-  Future<String> _callGeminiApi({
-    required String apiKey,
-    required String preferredModel,
-    required String prompt,
-  }) async {
-    final cleanKey = apiKey.trim();
-    final candidates = <String>[
-      if (preferredModel == 'gemini-3.1-pro') ...[
-        'gemini-2.5-pro',
-        'gemini-2.5-flash',
-        'gemini-2.0-flash',
-      ] else if (preferredModel == 'gemini-2.5-pro') ...[
-        'gemini-2.5-pro',
-        'gemini-2.5-flash',
-        'gemini-2.0-flash',
-      ] else ...[
-        'gemini-2.5-flash',
-        'gemini-2.0-flash',
-        'gemini-1.5-flash',
-      ]
-    ];
-
-    String lastError = '未知错误';
-    for (final modelName in candidates) {
-      final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
-      try {
-        final uri = Uri.parse(
-          'https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=${Uri.encodeQueryComponent(cleanKey)}',
-        );
-        final req = await client.postUrl(uri).timeout(const Duration(seconds: 15));
-        req.headers.set('Content-Type', 'application/json; charset=utf-8');
-        req.headers.set('x-goog-api-key', cleanKey);
-
-        final body = jsonEncode({
-          'contents': [
-            {
-              'parts': [
-                {'text': prompt}
-              ]
-            }
-          ]
-        });
-        req.add(utf8.encode(body));
-        final resp = await req.close().timeout(const Duration(seconds: 35));
-        final respStr = await resp.transform(utf8.decoder).join();
-
-        Map<String, dynamic>? json;
-        try {
-          json = jsonDecode(respStr) as Map<String, dynamic>;
-        } catch (_) {}
-
-        if (resp.statusCode == 200 && json != null) {
-          final list = json['candidates'] as List?;
-          if (list != null && list.isNotEmpty) {
-            final parts = list.first['content']?['parts'] as List?;
-            if (parts != null && parts.isNotEmpty) {
-              return parts.map((p) => '${p['text'] ?? ''}').join('\n').trim();
-            }
-          }
-        }
-
-        final errMsg = json?['error']?['message']?.toString() ?? 'HTTP ${resp.statusCode}: $respStr';
-        lastError = '[$modelName] $errMsg';
-        if (errMsg.toLowerCase().contains('api key not valid') ||
-            errMsg.toLowerCase().contains('user location is not supported') ||
-            errMsg.toLowerCase().contains('permission_denied')) {
-          break;
-        }
-      } catch (e) {
-        lastError = '[$modelName] 网络连接异常: $e';
-      } finally {
-        client.close();
-      }
-    }
-    throw Exception(lastError);
-  }
-
+  // ==================== 精简版 Gemini 分析弹窗（移除直连，仅保留复制并拉起外部 Gemini） ====================
   Future<void> _openGeminiAnalyzerSheet(String summaryText) async {
     final rawCfg = await AppDatabase.getUiState(widget.db, 'gemini_ai_config');
     Map<String, dynamic> cfg = {
@@ -564,7 +484,6 @@ class _TodayPageState extends State<TodayPage> {
       'gemName': '每日状态系统分析师',
       'gemPrompt': '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条格式如“标题：具体分析”。',
       'targetField': 'AI 深度异状分析',
-      'apiKey': '',
     };
     if (rawCfg != null && rawCfg.isNotEmpty) {
       try {
@@ -576,13 +495,9 @@ class _TodayPageState extends State<TodayPage> {
     final gemNameCtrl = TextEditingController(text: '${cfg['gemName']}');
     final gemPromptCtrl = TextEditingController(text: '${cfg['gemPrompt']}');
     final targetFieldCtrl = TextEditingController(text: '${cfg['targetField']}');
-    final apiKeyCtrl = TextEditingController(text: '${cfg['apiKey']}');
     final resultCtrl = TextEditingController();
     String selectedModel = '${cfg['model']}';
     String selectedMode = '${cfg['mode']}';
-    bool isLoading = false;
-    bool showAdvancedKey = apiKeyCtrl.text.trim().isEmpty;
-    bool obscureKey = false;
 
     Future<void> saveCurrentConfig() async {
       final newCfg = {
@@ -591,7 +506,6 @@ class _TodayPageState extends State<TodayPage> {
         'gemName': gemNameCtrl.text.trim(),
         'gemPrompt': gemPromptCtrl.text.trim(),
         'targetField': targetFieldCtrl.text.trim().isEmpty ? 'AI 深度异状分析' : targetFieldCtrl.text.trim(),
-        'apiKey': apiKeyCtrl.text.trim(),
       };
       await AppDatabase.setUiState(widget.db, 'gemini_ai_config', jsonEncode(newCfg));
     }
@@ -609,7 +523,7 @@ class _TodayPageState extends State<TodayPage> {
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setS) => DraggableScrollableSheet(
           expand: false,
-          initialChildSize: 0.90,
+          initialChildSize: 0.88,
           maxChildSize: 0.96,
           builder: (_, sc) => Padding(
             padding: EdgeInsets.fromLTRB(16, 14, 16, MediaQuery.of(ctx).viewInsets.bottom + 14),
@@ -637,7 +551,7 @@ class _TodayPageState extends State<TodayPage> {
                   ],
                 ),
                 const SizedBox(height: 4),
-                const Text('💡 自动记忆上次选用的模型、对话模式与 Gem 设定，支持直接生成或拉起外部 Gemini', style: TextStyle(fontSize: 11.5, color: Colors.grey)),
+                const Text('💡 自动记忆上次选用的模型、对话模式与 Gem 设定，支持一键复制今日状态并拉起外部 Gemini', style: TextStyle(fontSize: 11.5, color: Colors.grey)),
                 const Divider(height: 16),
                 Row(
                   children: [
@@ -773,111 +687,42 @@ class _TodayPageState extends State<TodayPage> {
                   ),
                   const SizedBox(height: 10),
                 ],
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: targetFieldCtrl,
-                        style: const TextStyle(fontSize: 13),
-                        decoration: const InputDecoration(
-                          labelText: '导出到每日状态的条目名称',
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                          contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                        ),
-                        onChanged: (_) => saveCurrentConfig(),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    TextButton.icon(
-                      onPressed: () => setS(() => showAdvancedKey = !showAdvancedKey),
-                      icon: Icon(showAdvancedKey ? Icons.key_off : Icons.key, size: 16),
-                      label: Text(apiKeyCtrl.text.trim().isEmpty ? '配置API直连' : '查看/改Key', style: const TextStyle(fontSize: 12)),
-                    ),
-                  ],
-                ),
-                if (showAdvancedKey) ...[
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: apiKeyCtrl,
-                    obscureText: obscureKey,
-                    style: const TextStyle(fontSize: 12.5),
-                    decoration: InputDecoration(
-                      labelText: 'Gemini API Key（支持 AQ. 或 AIzaSy 开头密钥）',
-                      border: const OutlineInputBorder(),
-                      isDense: true,
-                      suffixIcon: IconButton(
-                        icon: Icon(obscureKey ? Icons.visibility_off : Icons.visibility, size: 18),
-                        onPressed: () => setS(() => obscureKey = !obscureKey),
-                      ),
-                    ),
-                    onChanged: (_) => saveCurrentConfig(),
+                TextField(
+                  controller: targetFieldCtrl,
+                  style: const TextStyle(fontSize: 13),
+                  decoration: const InputDecoration(
+                    labelText: '导出到每日状态的条目名称',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                    contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                   ),
-                ],
+                  onChanged: (_) => saveCurrentConfig(),
+                ),
                 const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 10)),
-                        onPressed: () async {
-                          await saveCurrentConfig();
-                          final fullPrompt = buildFullPrompt();
-                          await Clipboard.setData(ClipboardData(text: fullPrompt));
-                          setS(() {
-                            resultCtrl.text = '✅ 已复制含今日状态与指令的完整文本，正在拉起外部 Gemini...';
-                          });
-                          await Share.share(fullPrompt, subject: '今日状态 Gemini 分析');
-                        },
-                        icon: const Icon(Icons.open_in_new, size: 17),
-                        label: const Text('复制并拉起外部 Gemini', style: TextStyle(fontSize: 12.5)),
-                      ),
+
+                // 仅保留「复制并拉起外部 Gemini」通栏主按钮
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF4F46E5),
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: FilledButton.icon(
-                        style: FilledButton.styleFrom(
-                          backgroundColor: const Color(0xFF4F46E5),
-                          padding: const EdgeInsets.symmetric(vertical: 10),
-                        ),
-                        onPressed: isLoading
-                            ? null
-                            : () async {
-                                await saveCurrentConfig();
-                                final key = apiKeyCtrl.text.trim();
-                                if (key.isEmpty) {
-                                  final fullPrompt = buildFullPrompt();
-                                  await Clipboard.setData(ClipboardData(text: fullPrompt));
-                                  setS(() {
-                                    showAdvancedKey = true;
-                                    resultCtrl.text = '⚠️ 尚未填写 API Key，已自动复制指令到剪贴板！';
-                                  });
-                                  return;
-                                }
-                                setS(() {
-                                  isLoading = true;
-                                  resultCtrl.text = '⏳ 正在通过 Gemini ($selectedModel) 深度分析今日状态，请稍候...';
-                                });
-                                try {
-                                  final aiText = await _callGeminiApi(
-                                    apiKey: key,
-                                    preferredModel: selectedModel,
-                                    prompt: buildFullPrompt(),
-                                  );
-                                  setS(() => resultCtrl.text = aiText);
-                                } catch (e) {
-                                  setS(() => resultCtrl.text = '❌ API 直连生成返回提示：\n$e');
-                                } finally {
-                                  setS(() => isLoading = false);
-                                }
-                              },
-                        icon: isLoading
-                            ? const SizedBox(width: 15, height: 15, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                            : const Icon(Icons.bolt, size: 17),
-                        label: Text(isLoading ? '正在分析...' : 'AI 直接生成分析', style: const TextStyle(fontSize: 12.5)),
-                      ),
-                    ),
-                  ],
+                    onPressed: () async {
+                      await saveCurrentConfig();
+                      final fullPrompt = buildFullPrompt();
+                      await Clipboard.setData(ClipboardData(text: fullPrompt));
+                      if (ctx.mounted) {
+                        ScaffoldMessenger.of(ctx).showSnackBar(
+                          const SnackBar(content: Text('✅ 已复制今日状态完整指令到剪贴板！')),
+                        );
+                      }
+                      await Share.share(fullPrompt, subject: '今日状态 Gemini 分析');
+                    },
+                    icon: const Icon(Icons.open_in_new, size: 18),
+                    label: const Text('复制并拉起外部 Gemini', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                  ),
                 ),
                 const SizedBox(height: 12),
                 Row(
@@ -908,7 +753,7 @@ class _TodayPageState extends State<TodayPage> {
                   maxLines: 12,
                   style: const TextStyle(fontSize: 13.5, height: 1.45),
                   decoration: const InputDecoration(
-                    hintText: '在此查看生成结果或粘贴外部回复...',
+                    hintText: '将外部 Gemini 的回复粘贴到此处，点击下方按钮即可自动分列导入到今日状态中...',
                     border: OutlineInputBorder(),
                     contentPadding: EdgeInsets.all(10),
                   ),
@@ -920,11 +765,12 @@ class _TodayPageState extends State<TodayPage> {
                     style: FilledButton.styleFrom(
                       backgroundColor: const Color(0xFF10B981),
                       padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     ),
                     onPressed: () async {
                       final rawAi = resultCtrl.text.trim();
-                      if (rawAi.isEmpty || rawAi.startsWith('⏳') || rawAi.startsWith('❌') || rawAi.startsWith('⚠️')) {
-                        setS(() => resultCtrl.text = '⚠️ 请先获取有效的分析内容后再点击导出！');
+                      if (rawAi.isEmpty || rawAi.startsWith('⚠️')) {
+                        setS(() => resultCtrl.text = '⚠️ 请先粘贴有效的 AI 分析内容后再点击导出！');
                         return;
                       }
                       await saveCurrentConfig();
@@ -1207,7 +1053,6 @@ class _TodayPageState extends State<TodayPage> {
           final scheds = snap.data!['scheds'] as List<Map<String, dynamic>>;
           final doneMap = snap.data!['done'] as Map<int, bool>;
 
-          // 自动同步一次主日程与子日程完成状态
           for (final s in scheds) {
             final sid = s['id'] as int;
             final ch = scheds.where((c) => c['parent_id'] == sid).toList();
@@ -1334,7 +1179,6 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  // ==================== 清晰美化的三大模块独立卡片容器（带顶部色带与拖拽手柄） ====================
   Widget _buildMajorSectionCard({
     required int dragIndex,
     required Color accentColor,
@@ -1440,6 +1284,7 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
+  // ==================== 今日状态摘要卡片（去掉复制按钮 + 已完成/未完成日程显示主次树形样式） ====================
   Widget _buildSummaryCard(
     int dragIndex,
     List<Map<String, dynamic>> items,
@@ -1479,14 +1324,66 @@ class _TodayPageState extends State<TodayPage> {
       return p.isEmpty ? '${s['title']}' : '${s['title']} ($p)';
     }
 
-    final doneList = scheds.where((s) => doneMap[s['id']] == true).map(fmtSched).toList();
-    final todoList = scheds.where((s) => doneMap[s['id']] != true).map(fmtSched).toList();
+    final validIds = scheds.map((s) => s['id'] as int).toSet();
+    final roots = scheds.where((s) {
+      final pid = s['parent_id'] as int?;
+      return pid == null || !validIds.contains(pid);
+    }).toList();
+    List<Map<String, dynamic>> childrenOf(int pid) =>
+        scheds.where((s) => s['parent_id'] == pid).toList();
+
+    // 构建带主次缩进层级的日程清单（若子日程属于该分组但父日程未勾选，也会自动带出父日程名称以明确主次从属）
+    List<({String text, int depth, bool isGroupHeaderOnly})> buildHierarchicalList(bool targetDone) {
+      final res = <({String text, int depth, bool isGroupHeaderOnly})>[];
+      bool hasMatchInSubtree(Map<String, dynamic> node) {
+        final id = node['id'] as int;
+        if ((doneMap[id] ?? false) == targetDone) return true;
+        for (final c in childrenOf(id)) {
+          if (hasMatchInSubtree(c)) return true;
+        }
+        return false;
+      }
+
+      void walk(Map<String, dynamic> node, int depth) {
+        if (!hasMatchInSubtree(node)) return;
+        final id = node['id'] as int;
+        final selfMatches = (doneMap[id] ?? false) == targetDone;
+        res.add((
+          text: fmtSched(node),
+          depth: depth,
+          isGroupHeaderOnly: !selfMatches,
+        ));
+        for (final c in childrenOf(id)) {
+          walk(c, depth + 1);
+        }
+      }
+
+      for (final r in roots) {
+        walk(r, 0);
+      }
+      return res;
+    }
+
+    final doneHierarchical = buildHierarchicalList(true);
+    final todoHierarchical = buildHierarchicalList(false);
+    final doneActualCount = scheds.where((s) => doneMap[s['id']] == true).length;
+    final todoActualCount = scheds.where((s) => doneMap[s['id']] != true).length;
+
+    String formatTreeForCopy(List<({String text, int depth, bool isGroupHeaderOnly})> list) {
+      if (list.isEmpty) return '无';
+      return '\n' +
+          list.map((e) {
+            final indent = '  ' * (e.depth + 1);
+            final prefix = e.depth == 0 ? '• ' : '↳ ';
+            return '$indent$prefix${e.text}';
+          }).join('\n');
+    }
 
     var copyText = '📋 $_date 状态记录';
     if (copyLines.isNotEmpty) copyText += '\n${copyLines.join('\n')}';
     if (scheds.isNotEmpty) {
-      copyText += '\n\n✅ 已完成日程：${doneList.isEmpty ? "无" : "\n${doneList.map((s) => "  • $s").join("\n")}"}';
-      copyText += '\n⬜ 未完成日程：${todoList.isEmpty ? "无" : "\n${todoList.map((s) => "  • $s").join("\n")}"}';
+      copyText += '\n\n✅ 已完成日程 ($doneActualCount)：${formatTreeForCopy(doneHierarchical)}';
+      copyText += '\n⬜ 未完成日程 ($todoActualCount)：${formatTreeForCopy(todoHierarchical)}';
     }
 
     const accentColor = Color(0xFFD97706);
@@ -1550,37 +1447,21 @@ class _TodayPageState extends State<TodayPage> {
                     ),
                   ),
                 ),
-                const SizedBox(width: 4),
+                const SizedBox(width: 6),
                 SizedBox(
-                  height: 26,
+                  height: 28,
                   child: FilledButton.icon(
                     style: FilledButton.styleFrom(
                       backgroundColor: const Color(0xFF4F46E5),
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
                       minimumSize: Size.zero,
                     ),
                     onPressed: () => _openGeminiAnalyzerSheet(copyText),
                     icon: const Icon(Icons.auto_awesome, size: 13),
-                    label: const Text('Gemini分析', style: TextStyle(fontSize: 11.5)),
+                    label: const Text('Gemini分析', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
                   ),
                 ),
-                const SizedBox(width: 5),
-                SizedBox(
-                  height: 26,
-                  child: FilledButton.tonal(
-                    style: FilledButton.styleFrom(
-                      backgroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      minimumSize: Size.zero,
-                    ),
-                    onPressed: () {
-                      Clipboard.setData(ClipboardData(text: copyText));
-                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已复制摘要到剪贴板')));
-                    },
-                    child: const Text('复制', style: TextStyle(fontSize: 11.5)),
-                  ),
-                ),
-                const SizedBox(width: 2),
+                const SizedBox(width: 4),
                 ReorderableDragStartListener(
                   index: dragIndex,
                   child: Padding(
@@ -1607,9 +1488,9 @@ class _TodayPageState extends State<TodayPage> {
                         ...summaryRows,
                         if (scheds.isNotEmpty) ...[
                           const SizedBox(height: 8),
-                          _buildSummaryScheduleBlock('✅ 已完成日程', doneList, const Color(0xFF10B981)),
+                          _buildSummaryScheduleTreeBlock('✅ 已完成日程', doneActualCount, doneHierarchical, const Color(0xFF10B981)),
                           const SizedBox(height: 6),
-                          _buildSummaryScheduleBlock('⬜ 未完成日程', todoList, const Color(0xFF64748B)),
+                          _buildSummaryScheduleTreeBlock('⬜ 未完成日程', todoActualCount, todoHierarchical, const Color(0xFF64748B)),
                         ],
                       ],
                     ),
@@ -1686,8 +1567,14 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  Widget _buildSummaryScheduleBlock(String label, List<String> list, Color accentColor) {
-    if (list.isEmpty) {
+  // 今日状态摘要中的主次树形日程块展示
+  Widget _buildSummaryScheduleTreeBlock(
+    String label,
+    int count,
+    List<({String text, int depth, bool isGroupHeaderOnly})> nodes,
+    Color accentColor,
+  ) {
+    if (nodes.isEmpty) {
       return Row(
         children: [
           Text('$label：', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF475569))),
@@ -1698,23 +1585,51 @@ class _TodayPageState extends State<TodayPage> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('$label (${list.length})：', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF475569))),
-        const SizedBox(height: 2),
+        Text('$label ($count)：', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF475569))),
+        const SizedBox(height: 3),
         Padding(
-          padding: const EdgeInsets.only(left: 8),
+          padding: const EdgeInsets.only(left: 4),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
-            children: list.map((item) => Container(
-              width: double.infinity,
-              margin: const EdgeInsets.only(bottom: 2.5),
-              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-              decoration: BoxDecoration(
-                color: const Color(0xFFF8FAFC),
-                borderRadius: BorderRadius.circular(5),
-                border: Border(left: BorderSide(color: accentColor, width: 3)),
-              ),
-              child: Text(item, style: const TextStyle(fontSize: 12, color: Color(0xFF334155))),
-            )).toList(),
+            children: nodes.map((item) {
+              final isSub = item.depth > 0;
+              return Padding(
+                padding: EdgeInsets.only(left: item.depth * 16.0, bottom: 3),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    if (isSub)
+                      Padding(
+                        padding: const EdgeInsets.only(right: 4),
+                        child: Icon(Icons.subdirectory_arrow_right, size: 14, color: accentColor.withOpacity(0.8)),
+                      ),
+                    Expanded(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: isSub ? Colors.white : const Color(0xFFF8FAFC),
+                          borderRadius: BorderRadius.circular(5),
+                          border: Border(
+                            left: BorderSide(color: accentColor, width: isSub ? 2.0 : 3.5),
+                            top: const BorderSide(color: Color(0xFFE2E8F0), width: 0.6),
+                            right: const BorderSide(color: Color(0xFFE2E8F0), width: 0.6),
+                            bottom: const BorderSide(color: Color(0xFFE2E8F0), width: 0.6),
+                          ),
+                        ),
+                        child: Text(
+                          item.text,
+                          style: TextStyle(
+                            fontSize: isSub ? 11.8 : 12.2,
+                            fontWeight: isSub ? FontWeight.normal : FontWeight.w600,
+                            color: item.isGroupHeaderOnly ? const Color(0xFF64748B) : const Color(0xFF1E293B),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }).toList(),
           ),
         ),
       ],
@@ -1899,7 +1814,6 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  // ==================== 日程打卡树：支持三区拖拽自由切换父子日程 + 勾选自动联动 ====================
   Widget _buildScheduleTree(List<Map<String, dynamic>> allScheds, Map<int, bool> doneMap) {
     final validIds = allScheds.map((s) => s['id'] as int).toSet();
     final roots = allScheds.where((s) {
@@ -2327,6 +2241,7 @@ class _TodayPageState extends State<TodayPage> {
                   children: [
                     ActionChip(visualDensity: const VisualDensity(horizontal: -4, vertical: -4), label: const Text('+ 新增分列行'), onPressed: () => appendTemplate('项目：')),
                     ActionChip(visualDensity: const VisualDensity(horizontal: -4, vertical: -4), label: const Text('早/午/晚模板'), onPressed: () => appendTemplate('早餐：\n午餐：\n晚餐：')),
+                    ActionChip(visualDensity: const VisualDensity(horizontal: -4, vertical: -4), label: const Text('上/下/晚模板'), onPressed: () => appendTemplate('上午：\n下午：\n晚上：')),
                   ],
                 ),
                 const SizedBox(height: 8),
@@ -2358,7 +2273,6 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  // ==================== 日程关联规划：采用类似查找页标题组的分级折叠与自动换行格式 ====================
   Future<void> _addOrEditSchedDialog({Map<String, dynamic>? editSched, int? parentId, String? parentTitle}) async {
     final mms = await widget.db.query('mindmaps', orderBy: 'id DESC');
     if (!mounted) return;
@@ -2368,7 +2282,6 @@ class _TodayPageState extends State<TodayPage> {
     String selPlan = isEdit ? ('${editSched['plan_info'] ?? ''}') : '';
     final Set<String> expandedPaths = {};
 
-    // 默认展开第一层根节点及当前已选路径的父级
     for (final m in mms) {
       try {
         final root = jsonDecode(m['root_json'] as String) as Map<String, dynamic>;
