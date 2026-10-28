@@ -675,7 +675,7 @@ class _FamilyPageState extends State<FamilyPage> {
                       child: Row(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          Icon(Icons.Upload_file, size: 18, color: hovering ? Colors.white : const Color(0xFF4F46E5)),
+                          Icon(Icons.upload_file, size: 18, color: hovering ? Colors.white : const Color(0xFF4F46E5)),
                           const SizedBox(width: 6),
                           Text(
                             '⬆️ 拖到此处松手：脱出原层级，独立成为「顶层大标题」',
