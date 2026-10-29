@@ -20,7 +20,7 @@ void main() async {
   runApp(DailyTrackerApp(db: db));
 }
 
-// ==================== 数据库层 (SQLite v8 支持热重载恢复、WAL 安全合并与排序) ====================
+// ==================== 数据库层 (支持热重载恢复、WAL 安全合并与版本升级) ====================
 class AppDatabase {
   static final AppDatabase instance = AppDatabase._();
   static Database? _db;
@@ -32,7 +32,6 @@ class AppDatabase {
     return _db!;
   }
 
-  /// 当遇到二进制 .db 备份包时调用：安全关闭当前数据库连接，并彻底清理残留的 -wal / -shm 伴生文件
   static Future<void> closeForRestore() async {
     final dir = await getApplicationDocumentsDirectory();
     final dbPath = p.join(dir.path, 'daily_tracker.db');
@@ -328,10 +327,10 @@ class _TodayPageState extends State<TodayPage> {
     await AppDatabase.setUiState(widget.db, 'today_ui_state', data);
   }
 
-  Future<Map<String, dynamic>> _load() async {
+  Future> _load() async {
     if (!_uiLoaded) await _restoreTodayUiState();
     final db = await AppDatabase.instance.database;
-    final items = List<Map<String, dynamic>>.from(
+    final items = List>.from(
       await db.query('status_items', orderBy: 'sort_order ASC, id ASC'),
     );
     final disp = <int, Map<String, dynamic>>{};
@@ -351,7 +350,7 @@ class _TodayPageState extends State<TodayPage> {
         if (prev.isNotEmpty) disp[id] = {'recordId': null, 'value': prev.first['value'], 'images': <String>[], 'isInherited': true, 'inheritedFrom': prev.first['date']};
       }
     }
-    final scheds = List<Map<String, dynamic>>.from(
+    final scheds = List>.from(
       await db.query('schedule_items', orderBy: 'sort_order ASC, id ASC'),
     );
     final doneMap = <int, bool>{};
@@ -411,7 +410,7 @@ class _TodayPageState extends State<TodayPage> {
     });
   }
 
-  bool _isSchedDescendant(int dragId, int targetId, List<Map<String, dynamic>> all) {
+  bool _isSchedDescendant(int dragId, int targetId, List> all) {
     if (dragId == targetId) return true;
     int? cur = targetId;
     final visited = <int>{};
@@ -428,7 +427,7 @@ class _TodayPageState extends State<TodayPage> {
     required int dragId,
     required int targetId,
     required String zone,
-    required List<Map<String, dynamic>> allScheds,
+    required List> allScheds,
   }) async {
     if (_isSchedDescendant(dragId, targetId, allScheds)) return;
     final db = await AppDatabase.instance.database;
@@ -468,11 +467,11 @@ class _TodayPageState extends State<TodayPage> {
   Future<void> _toggleScheduleCheckbox(
     int sid,
     bool targetDone,
-    List<Map<String, dynamic>> allScheds,
+    List> allScheds,
     Map<int, bool> doneMap,
   ) async {
     final db = await AppDatabase.instance.database;
-    List<Map<String, dynamic>> childrenOf(int pid) =>
+    List> childrenOf(int pid) =>
         allScheds.where((s) => s['parent_id'] == pid).toList();
 
     doneMap[sid] = targetDone;
@@ -1086,13 +1085,13 @@ class _TodayPageState extends State<TodayPage> {
           )
         ],
       ),
-      body: FutureBuilder<Map<String, dynamic>>(
+      body: FutureBuilder>(
         future: _load(),
         builder: (ctx, snap) {
           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
-          final items = snap.data!['items'] as List<Map<String, dynamic>>;
+          final items = snap.data!['items'] as List>;
           final disp = snap.data!['disp'] as Map<int, Map<String, dynamic>>;
-          final scheds = snap.data!['scheds'] as List<Map<String, dynamic>>;
+          final scheds = snap.data!['scheds'] as List>;
           final doneMap = snap.data!['done'] as Map<int, bool>;
 
           for (final s in scheds) {
@@ -1329,9 +1328,9 @@ class _TodayPageState extends State<TodayPage> {
 
   Widget _buildSummaryCard(
     int dragIndex,
-    List<Map<String, dynamic>> items,
+    List> items,
     Map<int, Map<String, dynamic>> disp,
-    List<Map<String, dynamic>> scheds,
+    List> scheds,
     Map<int, bool> doneMap,
   ) {
     final copyLines = <String>[];
@@ -1371,7 +1370,7 @@ class _TodayPageState extends State<TodayPage> {
       final pid = s['parent_id'] as int?;
       return pid == null || !validIds.contains(pid);
     }).toList();
-    List<Map<String, dynamic>> childrenOf(int pid) =>
+    List> childrenOf(int pid) =>
         scheds.where((s) => s['parent_id'] == pid).toList();
 
     List<({String text, int depth, bool isGroupHeaderOnly})> buildHierarchicalList(bool targetDone) {
@@ -1854,14 +1853,14 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  Widget _buildScheduleTree(List<Map<String, dynamic>> allScheds, Map<int, bool> doneMap) {
+  Widget _buildScheduleTree(List> allScheds, Map<int, bool> doneMap) {
     final validIds = allScheds.map((s) => s['id'] as int).toSet();
     final roots = allScheds.where((s) {
       final pid = s['parent_id'] as int?;
       return pid == null || !validIds.contains(pid);
     }).toList();
 
-    List<Map<String, dynamic>> childrenOf(int pid) {
+    List> childrenOf(int pid) {
       return allScheds.where((s) => s['parent_id'] == pid).toList();
     }
 
@@ -2352,7 +2351,7 @@ class _TodayPageState extends State<TodayPage> {
             final t = (node['text'] as String? ?? '').trim();
             if (t.isEmpty) return const SizedBox.shrink();
             final path = currentPath.isEmpty ? t : '$currentPath > $t';
-            final children = ((node['children'] as List?)?.cast<Map<String, dynamic>>() ?? []);
+            final children = ((node['children'] as List?)?.cast>() ?? []);
             final hasChildren = children.isNotEmpty;
             final isExpanded = expandedPaths.contains(path);
             final isSelected = selPlan == path;
