@@ -32,7 +32,7 @@ class AppDatabase {
     return _db!;
   }
 
-  /// 导入恢复前调用：安全关闭当前数据库连接，并彻底清理残留的 -wal / -shm 伴生文件
+  /// 当遇到二进制 .db 备份包时调用：安全关闭当前数据库连接，并彻底清理残留的 -wal / -shm 伴生文件
   static Future<void> closeForRestore() async {
     final dir = await getApplicationDocumentsDirectory();
     final dbPath = p.join(dir.path, 'daily_tracker.db');
