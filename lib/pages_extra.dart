@@ -5,13 +5,14 @@ import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:intl/intl.dart' hide TextDirection;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:sqflite/sqflite.dart';
 import 'main.dart';
 
-// ==================== 1. 查找与备份页面 (支持 WAL 全量备份与免重启热恢复 + 标题组上下拖拽) ====================
+// ==================== 1. 查找与备份页面 (原生支持 data.json + images 备份恢复 + 标题组上下拖拽) ====================
 class SearchPage extends StatefulWidget {
   final Database db;
   const SearchPage({super.key, required this.db});
@@ -23,6 +24,19 @@ class _SearchPageState extends State<SearchPage> {
   String _kw = '';
   bool _busy = false;
   final TextEditingController _searchCtrl = TextEditingController();
+
+  static const List<String> _allTables = [
+    'status_items',
+    'status_records',
+    'status_images',
+    'schedule_items',
+    'schedule_records',
+    'modules',
+    'module_entries',
+    'module_groups',
+    'mindmaps',
+    'ui_states',
+  ];
 
   @override
   void dispose() {
@@ -67,26 +81,31 @@ class _SearchPageState extends State<SearchPage> {
     return {'groups': groups, 'hits': hits};
   }
 
+  /// 导出备份：统一采用 data.json + images/ 结构（同时附带 daily_tracker.db 双保险）
   Future<void> _exportBackup() async {
     setState(() => _busy = true);
     try {
       final activeDb = await AppDatabase.instance.database;
-      // 强制将 WAL 预写日志中的最新数据全部刷入主 .db 文件，确保导出的数据库 100% 完整
-      try {
-        await activeDb.rawQuery('PRAGMA wal_checkpoint(FULL)');
-      } catch (_) {}
+      final dataMap = <String, dynamic>{};
+      for (final table in _allTables) {
+        try {
+          dataMap[table] = await activeDb.query(table);
+        } catch (_) {}
+      }
 
       final appDir = await getApplicationDocumentsDirectory();
-      final dbPath = p.join(appDir.path, 'daily_tracker.db');
       final tmpDir = await getTemporaryDirectory();
-      final zipPath = p.join(tmpDir.path, 'daily_tracker_backup.zip');
+      final ts = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
+      final zipPath = p.join(tmpDir.path, '每日记录_备份_$ts.zip');
       if (await File(zipPath).exists()) await File(zipPath).delete();
+
+      final jsonTempFile = File(p.join(tmpDir.path, 'data.json'));
+      await jsonTempFile.writeAsString(jsonEncode(dataMap), flush: true);
 
       final encoder = ZipFileEncoder();
       encoder.create(zipPath);
-      if (await File(dbPath).exists()) {
-        encoder.addFile(File(dbPath), 'daily_tracker.db');
-      }
+      encoder.addFile(jsonTempFile, 'data.json');
+
       final imgDir = Directory(p.join(appDir.path, 'images'));
       if (await imgDir.exists()) {
         await for (final entity in imgDir.list(recursive: true)) {
@@ -105,6 +124,58 @@ class _SearchPageState extends State<SearchPage> {
     }
   }
 
+  /// 将解析出的 data.json 映射安全写入当前 SQLite 数据库（自动校验列名兼容跨版本结构）
+  Future<void> _restoreFromJsonMap(Database db, Map<String, dynamic> rootMap) async {
+    // 兼容可能外层包了一层 data / tables 节点或直接以表名为顶层 Key 的结构
+    Map<String, dynamic> tablesMap = rootMap;
+    if (!rootMap.keys.any((k) => _allTables.contains(k))) {
+      for (final wrapKey in ['data', 'tables', 'db', 'database']) {
+        if (rootMap[wrapKey] is Map) {
+          tablesMap = Map<String, dynamic>.from(rootMap[wrapKey] as Map);
+          break;
+        }
+      }
+    }
+
+    await db.transaction((txn) async {
+      for (final table in _allTables) {
+        final rawList = tablesMap[table];
+        if (rawList is! List) continue;
+
+        final colInfo = await txn.rawQuery('PRAGMA table_info($table)');
+        final validCols = colInfo.map((c) => '${c['name']}').toSet();
+        if (validCols.isEmpty) continue;
+
+        await txn.delete(table);
+
+        for (final item in rawList) {
+          if (item is! Map) continue;
+          final filteredRow = <String, dynamic>{};
+          for (final entry in item.entries) {
+            final k = '${entry.key}';
+            if (validCols.contains(k)) {
+              filteredRow[k] = entry.value;
+            }
+          }
+          // 若旧版家庭模块顶级标题未包含 is_member 字段，智能标记顶级短名为成员卡片
+          if (table == 'modules' &&
+              validCols.contains('is_member') &&
+              !filteredRow.containsKey('is_member')) {
+            final pid = filteredRow['parent_id'];
+            final t = '${filteredRow['title'] ?? ''}'.trim();
+            if (pid == null && t.isNotEmpty && t.length <= 4 && !t.contains('宠物')) {
+              filteredRow['is_member'] = 1;
+            }
+          }
+          if (filteredRow.isNotEmpty) {
+            await txn.insert(table, filteredRow, conflictAlgorithm: ConflictAlgorithm.replace);
+          }
+        }
+      }
+    });
+  }
+
+  /// 导入恢复：原生支持读取 zip 内的 data.json + images/，同时兼容单个 .json 或 .db 文件
   Future<void> _importBackup() async {
     final res = await FilePicker.platform.pickFiles(type: FileType.any);
     if (res == null || res.files.single.path == null) return;
@@ -114,51 +185,71 @@ class _SearchPageState extends State<SearchPage> {
       final bytes = await File(pickedPath).readAsBytes();
       final appDir = await getApplicationDocumentsDirectory();
 
-      // 1. 先安全关闭当前数据库连接，并彻底删除残留的 -wal / -shm 伴生文件，防止旧内存数据回滚覆盖
-      await AppDatabase.closeForRestore();
+      String? jsonContent;
+      List<int>? rawDbBytes;
+      int restoredImages = 0;
 
-      bool restoredDb = false;
-
-      // 2. 支持直接选择 .zip 备份包或单个 .db 数据库文件
-      if (pickedPath.toLowerCase().endsWith('.db')) {
-        await File(p.join(appDir.path, 'daily_tracker.db')).writeAsBytes(bytes, flush: true);
-        restoredDb = true;
+      final lowerName = pickedPath.toLowerCase();
+      if (lowerName.endsWith('.json')) {
+        jsonContent = utf8.decode(bytes, allowMalformed: true);
+      } else if (lowerName.endsWith('.db')) {
+        rawDbBytes = bytes;
       } else {
         final archive = ZipDecoder().decodeBytes(bytes);
         for (final file in archive) {
           if (!file.isFile) continue;
           final cleanName = file.name.replaceAll('\\', '/');
-          if (cleanName.endsWith('-wal') || cleanName.endsWith('-shm') || cleanName.endsWith('-journal')) {
-            continue;
+          final base = p.basename(cleanName).toLowerCase();
+
+          if (base == 'data.json' || cleanName.toLowerCase().endsWith('.json')) {
+            jsonContent = utf8.decode(file.content as List<int>, allowMalformed: true);
+          } else if (base == 'daily_tracker.db' || cleanName.toLowerCase().endsWith('.db')) {
+            rawDbBytes = file.content as List<int>;
+          } else if (!cleanName.endsWith('-wal') &&
+              !cleanName.endsWith('-shm') &&
+              !cleanName.endsWith('-journal')) {
+            // 还原图片文件到 images/...
+            String relPath = cleanName;
+            final imgIdx = cleanName.indexOf('images/');
+            if (imgIdx >= 0) {
+              relPath = cleanName.substring(imgIdx);
+            }
+            final outFile = File(p.join(appDir.path, relPath));
+            await outFile.parent.create(recursive: true);
+            await outFile.writeAsBytes(file.content as List<int>, flush: true);
+            restoredImages++;
           }
-          final String outPath;
-          if (p.basename(cleanName) == 'daily_tracker.db' || cleanName.endsWith('.db')) {
-            outPath = p.join(appDir.path, 'daily_tracker.db');
-            restoredDb = true;
-          } else {
-            outPath = p.join(appDir.path, cleanName);
-          }
-          final outFile = File(outPath);
-          await outFile.parent.create(recursive: true);
-          await outFile.writeAsBytes(file.content as List<int>, flush: true);
         }
       }
 
-      // 3. 重新建立数据库连接并即时统计恢复的数据量
+      bool restoredOk = false;
+      if (jsonContent != null && jsonContent.trim().isNotEmpty) {
+        final decoded = jsonDecode(jsonContent) as Map<String, dynamic>;
+        final activeDb = await AppDatabase.instance.database;
+        await _restoreFromJsonMap(activeDb, decoded);
+        restoredOk = true;
+      } else if (rawDbBytes != null) {
+        await AppDatabase.closeForRestore();
+        await File(p.join(appDir.path, 'daily_tracker.db')).writeAsBytes(rawDbBytes, flush: true);
+        restoredOk = true;
+      }
+
       final newDb = await AppDatabase.instance.database;
-      final statusCnt = Sqflite.firstIntValue(await newDb.rawQuery('SELECT COUNT(*) FROM status_items')) ?? 0;
+      final recCnt = Sqflite.firstIntValue(await newDb.rawQuery('SELECT COUNT(*) FROM status_records')) ?? 0;
       final modCnt = Sqflite.firstIntValue(await newDb.rawQuery('SELECT COUNT(*) FROM modules')) ?? 0;
       final schedCnt = Sqflite.firstIntValue(await newDb.rawQuery('SELECT COUNT(*) FROM schedule_items')) ?? 0;
 
       if (mounted) {
-        if (!restoredDb) {
+        if (!restoredOk) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('⚠️ 所选文件中未找到 daily_tracker.db 备份数据，请确认选择的是正确的 zip 备份包！')),
+            const SnackBar(content: Text('⚠️ 未能在所选压缩包中识别到 data.json 备份数据！')),
           );
         } else {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('🎉 恢复成功！已即时加载：$statusCnt 项状态、$modCnt 个家庭标题、$schedCnt 项日程（无需重启）'),
+              content: Text(
+                '🎉 恢复成功！已即时导入：$recCnt 条状态记录、$modCnt 个家庭标题、$schedCnt 项日程、$restoredImages 张图片！',
+              ),
               duration: const Duration(seconds: 4),
             ),
           );
