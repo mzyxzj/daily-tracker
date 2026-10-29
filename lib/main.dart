@@ -20,12 +20,40 @@ void main() async {
   runApp(DailyTrackerApp(db: db));
 }
 
-// ==================== 数据库层 (SQLite v8 支持标题组拖拽排序与成员标识) ====================
+// ==================== 数据库层 (SQLite v8 支持热重载恢复、WAL 安全合并与排序) ====================
 class AppDatabase {
   static final AppDatabase instance = AppDatabase._();
   static Database? _db;
   AppDatabase._();
-  Future<Database> get database async => _db ??= await _init();
+
+  Future<Database> get database async {
+    if (_db != null && _db!.isOpen) return _db!;
+    _db = await _init();
+    return _db!;
+  }
+
+  /// 导入恢复前调用：安全关闭当前数据库连接，并彻底清理残留的 -wal / -shm 伴生文件
+  static Future<void> closeForRestore() async {
+    final dir = await getApplicationDocumentsDirectory();
+    final dbPath = p.join(dir.path, 'daily_tracker.db');
+    if (_db != null) {
+      try {
+        if (_db!.isOpen) await _db!.close();
+      } catch (_) {}
+      _db = null;
+    }
+    try {
+      await deleteDatabase(dbPath);
+    } catch (_) {}
+    for (final ext in ['', '-wal', '-shm', '-journal']) {
+      final f = File('$dbPath$ext');
+      if (await f.exists()) {
+        try {
+          await f.delete();
+        } catch (_) {}
+      }
+    }
+  }
 
   Future<Database> _init() async {
     final dir = await getApplicationDocumentsDirectory();
@@ -74,7 +102,8 @@ class AppDatabase {
 
   static Future<String?> getUiState(Database db, String key) async {
     try {
-      final rows = await db.query('ui_states', where: 'state_key = ?', whereArgs: [key]);
+      final activeDb = await instance.database;
+      final rows = await activeDb.query('ui_states', where: 'state_key = ?', whereArgs: [key]);
       if (rows.isNotEmpty) return rows.first['state_val'] as String;
     } catch (_) {}
     return null;
@@ -82,7 +111,8 @@ class AppDatabase {
 
   static Future<void> setUiState(Database db, String key, String val) async {
     try {
-      await db.insert('ui_states', {'state_key': key, 'state_val': val}, conflictAlgorithm: ConflictAlgorithm.replace);
+      final activeDb = await instance.database;
+      await activeDb.insert('ui_states', {'state_key': key, 'state_val': val}, conflictAlgorithm: ConflictAlgorithm.replace);
     } catch (_) {}
   }
 }
@@ -202,20 +232,31 @@ class _MainShellState extends State<MainShell> {
   int _idx = 2;
   @override
   Widget build(BuildContext context) {
-    final pages = [SearchPage(db: widget.db), FamilyPage(db: widget.db), TodayPage(db: widget.db), PlanPage(db: widget.db)];
-    return Scaffold(
-      body: pages[_idx],
-      bottomNavigationBar: NavigationBar(
-        height: 62,
-        selectedIndex: _idx,
-        onDestinationSelected: (i) => setState(() => _idx = i),
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.search), label: '查找'),
-          NavigationDestination(icon: Icon(Icons.home_outlined), label: '家庭'),
-          NavigationDestination(icon: Icon(Icons.calendar_today), label: '今日'),
-          NavigationDestination(icon: Icon(Icons.account_tree_outlined), label: '规划'),
-        ],
-      ),
+    return FutureBuilder<Database>(
+      future: AppDatabase.instance.database,
+      builder: (ctx, snap) {
+        final activeDb = snap.data ?? widget.db;
+        final pages = [
+          SearchPage(db: activeDb),
+          FamilyPage(db: activeDb),
+          TodayPage(db: activeDb),
+          PlanPage(db: activeDb),
+        ];
+        return Scaffold(
+          body: pages[_idx],
+          bottomNavigationBar: NavigationBar(
+            height: 62,
+            selectedIndex: _idx,
+            onDestinationSelected: (i) => setState(() => _idx = i),
+            destinations: const [
+              NavigationDestination(icon: Icon(Icons.search), label: '查找'),
+              NavigationDestination(icon: Icon(Icons.home_outlined), label: '家庭'),
+              NavigationDestination(icon: Icon(Icons.calendar_today), label: '今日'),
+              NavigationDestination(icon: Icon(Icons.account_tree_outlined), label: '规划'),
+            ],
+          ),
+        );
+      },
     );
   }
 }
@@ -289,8 +330,9 @@ class _TodayPageState extends State<TodayPage> {
 
   Future<Map<String, dynamic>> _load() async {
     if (!_uiLoaded) await _restoreTodayUiState();
+    final db = await AppDatabase.instance.database;
     final items = List<Map<String, dynamic>>.from(
-      await widget.db.query('status_items', orderBy: 'sort_order ASC, id ASC'),
+      await db.query('status_items', orderBy: 'sort_order ASC, id ASC'),
     );
     final disp = <int, Map<String, dynamic>>{};
     final appDir = await getApplicationDocumentsDirectory();
@@ -299,23 +341,23 @@ class _TodayPageState extends State<TodayPage> {
       final id = it['id'] as int, type = it['type'] as String;
       final allowInherit = (it['allow_inherit'] as int? ?? 1) == 1;
 
-      final todayRecs = await widget.db.query('status_records', where: 'item_id = ? AND date = ?', whereArgs: [id, _date]);
+      final todayRecs = await db.query('status_records', where: 'item_id = ? AND date = ?', whereArgs: [id, _date]);
       if (todayRecs.isNotEmpty) {
         final r = todayRecs.first;
-        final imgs = await widget.db.query('status_images', where: 'record_id = ?', whereArgs: [r['id']], orderBy: 'sort_order ASC');
+        final imgs = await db.query('status_images', where: 'record_id = ?', whereArgs: [r['id']], orderBy: 'sort_order ASC');
         disp[id] = {'recordId': r['id'], 'value': r['value'], 'images': imgs.map((i) => p.join(appDir.path, i['file_path'] as String)).toList(), 'isInherited': false};
       } else if (type != 'image' && allowInherit) {
-        final prev = await widget.db.query('status_records', where: 'item_id = ? AND date < ? AND value != ""', whereArgs: [id, _date], orderBy: 'date DESC', limit: 1);
+        final prev = await db.query('status_records', where: 'item_id = ? AND date < ? AND value != ""', whereArgs: [id, _date], orderBy: 'date DESC', limit: 1);
         if (prev.isNotEmpty) disp[id] = {'recordId': null, 'value': prev.first['value'], 'images': <String>[], 'isInherited': true, 'inheritedFrom': prev.first['date']};
       }
     }
     final scheds = List<Map<String, dynamic>>.from(
-      await widget.db.query('schedule_items', orderBy: 'sort_order ASC, id ASC'),
+      await db.query('schedule_items', orderBy: 'sort_order ASC, id ASC'),
     );
     final doneMap = <int, bool>{};
     for (final s in scheds) {
       final sid = s['id'] as int;
-      final r = await widget.db.query('schedule_records', where: 'item_id = ? AND date = ?', whereArgs: [sid, _date]);
+      final r = await db.query('schedule_records', where: 'item_id = ? AND date = ?', whereArgs: [sid, _date]);
       doneMap[sid] = r.isNotEmpty && (r.first['done'] as int) == 1;
     }
     return {'items': items, 'disp': disp, 'scheds': scheds, 'done': doneMap};
@@ -353,14 +395,15 @@ class _TodayPageState extends State<TodayPage> {
   }
 
   Future<int> _ensureStatusItem(String name, String type) async {
-    final existing = await widget.db.query('status_items', where: 'name = ?', whereArgs: [name]);
+    final db = await AppDatabase.instance.database;
+    final existing = await db.query('status_items', where: 'name = ?', whereArgs: [name]);
     if (existing.isNotEmpty) return existing.first['id'] as int;
     if (name == '状态与异状' || name == '状态和异状') {
-      final alt = await widget.db.query('status_items', where: 'name IN (?, ?)', whereArgs: ['状态与异状', '状态和异状']);
+      final alt = await db.query('status_items', where: 'name IN (?, ?)', whereArgs: ['状态与异状', '状态和异状']);
       if (alt.isNotEmpty) return alt.first['id'] as int;
     }
-    final all = await widget.db.query('status_items');
-    return await widget.db.insert('status_items', {
+    final all = await db.query('status_items');
+    return await db.insert('status_items', {
       'name': name,
       'type': type,
       'allow_inherit': 1,
@@ -368,7 +411,6 @@ class _TodayPageState extends State<TodayPage> {
     });
   }
 
-  // ==================== 日程打卡：参照家庭模块实现父子拖拽切换与排序 ====================
   bool _isSchedDescendant(int dragId, int targetId, List<Map<String, dynamic>> all) {
     if (dragId == targetId) return true;
     int? cur = targetId;
@@ -389,11 +431,12 @@ class _TodayPageState extends State<TodayPage> {
     required List<Map<String, dynamic>> allScheds,
   }) async {
     if (_isSchedDescendant(dragId, targetId, allScheds)) return;
+    final db = await AppDatabase.instance.database;
     final target = allScheds.firstWhere((m) => m['id'] == targetId);
 
     if (zone == 'inside') {
       final siblings = allScheds.where((m) => m['parent_id'] == targetId && m['id'] != dragId).toList();
-      await widget.db.update(
+      await db.update(
         'schedule_items',
         {'parent_id': targetId, 'sort_order': siblings.length},
         where: 'id = ?',
@@ -411,7 +454,7 @@ class _TodayPageState extends State<TodayPage> {
       siblings.insert(insertIdx, dragMap);
 
       for (int i = 0; i < siblings.length; i++) {
-        await widget.db.update(
+        await db.update(
           'schedule_items',
           {'parent_id': newParentId, 'sort_order': i},
           where: 'id = ?',
@@ -422,18 +465,18 @@ class _TodayPageState extends State<TodayPage> {
     if (mounted) setState(() {});
   }
 
-  // ==================== 日程打卡：父子双向勾选自动同步 ====================
   Future<void> _toggleScheduleCheckbox(
     int sid,
     bool targetDone,
     List<Map<String, dynamic>> allScheds,
     Map<int, bool> doneMap,
   ) async {
+    final db = await AppDatabase.instance.database;
     List<Map<String, dynamic>> childrenOf(int pid) =>
         allScheds.where((s) => s['parent_id'] == pid).toList();
 
     doneMap[sid] = targetDone;
-    await widget.db.insert(
+    await db.insert(
       'schedule_records',
       {'item_id': sid, 'date': _date, 'done': targetDone ? 1 : 0},
       conflictAlgorithm: ConflictAlgorithm.replace,
@@ -443,7 +486,7 @@ class _TodayPageState extends State<TodayPage> {
       for (final sub in childrenOf(pId)) {
         final subId = sub['id'] as int;
         doneMap[subId] = d;
-        await widget.db.insert(
+        await db.insert(
           'schedule_records',
           {'item_id': subId, 'date': _date, 'done': d ? 1 : 0},
           conflictAlgorithm: ConflictAlgorithm.replace,
@@ -462,7 +505,7 @@ class _TodayPageState extends State<TodayPage> {
       if (siblings.isNotEmpty) {
         final allSiblingsDone = siblings.every((c) => doneMap[c['id'] as int] == true);
         doneMap[pId] = allSiblingsDone;
-        await widget.db.insert(
+        await db.insert(
           'schedule_records',
           {'item_id': pId, 'date': _date, 'done': allSiblingsDone ? 1 : 0},
           conflictAlgorithm: ConflictAlgorithm.replace,
@@ -475,7 +518,6 @@ class _TodayPageState extends State<TodayPage> {
     if (mounted) setState(() {});
   }
 
-  // ==================== 精简版 Gemini 分析弹窗（移除直连，仅保留复制并拉起外部 Gemini） ====================
   Future<void> _openGeminiAnalyzerSheet(String summaryText) async {
     final rawCfg = await AppDatabase.getUiState(widget.db, 'gemini_ai_config');
     Map<String, dynamic> cfg = {
@@ -699,8 +741,6 @@ class _TodayPageState extends State<TodayPage> {
                   onChanged: (_) => saveCurrentConfig(),
                 ),
                 const SizedBox(height: 12),
-
-                // 仅保留「复制并拉起外部 Gemini」通栏主按钮
                 SizedBox(
                   width: double.infinity,
                   child: FilledButton.icon(
@@ -774,6 +814,7 @@ class _TodayPageState extends State<TodayPage> {
                         return;
                       }
                       await saveCurrentConfig();
+                      final db = await AppDatabase.instance.database;
                       final targetName = targetFieldCtrl.text.trim().isEmpty ? 'AI 深度异状分析' : targetFieldCtrl.text.trim();
                       final cleanedLines = rawAi
                           .split('\n')
@@ -782,8 +823,8 @@ class _TodayPageState extends State<TodayPage> {
                           .toList();
 
                       final itemId = await _ensureStatusItem(targetName, 'text');
-                      await widget.db.update('status_items', {'allow_inherit': 0}, where: 'id = ?', whereArgs: [itemId]);
-                      await widget.db.insert(
+                      await db.update('status_items', {'allow_inherit': 0}, where: 'id = ?', whereArgs: [itemId]);
+                      await db.insert(
                         'status_records',
                         {'item_id': itemId, 'date': _date, 'value': cleanedLines.join('\n')},
                         conflictAlgorithm: ConflictAlgorithm.replace,
@@ -812,6 +853,7 @@ class _TodayPageState extends State<TodayPage> {
     try {
       final res = await FilePicker.platform.pickFiles(type: FileType.any);
       if (res == null || res.files.single.path == null) return;
+      final db = await AppDatabase.instance.database;
       final filePath = res.files.single.path!;
       final bytes = await File(filePath).readAsBytes();
       final archive = ZipDecoder().decodeBytes(bytes);
@@ -968,7 +1010,7 @@ class _TodayPageState extends State<TodayPage> {
           final itemId = await _ensureStatusItem(fName, isNumber ? 'number' : 'text');
           final joinedVal = fLines.join('\n');
 
-          await widget.db.insert(
+          await db.insert(
             'status_records',
             {'item_id': itemId, 'date': dKey, 'value': joinedVal},
             conflictAlgorithm: ConflictAlgorithm.replace,
@@ -978,19 +1020,19 @@ class _TodayPageState extends State<TodayPage> {
         final imgList = dateImages[dKey] ?? [];
         if (imgList.isNotEmpty) {
           final imgItemId = await _ensureStatusItem('今日图片', 'image');
-          await widget.db.insert(
+          await db.insert(
             'status_records',
             {'item_id': imgItemId, 'date': dKey, 'value': ''},
             conflictAlgorithm: ConflictAlgorithm.ignore,
           );
-          final recs = await widget.db.query('status_records', where: 'item_id = ? AND date = ?', whereArgs: [imgItemId, dKey]);
+          final recs = await db.query('status_records', where: 'item_id = ? AND date = ?', whereArgs: [imgItemId, dKey]);
           final recId = recs.first['id'] as int;
 
           final dFolder = dKey.replaceAll('-', '');
           final targetDir = Directory(p.join(appDir.path, 'images', 'status', dFolder));
           if (!await targetDir.exists()) await targetDir.create(recursive: true);
 
-          final existingImgs = await widget.db.query('status_images', where: 'record_id = ?', whereArgs: [recId]);
+          final existingImgs = await db.query('status_images', where: 'record_id = ?', whereArgs: [recId]);
           int nextSort = existingImgs.length;
 
           for (final mediaKey in imgList) {
@@ -999,7 +1041,7 @@ class _TodayPageState extends State<TodayPage> {
             final fileName = '${recId}_${nextSort}_${DateTime.now().millisecondsSinceEpoch}$ext';
             final relPath = p.join('images', 'status', dFolder, fileName);
             await File(p.join(appDir.path, relPath)).writeAsBytes(archFile.content as List<int>);
-            await widget.db.insert('status_images', {
+            await db.insert('status_images', {
               'record_id': recId,
               'file_path': relPath,
               'sort_order': nextSort++,
@@ -1111,10 +1153,11 @@ class _TodayPageState extends State<TodayPage> {
                             itemCount: items.length,
                             onReorder: (oldIdx, newIdx) async {
                               if (newIdx > oldIdx) newIdx -= 1;
+                              final db = await AppDatabase.instance.database;
                               final moved = items.removeAt(oldIdx);
                               items.insert(newIdx, moved);
                               for (int i = 0; i < items.length; i++) {
-                                await widget.db.update('status_items', {'sort_order': i}, where: 'id = ?', whereArgs: [items[i]['id']]);
+                                await db.update('status_items', {'sort_order': i}, where: 'id = ?', whereArgs: [items[i]['id']]);
                               }
                               setState(() {});
                             },
@@ -1284,7 +1327,6 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  // ==================== 今日状态摘要卡片（去掉复制按钮 + 已完成/未完成日程显示主次树形样式） ====================
   Widget _buildSummaryCard(
     int dragIndex,
     List<Map<String, dynamic>> items,
@@ -1332,7 +1374,6 @@ class _TodayPageState extends State<TodayPage> {
     List<Map<String, dynamic>> childrenOf(int pid) =>
         scheds.where((s) => s['parent_id'] == pid).toList();
 
-    // 构建带主次缩进层级的日程清单（若子日程属于该分组但父日程未勾选，也会自动带出父日程名称以明确主次从属）
     List<({String text, int depth, bool isGroupHeaderOnly})> buildHierarchicalList(bool targetDone) {
       final res = <({String text, int depth, bool isGroupHeaderOnly})>[];
       bool hasMatchInSubtree(Map<String, dynamic> node) {
@@ -1567,7 +1608,6 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  // 今日状态摘要中的主次树形日程块展示
   Widget _buildSummaryScheduleTreeBlock(
     String label,
     int count,
@@ -2014,6 +2054,7 @@ class _TodayPageState extends State<TodayPage> {
                         ),
                         InkWell(
                           onTap: () async {
+                            final db = await AppDatabase.instance.database;
                             final subIds = <int>[sid];
                             void collect(int p) {
                               for (final c in childrenOf(p)) {
@@ -2024,8 +2065,8 @@ class _TodayPageState extends State<TodayPage> {
                             }
                             collect(sid);
                             for (final did in subIds) {
-                              await widget.db.delete('schedule_records', where: 'item_id = ?', whereArgs: [did]);
-                              await widget.db.delete('schedule_items', where: 'id = ?', whereArgs: [did]);
+                              await db.delete('schedule_records', where: 'item_id = ?', whereArgs: [did]);
+                              await db.delete('schedule_items', where: 'id = ?', whereArgs: [did]);
                             }
                             setState(() {});
                           },
@@ -2105,8 +2146,9 @@ class _TodayPageState extends State<TodayPage> {
   Future<void> _pickImgs(int itemId) async {
     final picked = await ImagePicker().pickMultiImage(imageQuality: 100);
     if (picked.isEmpty) return;
-    await widget.db.insert('status_records', {'item_id': itemId, 'date': _date, 'value': ''}, conflictAlgorithm: ConflictAlgorithm.ignore);
-    final recs = await widget.db.query('status_records', where: 'item_id = ? AND date = ?', whereArgs: [itemId, _date]);
+    final db = await AppDatabase.instance.database;
+    await db.insert('status_records', {'item_id': itemId, 'date': _date, 'value': ''}, conflictAlgorithm: ConflictAlgorithm.ignore);
+    final recs = await db.query('status_records', where: 'item_id = ? AND date = ?', whereArgs: [itemId, _date]);
     final recId = recs.first['id'] as int;
     final appDir = await getApplicationDocumentsDirectory();
     final dStr = _date.replaceAll('-', '');
@@ -2115,7 +2157,7 @@ class _TodayPageState extends State<TodayPage> {
     for (int i = 0; i < picked.length; i++) {
       final rel = p.join('images', 'status', dStr, '${recId}_${i}_${DateTime.now().millisecondsSinceEpoch}.jpg');
       await File(picked[i].path).copy(p.join(appDir.path, rel));
-      await widget.db.insert('status_images', {'record_id': recId, 'file_path': rel, 'sort_order': i});
+      await db.insert('status_images', {'record_id': recId, 'file_path': rel, 'sort_order': i});
     }
     setState(() {});
   }
@@ -2130,8 +2172,9 @@ class _TodayPageState extends State<TodayPage> {
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
           FilledButton(
             onPressed: () async {
-              await widget.db.delete('status_records', where: 'item_id = ?', whereArgs: [id]);
-              await widget.db.delete('status_items', where: 'id = ?', whereArgs: [id]);
+              final db = await AppDatabase.instance.database;
+              await db.delete('status_records', where: 'item_id = ?', whereArgs: [id]);
+              await db.delete('status_items', where: 'id = ?', whereArgs: [id]);
               if (mounted) Navigator.pop(ctx);
               setState(() {});
             },
@@ -2188,11 +2231,12 @@ class _TodayPageState extends State<TodayPage> {
               onPressed: () async {
                 final txt = ctrl.text.trim();
                 if (txt.isEmpty) return;
+                final db = await AppDatabase.instance.database;
                 if (isEdit) {
-                  await widget.db.update('status_items', {'name': txt, 'type': type, 'allow_inherit': allowInherit ? 1 : 0}, where: 'id = ?', whereArgs: [editItem['id']]);
+                  await db.update('status_items', {'name': txt, 'type': type, 'allow_inherit': allowInherit ? 1 : 0}, where: 'id = ?', whereArgs: [editItem['id']]);
                 } else {
-                  final all = await widget.db.query('status_items');
-                  await widget.db.insert('status_items', {'name': txt, 'type': type, 'allow_inherit': allowInherit ? 1 : 0, 'sort_order': all.length});
+                  final all = await db.query('status_items');
+                  await db.insert('status_items', {'name': txt, 'type': type, 'allow_inherit': allowInherit ? 1 : 0, 'sort_order': all.length});
                 }
                 if (mounted) Navigator.pop(ctx);
                 setState(() {});
@@ -2262,7 +2306,8 @@ class _TodayPageState extends State<TodayPage> {
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
           FilledButton(
             onPressed: () async {
-              await widget.db.insert('status_records', {'item_id': id, 'date': _date, 'value': ctrl.text.trim()}, conflictAlgorithm: ConflictAlgorithm.replace);
+              final db = await AppDatabase.instance.database;
+              await db.insert('status_records', {'item_id': id, 'date': _date, 'value': ctrl.text.trim()}, conflictAlgorithm: ConflictAlgorithm.replace);
               if (mounted) Navigator.pop(ctx);
               setState(() {});
             },
@@ -2274,7 +2319,8 @@ class _TodayPageState extends State<TodayPage> {
   }
 
   Future<void> _addOrEditSchedDialog({Map<String, dynamic>? editSched, int? parentId, String? parentTitle}) async {
-    final mms = await widget.db.query('mindmaps', orderBy: 'id DESC');
+    final db = await AppDatabase.instance.database;
+    final mms = await db.query('mindmaps', orderBy: 'id DESC');
     if (!mounted) return;
 
     final isEdit = editSched != null;
@@ -2517,15 +2563,15 @@ class _TodayPageState extends State<TodayPage> {
                 onPressed: () async {
                   if (ctrl.text.trim().isEmpty) return;
                   if (isEdit) {
-                    await widget.db.update(
+                    await db.update(
                       'schedule_items',
                       {'title': ctrl.text.trim(), 'plan_info': selPlan},
                       where: 'id = ?',
                       whereArgs: [editSched['id']],
                     );
                   } else {
-                    final all = await widget.db.query('schedule_items');
-                    await widget.db.insert('schedule_items', {
+                    final all = await db.query('schedule_items');
+                    await db.insert('schedule_items', {
                       'title': ctrl.text.trim(),
                       'plan_info': selPlan,
                       'parent_id': parentId,
@@ -2549,7 +2595,8 @@ class _TodayPageState extends State<TodayPage> {
   }
 
   Future<void> _showTrend(int itemId, String name) async {
-    final recs = await widget.db.query('status_records', where: 'item_id = ? AND value != ""', whereArgs: [itemId], orderBy: 'date ASC');
+    final db = await AppDatabase.instance.database;
+    final recs = await db.query('status_records', where: 'item_id = ? AND value != ""', whereArgs: [itemId], orderBy: 'date ASC');
     final pts = <({String date, double value})>[];
     for (final r in recs) {
       final v = double.tryParse('${r['value']}');
