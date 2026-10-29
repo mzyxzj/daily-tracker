@@ -9,8 +9,9 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:sqflite/sqflite.dart';
+import 'main.dart';
 
-// ==================== 1. 查找与备份页面 ====================
+// ==================== 1. 查找与备份页面 (支持 WAL 全量备份与免重启热恢复 + 标题组上下拖拽) ====================
 class SearchPage extends StatefulWidget {
   final Database db;
   const SearchPage({super.key, required this.db});
@@ -30,33 +31,37 @@ class _SearchPageState extends State<SearchPage> {
   }
 
   Future<Map<String, dynamic>> _load() async {
+    final activeDb = await AppDatabase.instance.database;
     List<Map<String, dynamic>> groups;
     try {
       groups = List<Map<String, dynamic>>.from(
-        await widget.db.query('module_groups', orderBy: 'sort_order ASC, id DESC'),
+        await activeDb.query('module_groups', orderBy: 'sort_order ASC, id DESC'),
       );
     } catch (_) {
       groups = List<Map<String, dynamic>>.from(
-        await widget.db.query('module_groups', orderBy: 'id DESC'),
+        await activeDb.query('module_groups', orderBy: 'id DESC'),
       );
     }
     final hits = <Map<String, dynamic>>[];
     if (_kw.trim().isNotEmpty) {
       final like = '%${_kw.trim()}%';
-      for (final r in await widget.db.rawQuery(
+      for (final r in await activeDb.rawQuery(
         'SELECT r.date, r.value, i.name FROM status_records r JOIN status_items i ON r.item_id = i.id WHERE r.value LIKE ? OR i.name LIKE ? ORDER BY r.date DESC LIMIT 40',
         [like, like],
       )) {
         hits.add({'tag': '状态 · ${r['date']}', 'title': '${r['name']}', 'sub': '${r['value']}'});
       }
-      for (final m in await widget.db.query('modules', where: 'title LIKE ?', whereArgs: [like])) {
+      for (final m in await activeDb.query('modules', where: 'title LIKE ?', whereArgs: [like])) {
         hits.add({'tag': '家庭标题', 'title': '${m['title']}', 'sub': '可在家庭页查看详情'});
       }
-      for (final e in await widget.db.rawQuery(
+      for (final e in await activeDb.rawQuery(
         'SELECT e.seq, e.content, m.title FROM module_entries e JOIN modules m ON e.module_id = m.id WHERE e.content LIKE ? LIMIT 40',
         [like],
       )) {
         hits.add({'tag': '家庭 · ${e['title']}', 'title': '${e['seq']}. ${e['content']}', 'sub': ''});
+      }
+      for (final s in await activeDb.query('schedule_items', where: 'title LIKE ? OR plan_info LIKE ?', whereArgs: [like, like])) {
+        hits.add({'tag': '日程打卡', 'title': '${s['title']}', 'sub': '${s['plan_info'] ?? ''}'});
       }
     }
     return {'groups': groups, 'hits': hits};
@@ -65,6 +70,12 @@ class _SearchPageState extends State<SearchPage> {
   Future<void> _exportBackup() async {
     setState(() => _busy = true);
     try {
+      final activeDb = await AppDatabase.instance.database;
+      // 强制将 WAL 预写日志中的最新数据全部刷入主 .db 文件，确保导出的数据库 100% 完整
+      try {
+        await activeDb.rawQuery('PRAGMA wal_checkpoint(FULL)');
+      } catch (_) {}
+
       final appDir = await getApplicationDocumentsDirectory();
       final dbPath = p.join(appDir.path, 'daily_tracker.db');
       final tmpDir = await getTemporaryDirectory();
@@ -73,7 +84,9 @@ class _SearchPageState extends State<SearchPage> {
 
       final encoder = ZipFileEncoder();
       encoder.create(zipPath);
-      if (await File(dbPath).exists()) encoder.addFile(File(dbPath), 'daily_tracker.db');
+      if (await File(dbPath).exists()) {
+        encoder.addFile(File(dbPath), 'daily_tracker.db');
+      }
       final imgDir = Directory(p.join(appDir.path, 'images'));
       if (await imgDir.exists()) {
         await for (final entity in imgDir.list(recursive: true)) {
@@ -97,21 +110,63 @@ class _SearchPageState extends State<SearchPage> {
     if (res == null || res.files.single.path == null) return;
     setState(() => _busy = true);
     try {
-      final bytes = await File(res.files.single.path!).readAsBytes();
-      final archive = ZipDecoder().decodeBytes(bytes);
+      final pickedPath = res.files.single.path!;
+      final bytes = await File(pickedPath).readAsBytes();
       final appDir = await getApplicationDocumentsDirectory();
-      for (final file in archive) {
-        final outPath = p.join(appDir.path, file.name);
-        if (file.isFile) {
+
+      // 1. 先安全关闭当前数据库连接，并彻底删除残留的 -wal / -shm 伴生文件，防止旧内存数据回滚覆盖
+      await AppDatabase.closeForRestore();
+
+      bool restoredDb = false;
+
+      // 2. 支持直接选择 .zip 备份包或单个 .db 数据库文件
+      if (pickedPath.toLowerCase().endsWith('.db')) {
+        await File(p.join(appDir.path, 'daily_tracker.db')).writeAsBytes(bytes, flush: true);
+        restoredDb = true;
+      } else {
+        final archive = ZipDecoder().decodeBytes(bytes);
+        for (final file in archive) {
+          if (!file.isFile) continue;
+          final cleanName = file.name.replaceAll('\\', '/');
+          if (cleanName.endsWith('-wal') || cleanName.endsWith('-shm') || cleanName.endsWith('-journal')) {
+            continue;
+          }
+          final String outPath;
+          if (p.basename(cleanName) == 'daily_tracker.db' || cleanName.endsWith('.db')) {
+            outPath = p.join(appDir.path, 'daily_tracker.db');
+            restoredDb = true;
+          } else {
+            outPath = p.join(appDir.path, cleanName);
+          }
           final outFile = File(outPath);
           await outFile.parent.create(recursive: true);
-          await outFile.writeAsBytes(file.content as List<int>);
+          await outFile.writeAsBytes(file.content as List<int>, flush: true);
         }
       }
+
+      // 3. 重新建立数据库连接并即时统计恢复的数据量
+      final newDb = await AppDatabase.instance.database;
+      final statusCnt = Sqflite.firstIntValue(await newDb.rawQuery('SELECT COUNT(*) FROM status_items')) ?? 0;
+      final modCnt = Sqflite.firstIntValue(await newDb.rawQuery('SELECT COUNT(*) FROM modules')) ?? 0;
+      final schedCnt = Sqflite.firstIntValue(await newDb.rawQuery('SELECT COUNT(*) FROM schedule_items')) ?? 0;
+
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('🎉 导入成功！请彻底关闭并重启 App 以加载恢复的数据')),
-        );
+        if (!restoredDb) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('⚠️ 所选文件中未找到 daily_tracker.db 备份数据，请确认选择的是正确的 zip 备份包！')),
+          );
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('🎉 恢复成功！已即时加载：$statusCnt 项状态、$modCnt 个家庭标题、$schedCnt 项日程（无需重启）'),
+              duration: const Duration(seconds: 4),
+            ),
+          );
+          setState(() {});
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(builder: (_) => MainShell(db: newDb)),
+          );
+        }
       }
     } catch (e) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('恢复失败: $e')));
@@ -124,7 +179,8 @@ class _SearchPageState extends State<SearchPage> {
     required bool saveMode,
     Map<String, dynamic>? existingGroup,
   }) async {
-    final mods = await widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
+    final activeDb = await AppDatabase.instance.database;
+    final mods = await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC');
     if (!mounted) return;
 
     final isEdit = existingGroup != null;
@@ -294,10 +350,11 @@ class _SearchPageState extends State<SearchPage> {
               FilledButton(
                 onPressed: () async {
                   if (sel.isEmpty) return;
+                  final db = await AppDatabase.instance.database;
                   if (saveMode) {
                     if (nameCtrl.text.trim().isEmpty) return;
                     if (isEdit) {
-                      await widget.db.update(
+                      await db.update(
                         'module_groups',
                         {
                           'name': nameCtrl.text.trim(),
@@ -307,16 +364,16 @@ class _SearchPageState extends State<SearchPage> {
                         whereArgs: [existingGroup['id']],
                       );
                     } else {
-                      final allG = await widget.db.query('module_groups');
+                      final allG = await db.query('module_groups');
                       try {
-                        await widget.db.insert('module_groups', {
+                        await db.insert('module_groups', {
                           'name': nameCtrl.text.trim(),
                           'module_ids': jsonEncode(sel.toList()),
                           'sort_order': allG.length,
                           'created_at': DateTime.now().toIso8601String(),
                         });
                       } catch (_) {
-                        await widget.db.insert('module_groups', {
+                        await db.insert('module_groups', {
                           'name': nameCtrl.text.trim(),
                           'module_ids': jsonEncode(sel.toList()),
                           'created_at': DateTime.now().toIso8601String(),
@@ -340,7 +397,8 @@ class _SearchPageState extends State<SearchPage> {
   }
 
   Future<void> _viewMods(String title, List<int> ids) async {
-    final allMods = await widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
+    final activeDb = await AppDatabase.instance.database;
+    final allMods = await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC');
     final modMap = {for (final m in allMods) m['id'] as int: m};
 
     String fullPathOf(int id) {
@@ -358,7 +416,7 @@ class _SearchPageState extends State<SearchPage> {
     for (final m in allMods) {
       final id = m['id'] as int;
       if (!ids.contains(id)) continue;
-      final es = await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [id], orderBy: 'seq ASC');
+      final es = await activeDb.query('module_entries', where: 'module_id = ?', whereArgs: [id], orderBy: 'seq ASC');
       data.add({'title': fullPathOf(id), 'entries': es});
     }
 
@@ -530,11 +588,12 @@ class _SearchPageState extends State<SearchPage> {
                   itemCount: groups.length,
                   onReorder: (oldIdx, newIdx) async {
                     if (newIdx > oldIdx) newIdx -= 1;
+                    final activeDb = await AppDatabase.instance.database;
                     final moved = groups.removeAt(oldIdx);
                     groups.insert(newIdx, moved);
                     for (int i = 0; i < groups.length; i++) {
                       try {
-                        await widget.db.update(
+                        await activeDb.update(
                           'module_groups',
                           {'sort_order': i},
                           where: 'id = ?',
@@ -576,7 +635,8 @@ class _SearchPageState extends State<SearchPage> {
                               icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 20),
                               tooltip: '删除标题组',
                               onPressed: () async {
-                                await widget.db.delete('module_groups', where: 'id = ?', whereArgs: [g['id']]);
+                                final activeDb = await AppDatabase.instance.database;
+                                await activeDb.delete('module_groups', where: 'id = ?', whereArgs: [g['id']]);
                                 setState(() {});
                               },
                             ),
@@ -637,7 +697,7 @@ class _SearchPageState extends State<SearchPage> {
   }
 }
 
-// ==================== 2. 家庭模块页面 ====================
+// ==================== 2. 家庭模块页面 (6套差异炫彩高定成员卡片 + 加高防重叠 + 仅按序号拆分) ====================
 class _MemberPalette {
   final List<Color> bgGradient;
   final List<Color> avatarGradient;
@@ -736,7 +796,8 @@ class _FamilyPageState extends State<FamilyPage> {
 
   Future<void> _restoreFamilyUiState() async {
     try {
-      final rows = await widget.db.query('ui_states', where: 'state_key = ?', whereArgs: ['family_collapsed_ids']);
+      final activeDb = await AppDatabase.instance.database;
+      final rows = await activeDb.query('ui_states', where: 'state_key = ?', whereArgs: ['family_collapsed_ids']);
       if (rows.isNotEmpty) {
         final list = (jsonDecode(rows.first['state_val'] as String) as List).cast<int>();
         _collapsedIds
@@ -749,7 +810,8 @@ class _FamilyPageState extends State<FamilyPage> {
 
   Future<void> _saveFamilyUiState() async {
     try {
-      await widget.db.insert(
+      final activeDb = await AppDatabase.instance.database;
+      await activeDb.insert(
         'ui_states',
         {'state_key': 'family_collapsed_ids', 'state_val': jsonEncode(_collapsedIds.toList())},
         conflictAlgorithm: ConflictAlgorithm.replace,
@@ -759,8 +821,9 @@ class _FamilyPageState extends State<FamilyPage> {
 
   Future<Map<String, dynamic>> _loadFamilyData() async {
     if (!_uiLoaded) await _restoreFamilyUiState();
-    final mods = await widget.db.query('modules', orderBy: 'sort_order ASC, id ASC');
-    final entries = await widget.db.query('module_entries');
+    final activeDb = await AppDatabase.instance.database;
+    final mods = await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC');
+    final entries = await activeDb.query('module_entries');
     final entryCounts = <int, int>{};
     for (final e in entries) {
       final mid = e['module_id'] as int;
@@ -789,11 +852,12 @@ class _FamilyPageState extends State<FamilyPage> {
     required List<Map<String, dynamic>> allMods,
   }) async {
     if (_isDescendant(dragId, targetId, allMods)) return;
+    final activeDb = await AppDatabase.instance.database;
     final target = allMods.firstWhere((m) => m['id'] == targetId);
 
     if (zone == 'inside') {
       final siblings = allMods.where((m) => m['parent_id'] == targetId && m['id'] != dragId).toList();
-      await widget.db.update(
+      await activeDb.update(
         'modules',
         {'parent_id': targetId, 'sort_order': siblings.length},
         where: 'id = ?',
@@ -811,7 +875,7 @@ class _FamilyPageState extends State<FamilyPage> {
       siblings.insert(insertIdx, dragMap);
 
       for (int i = 0; i < siblings.length; i++) {
-        await widget.db.update(
+        await activeDb.update(
           'modules',
           {'parent_id': newParentId, 'sort_order': i},
           where: 'id = ?',
@@ -835,6 +899,7 @@ class _FamilyPageState extends State<FamilyPage> {
     try {
       final res = await FilePicker.platform.pickFiles(type: FileType.any);
       if (res == null || res.files.single.path == null) return;
+      final activeDb = await AppDatabase.instance.database;
       final filePath = res.files.single.path!;
       final bytes = await File(filePath).readAsBytes();
       final archive = ZipDecoder().decodeBytes(bytes);
@@ -973,20 +1038,20 @@ class _FamilyPageState extends State<FamilyPage> {
             .trim();
         final titleToSave = cleanTitle.isEmpty ? rawTitle.trim() : cleanTitle;
 
-        final existing = await widget.db.query(
+        final existing = await activeDb.query(
           'modules',
           where: parentId == null ? 'title = ? AND parent_id IS NULL' : 'title = ? AND parent_id = ?',
           whereArgs: parentId == null ? [titleToSave] : [titleToSave, parentId],
         );
         if (existing.isNotEmpty) return existing.first['id'] as int;
 
-        final siblings = await widget.db.query(
+        final siblings = await activeDb.query(
           'modules',
           where: parentId == null ? 'parent_id IS NULL' : 'parent_id = ?',
           whereArgs: parentId == null ? null : [parentId],
         );
         createdFolders++;
-        return await widget.db.insert('modules', {
+        return await activeDb.insert('modules', {
           'title': titleToSave,
           'parent_id': parentId,
           'is_member': (parentId == null && isTopLevel && titleToSave.length <= 6) ? 1 : 0,
@@ -1000,9 +1065,9 @@ class _FamilyPageState extends State<FamilyPage> {
             .replaceFirst(RegExp(r'^(\d+[\.、]|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳])\s*'), '')
             .trim();
         if (content.isEmpty) return;
-        final existing = await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [folderId]);
+        final existing = await activeDb.query('module_entries', where: 'module_id = ?', whereArgs: [folderId]);
         createdEntries++;
-        await widget.db.insert('module_entries', {
+        await activeDb.insert('module_entries', {
           'module_id': folderId,
           'seq': existing.length + 1,
           'content': content,
@@ -1076,6 +1141,7 @@ class _FamilyPageState extends State<FamilyPage> {
   }
 
   Future<void> _moduleEntriesDialog(Map<String, dynamic> mod, List<Map<String, dynamic>> allMods) async {
+    final activeDb = await AppDatabase.instance.database;
     final modId = mod['id'] as int;
     final modMap = {for (final m in allMods) m['id'] as int: m};
     String fullPathOf(int id) {
@@ -1091,7 +1157,7 @@ class _FamilyPageState extends State<FamilyPage> {
 
     final fullPath = fullPathOf(modId);
     final entries = List<Map<String, dynamic>>.from(
-      await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC'),
+      await activeDb.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC'),
     );
 
     if (!mounted) return;
@@ -1169,6 +1235,7 @@ class _FamilyPageState extends State<FamilyPage> {
                       onPressed: () async {
                         final raw = ctrl.text.trim();
                         if (raw.isEmpty) return;
+                        final db = await AppDatabase.instance.database;
 
                         final itemsToInsert = <String>[];
                         final seqRegex = RegExp(
@@ -1192,8 +1259,8 @@ class _FamilyPageState extends State<FamilyPage> {
                         }
 
                         for (final content in itemsToInsert) {
-                          final curAll = await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [modId]);
-                          await widget.db.insert('module_entries', {
+                          final curAll = await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId]);
+                          await db.insert('module_entries', {
                             'module_id': modId,
                             'seq': curAll.length + 1,
                             'content': content,
@@ -1205,7 +1272,7 @@ class _FamilyPageState extends State<FamilyPage> {
                         ctrl.clear();
                         entries
                           ..clear()
-                          ..addAll(await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC'));
+                          ..addAll(await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC'));
                         setS(() {});
                         setState(() {});
                       },
@@ -1222,11 +1289,12 @@ class _FamilyPageState extends State<FamilyPage> {
                           itemCount: entries.length,
                           onReorder: (oldIdx, newIdx) async {
                             if (newIdx > oldIdx) newIdx -= 1;
+                            final db = await AppDatabase.instance.database;
                             final moved = entries.removeAt(oldIdx);
                             entries.insert(newIdx, moved);
                             for (int i = 0; i < entries.length; i++) {
                               entries[i] = {...entries[i], 'seq': i + 1, 'sort_order': i};
-                              await widget.db.update(
+                              await db.update(
                                 'module_entries',
                                 {'seq': i + 1, 'sort_order': i},
                                 where: 'id = ?',
@@ -1261,9 +1329,10 @@ class _FamilyPageState extends State<FamilyPage> {
                                   Expanded(
                                     child: GestureDetector(
                                       onTap: () => _editEntryContentDialog(e, () async {
+                                        final db = await AppDatabase.instance.database;
                                         entries
                                           ..clear()
-                                          ..addAll(await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC'));
+                                          ..addAll(await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC'));
                                         setS(() {});
                                         setState(() {});
                                       }),
@@ -1274,14 +1343,15 @@ class _FamilyPageState extends State<FamilyPage> {
                                     visualDensity: VisualDensity.compact,
                                     icon: const Icon(Icons.close, size: 18, color: Colors.redAccent),
                                     onPressed: () async {
-                                      await widget.db.delete('module_entries', where: 'id = ?', whereArgs: [e['id']]);
-                                      final rem = await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC');
+                                      final db = await AppDatabase.instance.database;
+                                      await db.delete('module_entries', where: 'id = ?', whereArgs: [e['id']]);
+                                      final rem = await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC');
                                       for (int idx = 0; idx < rem.length; idx++) {
-                                        await widget.db.update('module_entries', {'seq': idx + 1, 'sort_order': idx}, where: 'id = ?', whereArgs: [rem[idx]['id']]);
+                                        await db.update('module_entries', {'seq': idx + 1, 'sort_order': idx}, where: 'id = ?', whereArgs: [rem[idx]['id']]);
                                       }
                                       entries
                                         ..clear()
-                                        ..addAll(await widget.db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC'));
+                                        ..addAll(await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC'));
                                       setS(() {});
                                       setState(() {});
                                     },
@@ -1325,7 +1395,8 @@ class _FamilyPageState extends State<FamilyPage> {
           FilledButton(
             onPressed: () async {
               if (ctrl.text.trim().isEmpty) return;
-              await widget.db.update(
+              final db = await AppDatabase.instance.database;
+              await db.update(
                 'module_entries',
                 {'content': ctrl.text.trim()},
                 where: 'id = ?',
@@ -1381,20 +1452,21 @@ class _FamilyPageState extends State<FamilyPage> {
               onPressed: () async {
                 final txt = ctrl.text.trim();
                 if (txt.isEmpty) return;
+                final db = await AppDatabase.instance.database;
                 if (isEdit) {
-                  await widget.db.update(
+                  await db.update(
                     'modules',
                     {'title': txt, 'is_member': isMember ? 1 : 0},
                     where: 'id = ?',
                     whereArgs: [editMod['id']],
                   );
                 } else {
-                  final siblings = await widget.db.query(
+                  final siblings = await db.query(
                     'modules',
                     where: parentId == null ? 'parent_id IS NULL' : 'parent_id = ?',
                     whereArgs: parentId == null ? null : [parentId],
                   );
-                  await widget.db.insert('modules', {
+                  await db.insert('modules', {
                     'title': txt,
                     'parent_id': parentId,
                     'is_member': isMember ? 1 : 0,
@@ -1678,6 +1750,7 @@ class _FamilyPageState extends State<FamilyPage> {
                                 ),
                                 InkWell(
                                   onTap: () async {
+                                    final db = await AppDatabase.instance.database;
                                     final subIds = <int>[id];
                                     void collect(int p) {
                                       for (final c in childrenOf(p)) {
@@ -1688,8 +1761,8 @@ class _FamilyPageState extends State<FamilyPage> {
                                     }
                                     collect(id);
                                     for (final did in subIds) {
-                                      await widget.db.delete('module_entries', where: 'module_id = ?', whereArgs: [did]);
-                                      await widget.db.delete('modules', where: 'id = ?', whereArgs: [did]);
+                                      await db.delete('module_entries', where: 'module_id = ?', whereArgs: [did]);
+                                      await db.delete('modules', where: 'id = ?', whereArgs: [did]);
                                     }
                                     setState(() {});
                                   },
@@ -1824,6 +1897,7 @@ class _FamilyPageState extends State<FamilyPage> {
                               ),
                               InkWell(
                                 onTap: () async {
+                                  final db = await AppDatabase.instance.database;
                                   final subIds = <int>[id];
                                   void collect(int p) {
                                     for (final c in childrenOf(p)) {
@@ -1834,8 +1908,8 @@ class _FamilyPageState extends State<FamilyPage> {
                                   }
                                   collect(id);
                                   for (final did in subIds) {
-                                    await widget.db.delete('module_entries', where: 'module_id = ?', whereArgs: [did]);
-                                    await widget.db.delete('modules', where: 'id = ?', whereArgs: [did]);
+                                    await db.delete('module_entries', where: 'module_id = ?', whereArgs: [did]);
+                                    await db.delete('modules', where: 'id = ?', whereArgs: [did]);
                                   }
                                   setState(() {});
                                 },
@@ -1910,7 +1984,8 @@ class _PlanPageState extends State<PlanPage> {
   bool _busy = false;
 
   Future<List<Map<String, dynamic>>> _loadMindmaps() async {
-    return await widget.db.query('mindmaps', orderBy: 'updated_at DESC, id DESC');
+    final activeDb = await AppDatabase.instance.database;
+    return await activeDb.query('mindmaps', orderBy: 'updated_at DESC, id DESC');
   }
 
   String _genId() => '${DateTime.now().microsecondsSinceEpoch}_${math.Random().nextInt(99999)}';
@@ -2051,9 +2126,10 @@ class _PlanPageState extends State<PlanPage> {
         return;
       }
 
+      final activeDb = await AppDatabase.instance.database;
       final title = (rootNode['text'] as String? ?? p.basenameWithoutExtension(filePath)).trim();
       final now = DateTime.now().toIso8601String();
-      final id = await widget.db.insert('mindmaps', {
+      final id = await activeDb.insert('mindmaps', {
         'title': title.isEmpty ? '导入的规划' : title,
         'root_json': jsonEncode(rootNode),
         'created_at': now,
@@ -2091,6 +2167,7 @@ class _PlanPageState extends State<PlanPage> {
             onPressed: () async {
               final t = ctrl.text.trim();
               if (t.isEmpty) return;
+              final activeDb = await AppDatabase.instance.database;
               final root = {
                 'id': _genId(),
                 'text': t,
@@ -2098,7 +2175,7 @@ class _PlanPageState extends State<PlanPage> {
                 'children': <Map<String, dynamic>>[],
               };
               final now = DateTime.now().toIso8601String();
-              final id = await widget.db.insert('mindmaps', {
+              final id = await activeDb.insert('mindmaps', {
                 'title': t,
                 'root_json': jsonEncode(root),
                 'created_at': now,
@@ -2220,7 +2297,8 @@ class _PlanPageState extends State<PlanPage> {
                   trailing: IconButton(
                     icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
                     onPressed: () async {
-                      await widget.db.delete('mindmaps', where: 'id = ?', whereArgs: [id]);
+                      final activeDb = await AppDatabase.instance.database;
+                      await activeDb.delete('mindmaps', where: 'id = ?', whereArgs: [id]);
                       setState(() {});
                     },
                   ),
@@ -2312,7 +2390,8 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
 
   Future<void> _saveToDb() async {
     _title = (_root['text'] as String? ?? _title).trim();
-    await widget.db.update(
+    final activeDb = await AppDatabase.instance.database;
+    await activeDb.update(
       'mindmaps',
       {
         'title': _title,
