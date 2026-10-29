@@ -12,7 +12,7 @@ import 'package:share_plus/share_plus.dart';
 import 'package:sqflite/sqflite.dart';
 import 'main.dart';
 
-// ==================== 1. 查找与备份页面 (原生支持 data.json + images 备份恢复 + 标题组上下拖拽) ====================
+// ==================== 1. 查找与备份页面 (含安全搜索、防崩溃渲染、数据组拖拽排序) ====================
 class SearchPage extends StatefulWidget {
   final Database db;
   const SearchPage({super.key, required this.db});
@@ -45,47 +45,62 @@ class _SearchPageState extends State<SearchPage> {
   }
 
   Future<Map<String, dynamic>> _load() async {
-    final activeDb = await AppDatabase.instance.database;
-    List<Map<String, dynamic>> groups;
     try {
-      groups = List<Map<String, dynamic>>.from(
-        await activeDb.query('module_groups', orderBy: 'sort_order ASC, id DESC'),
-      );
-    } catch (_) {
-      groups = List<Map<String, dynamic>>.from(
-        await activeDb.query('module_groups', orderBy: 'id DESC'),
-      );
+      final activeDb = await AppDatabase.instance.database;
+      List<Map<String, dynamic>> groups = [];
+      try {
+        groups = List<Map<String, dynamic>>.from(
+          await activeDb.query('module_groups', orderBy: 'sort_order ASC, id DESC'),
+        );
+      } catch (_) {
+        try {
+          groups = List<Map<String, dynamic>>.from(
+            await activeDb.query('module_groups', orderBy: 'id DESC'),
+          );
+        } catch (_) {}
+      }
+
+      final hits = <Map<String, dynamic>>[];
+      if (_kw.trim().isNotEmpty) {
+        final like = '%${_kw.trim()}%';
+        try {
+          for (final r in await activeDb.rawQuery(
+            'SELECT r.date, r.value, i.name FROM status_records r JOIN status_items i ON r.item_id = i.id WHERE r.value LIKE ? OR i.name LIKE ? ORDER BY r.date DESC LIMIT 30',
+            [like, like],
+          )) {
+            hits.add({'tag': '状态 · ${r['date']}', 'title': '${r['name']}', 'sub': '${r['value']}'});
+          }
+        } catch (_) {}
+
+        try {
+          for (final m in await activeDb.query('modules', where: 'title LIKE ?', whereArgs: [like])) {
+            hits.add({'tag': '家庭标题', 'title': '${m['title']}', 'sub': '可在家庭页查看详情'});
+          }
+        } catch (_) {}
+
+        try {
+          for (final e in await activeDb.rawQuery(
+            'SELECT e.seq, e.content, m.title FROM module_entries e JOIN modules m ON e.module_id = m.id WHERE e.content LIKE ? LIMIT 30',
+            [like],
+          )) {
+            hits.add({'tag': '家庭 · ${e['title']}', 'title': '${e['seq']}. ${e['content']}', 'sub': ''});
+          }
+        } catch (_) {}
+      }
+      return {'groups': groups, 'hits': hits};
+    } catch (e) {
+      return {'groups': <Map<String, dynamic>>[], 'hits': <Map<String, dynamic>>[]};
     }
-    final hits = <Map<String, dynamic>>[];
-    if (_kw.trim().isNotEmpty) {
-      final like = '%${_kw.trim()}%';
-      for (final r in await activeDb.rawQuery(
-        'SELECT r.date, r.value, i.name FROM status_records r JOIN status_items i ON r.item_id = i.id WHERE r.value LIKE ? OR i.name LIKE ? ORDER BY r.date DESC LIMIT 40',
-        [like, like],
-      )) {
-        hits.add({'tag': '状态 · ${r['date']}', 'title': '${r['name']}', 'sub': '${r['value']}'});
-      }
-      for (final m in await activeDb.query('modules', where: 'title LIKE ?', whereArgs: [like])) {
-        hits.add({'tag': '家庭标题', 'title': '${m['title']}', 'sub': '可在家庭页查看详情'});
-      }
-      for (final e in await activeDb.rawQuery(
-        'SELECT e.seq, e.content, m.title FROM module_entries e JOIN modules m ON e.module_id = m.id WHERE e.content LIKE ? LIMIT 40',
-        [like],
-      )) {
-        hits.add({'tag': '家庭 · ${e['title']}', 'title': '${e['seq']}. ${e['content']}', 'sub': ''});
-      }
-      for (final s in await activeDb.query('schedule_items', where: 'title LIKE ? OR plan_info LIKE ?', whereArgs: [like, like])) {
-        hits.add({'tag': '日程打卡', 'title': '${s['title']}', 'sub': '${s['plan_info'] ?? ''}'});
-      }
-    }
-    return {'groups': groups, 'hits': hits};
   }
 
-  /// 导出备份：统一采用 data.json + images/ 结构（同时附带 daily_tracker.db 双保险）
   Future<void> _exportBackup() async {
     setState(() => _busy = true);
     try {
       final activeDb = await AppDatabase.instance.database;
+      try {
+        await activeDb.rawQuery('PRAGMA wal_checkpoint(FULL)');
+      } catch (_) {}
+
       final dataMap = <String, dynamic>{};
       for (final table in _allTables) {
         try {
@@ -124,9 +139,7 @@ class _SearchPageState extends State<SearchPage> {
     }
   }
 
-  /// 将解析出的 data.json 映射安全写入当前 SQLite 数据库（自动校验列名兼容跨版本结构）
   Future<void> _restoreFromJsonMap(Database db, Map<String, dynamic> rootMap) async {
-    // 兼容可能外层包了一层 data / tables 节点或直接以表名为顶层 Key 的结构
     Map<String, dynamic> tablesMap = rootMap;
     if (!rootMap.keys.any((k) => _allTables.contains(k))) {
       for (final wrapKey in ['data', 'tables', 'db', 'database']) {
@@ -157,7 +170,6 @@ class _SearchPageState extends State<SearchPage> {
               filteredRow[k] = entry.value;
             }
           }
-          // 若旧版家庭模块顶级标题未包含 is_member 字段，智能标记顶级短名为成员卡片
           if (table == 'modules' &&
               validCols.contains('is_member') &&
               !filteredRow.containsKey('is_member')) {
@@ -175,7 +187,6 @@ class _SearchPageState extends State<SearchPage> {
     });
   }
 
-  /// 导入恢复：原生支持读取 zip 内的 data.json + images/，同时兼容单个 .json 或 .db 文件
   Future<void> _importBackup() async {
     final res = await FilePicker.platform.pickFiles(type: FileType.any);
     if (res == null || res.files.single.path == null) return;
@@ -208,7 +219,6 @@ class _SearchPageState extends State<SearchPage> {
           } else if (!cleanName.endsWith('-wal') &&
               !cleanName.endsWith('-shm') &&
               !cleanName.endsWith('-journal')) {
-            // 还原图片文件到 images/...
             String relPath = cleanName;
             final imgIdx = cleanName.indexOf('images/');
             if (imgIdx >= 0) {
@@ -242,14 +252,12 @@ class _SearchPageState extends State<SearchPage> {
       if (mounted) {
         if (!restoredOk) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('⚠️ 未能在所选压缩包中识别到 data.json 备份数据！')),
+            const SnackBar(content: Text('⚠️ 未能在所选压缩包中识别到有效备份数据！')),
           );
         } else {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text(
-                '🎉 恢复成功！已即时导入：$recCnt 条状态记录、$modCnt 个家庭标题、$schedCnt 项日程、$restoredImages 张图片！',
-              ),
+              content: Text('🎉 恢复成功！即时导入：$recCnt 条状态、$modCnt 个标题、$schedCnt 项日程、$restoredImages 张图片！'),
               duration: const Duration(seconds: 4),
             ),
           );
@@ -586,8 +594,10 @@ class _SearchPageState extends State<SearchPage> {
         future: _load(),
         builder: (ctx, snap) {
           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
-          final groups = snap.data!['groups'] as List<Map<String, dynamic>>;
-          final hits = snap.data!['hits'] as List<Map<String, dynamic>>;
+          final dataMap = snap.data!;
+          final groups = dataMap['groups'] as List<Map<String, dynamic>>;
+          final hits = dataMap['hits'] as List<Map<String, dynamic>>;
+
           return ListView(
             padding: const EdgeInsets.all(12),
             children: [
@@ -788,7 +798,7 @@ class _SearchPageState extends State<SearchPage> {
   }
 }
 
-// ==================== 2. 家庭模块页面 (6套差异炫彩高定成员卡片 + 加高防重叠 + 仅按序号拆分) ====================
+// ==================== 2. 家庭模块页面 (6套炫彩渐变卡片 + 上下加宽 + 仅按序号拆分) ====================
 class _MemberPalette {
   final List<Color> bgGradient;
   final List<Color> avatarGradient;
@@ -1606,8 +1616,9 @@ class _FamilyPageState extends State<FamilyPage> {
         future: _loadFamilyData(),
         builder: (ctx, snap) {
           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
-          final mods = snap.data!['mods'] as List<Map<String, dynamic>>;
-          final entryCounts = snap.data!['counts'] as Map<int, int>;
+          final dataMap = snap.data!;
+          final mods = dataMap['mods'] as List<Map<String, dynamic>>;
+          final entryCounts = dataMap['counts'] as Map<int, int>;
 
           final validIds = mods.map((m) => m['id'] as int).toSet();
           final roots = mods.where((m) {
@@ -2063,7 +2074,7 @@ class _FamilyPageState extends State<FamilyPage> {
     );
   }
 }
-// ==================== 3. 规划与思维导图页面 (支持 XMind 导入 + 节点长按拖拽移动) ====================
+// ==================== 3. 规划与思维导图页面 (支持 XMind 导入 + 全屏画布 + 节点长按三区拖拽移动) ====================
 class PlanPage extends StatefulWidget {
   final Database db;
   const PlanPage({super.key, required this.db});
@@ -2075,8 +2086,14 @@ class _PlanPageState extends State<PlanPage> {
   bool _busy = false;
 
   Future<List<Map<String, dynamic>>> _loadMindmaps() async {
-    final activeDb = await AppDatabase.instance.database;
-    return await activeDb.query('mindmaps', orderBy: 'updated_at DESC, id DESC');
+    try {
+      final activeDb = await AppDatabase.instance.database;
+      return List<Map<String, dynamic>>.from(
+        await activeDb.query('mindmaps', orderBy: 'updated_at DESC, id DESC'),
+      );
+    } catch (_) {
+      return <Map<String, dynamic>>[];
+    }
   }
 
   String _genId() => '${DateTime.now().microsecondsSinceEpoch}_${math.Random().nextInt(99999)}';
@@ -2098,16 +2115,16 @@ class _PlanPageState extends State<PlanPage> {
       final attached = childrenObj['attached'];
       if (attached is List) {
         for (final c in attached) {
-          if (c is Map<String, dynamic>) {
-            childrenList.add(_convertXmindJsonTopic(c));
-          } else if (c is Map) {
+          if (c is Map) {
             childrenList.add(_convertXmindJsonTopic(Map<String, dynamic>.from(c)));
           }
         }
       }
     } else if (childrenObj is List) {
       for (final c in childrenObj) {
-        if (c is Map) childrenList.add(_convertXmindJsonTopic(Map<String, dynamic>.from(c)));
+        if (c is Map) {
+          childrenList.add(_convertXmindJsonTopic(Map<String, dynamic>.from(c)));
+        }
       }
     }
     return {
@@ -2201,11 +2218,13 @@ class _PlanPageState extends State<PlanPage> {
       if (jsonFile != null) {
         final jsonStr = utf8.decode(jsonFile.content as List<int>, allowMalformed: true);
         final decoded = jsonDecode(jsonStr);
-        if (decoded is List && decoded.isNotEmpty) {
-          final rootTopic = decoded.first['rootTopic'] as Map<String, dynamic>?;
-          if (rootTopic != null) rootNode = _convertXmindJsonTopic(rootTopic);
-        } else if (decoded is Map && decoded['rootTopic'] != null) {
-          rootNode = _convertXmindJsonTopic(Map<String, dynamic>.from(decoded['rootTopic']));
+        if (decoded is List && decoded.isNotEmpty && decoded.first is Map) {
+          final firstMap = Map<String, dynamic>.from(decoded.first as Map);
+          if (firstMap['rootTopic'] is Map) {
+            rootNode = _convertXmindJsonTopic(Map<String, dynamic>.from(firstMap['rootTopic'] as Map));
+          }
+        } else if (decoded is Map && decoded['rootTopic'] is Map) {
+          rootNode = _convertXmindJsonTopic(Map<String, dynamic>.from(decoded['rootTopic'] as Map));
         }
       } else if (xmlFile != null) {
         final xmlStr = utf8.decode(xmlFile.content as List<int>, allowMalformed: true);
@@ -2259,7 +2278,7 @@ class _PlanPageState extends State<PlanPage> {
               final t = ctrl.text.trim();
               if (t.isEmpty) return;
               final activeDb = await AppDatabase.instance.database;
-              final root = {
+              final root = <String, dynamic>{
                 'id': _genId(),
                 'text': t,
                 'collapsed': false,
@@ -2294,6 +2313,29 @@ class _PlanPageState extends State<PlanPage> {
     ).then((_) {
       if (mounted) setState(() {});
     });
+  }
+
+  void _confirmDeleteMindmap(int id, String title) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('确认删除规划'),
+        content: Text('确定要删除规划导图「$title」吗？'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () async {
+              final activeDb = await AppDatabase.instance.database;
+              await activeDb.delete('mindmaps', where: 'id = ?', whereArgs: [id]);
+              if (mounted) Navigator.pop(ctx);
+              setState(() {});
+            },
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -2347,17 +2389,25 @@ class _PlanPageState extends State<PlanPage> {
               final m = maps[i];
               final id = m['id'] as int;
               final title = '${m['title']}';
-              Map<String, dynamic> root = {};
+              Map<String, dynamic> root = {'id': 'root_$id', 'text': title, 'children': <Map<String, dynamic>>[]};
               int totalNodes = 1;
               try {
-                root = jsonDecode(m['root_json'] as String) as Map<String, dynamic>;
-                void countNodes(Map<String, dynamic> n) {
-                  for (final c in ((n['children'] as List?)?.cast<Map<String, dynamic>>() ?? [])) {
-                    totalNodes++;
-                    countNodes(c);
+                final decoded = jsonDecode('${m['root_json'] ?? "{}"}');
+                if (decoded is Map) {
+                  root = Map<String, dynamic>.from(decoded);
+                  void countNodes(Map<String, dynamic> n) {
+                    final rawCh = n['children'];
+                    if (rawCh is List) {
+                      for (final c in rawCh) {
+                        if (c is Map) {
+                          totalNodes++;
+                          countNodes(Map<String, dynamic>.from(c));
+                        }
+                      }
+                    }
                   }
+                  countNodes(root);
                 }
-                countNodes(root);
               } catch (_) {}
 
               return Card(
@@ -2387,11 +2437,7 @@ class _PlanPageState extends State<PlanPage> {
                   onTap: () => _openEditor(id, title, root),
                   trailing: IconButton(
                     icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
-                    onPressed: () async {
-                      final activeDb = await AppDatabase.instance.database;
-                      await activeDb.delete('mindmaps', where: 'id = ?', whereArgs: [id]);
-                      setState(() {});
-                    },
+                    onPressed: () => _confirmDeleteMindmap(id, title),
                   ),
                 ),
               );
@@ -2454,8 +2500,7 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
   void initState() {
     super.initState();
     _title = widget.initialTitle;
-    _root = jsonDecode(jsonEncode(widget.initialRoot)) as Map<String, dynamic>;
-    _ensureNodeIds(_root);
+    _root = _normalizeTreeNode(widget.initialRoot);
   }
 
   @override
@@ -2467,16 +2512,39 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
     super.dispose();
   }
 
-  void _ensureNodeIds(Map<String, dynamic> node) {
-    if (node['id'] == null || node['id'].toString().isEmpty) {
-      node['id'] = '${DateTime.now().microsecondsSinceEpoch}_${math.Random().nextInt(999999)}';
+  Map<String, dynamic> _normalizeTreeNode(Map rawNode) {
+    final map = Map<String, dynamic>.from(rawNode);
+    if (map['id'] == null || map['id'].toString().isEmpty) {
+      map['id'] = '${DateTime.now().microsecondsSinceEpoch}_${math.Random().nextInt(999999)}';
+    } else {
+      map['id'] = '${map['id']}';
     }
-    node['collapsed'] = node['collapsed'] == true;
-    final children = (node['children'] as List?)?.cast<Map<String, dynamic>>() ?? <Map<String, dynamic>>[];
-    node['children'] = children;
-    for (final c in children) {
-      _ensureNodeIds(c);
+    map['text'] = '${map['text'] ?? '节点'}';
+    map['collapsed'] = map['collapsed'] == true;
+    final rawChildren = map['children'];
+    final normalizedChildren = <Map<String, dynamic>>[];
+    if (rawChildren is List) {
+      for (final c in rawChildren) {
+        if (c is Map) {
+          normalizedChildren.add(_normalizeTreeNode(c));
+        }
+      }
     }
+    map['children'] = normalizedChildren;
+    return map;
+  }
+
+  List<Map<String, dynamic>> _childrenOfNode(Map<String, dynamic> node) {
+    final raw = node['children'];
+    if (raw is List<Map<String, dynamic>>) return raw;
+    if (raw is List) {
+      final list = raw.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
+      node['children'] = list;
+      return list;
+    }
+    final empty = <Map<String, dynamic>>[];
+    node['children'] = empty;
+    return empty;
   }
 
   Future<void> _saveToDb() async {
@@ -2495,7 +2563,7 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
   }
 
   int _countDescendants(Map<String, dynamic> node) {
-    final children = (node['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+    final children = _childrenOfNode(node);
     int count = children.length;
     for (final c in children) {
       count += _countDescendants(c);
@@ -2505,7 +2573,7 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
 
   void _setAllCollapsed(Map<String, dynamic> node, bool collapsed, {bool isRoot = true}) {
     if (!isRoot) node['collapsed'] = collapsed;
-    for (final c in ((node['children'] as List?)?.cast<Map<String, dynamic>>() ?? [])) {
+    for (final c in _childrenOfNode(node)) {
       _setAllCollapsed(c, collapsed, isRoot: false);
     }
   }
@@ -2513,8 +2581,8 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
   bool _isDescendantInTree(String dragId, String targetId) {
     if (dragId == targetId) return true;
     Map<String, dynamic>? findNode(Map<String, dynamic> cur, String id) {
-      if (cur['id'] == id) return cur;
-      for (final c in ((cur['children'] as List?)?.cast<Map<String, dynamic>>() ?? [])) {
+      if ('${cur['id']}' == id) return cur;
+      for (final c in _childrenOfNode(cur)) {
         final found = findNode(c, id);
         if (found != null) return found;
       }
@@ -2531,13 +2599,13 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
     required String targetId,
     required String zone,
   }) async {
-    if (dragId == _root['id'] || _isDescendantInTree(dragId, targetId)) return;
+    if (dragId == '${_root['id']}' || _isDescendantInTree(dragId, targetId)) return;
 
     Map<String, dynamic>? removedNode;
 
     bool removeFromParent(Map<String, dynamic> cur) {
-      final children = (cur['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
-      final idx = children.indexWhere((c) => c['id'] == dragId);
+      final children = _childrenOfNode(cur);
+      final idx = children.indexWhere((c) => '${c['id']}' == dragId);
       if (idx != -1) {
         removedNode = children.removeAt(idx);
         cur['children'] = children;
@@ -2551,16 +2619,16 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
 
     if (!removeFromParent(_root) || removedNode == null) return;
 
-    if (zone == 'inside' || targetId == _root['id']) {
+    if (zone == 'inside' || targetId == '${_root['id']}') {
       bool insertInside(Map<String, dynamic> cur) {
-        if (cur['id'] == targetId) {
-          final children = (cur['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+        if ('${cur['id']}' == targetId) {
+          final children = _childrenOfNode(cur);
           children.add(removedNode!);
           cur['children'] = children;
           cur['collapsed'] = false;
           return true;
         }
-        for (final c in ((cur['children'] as List?)?.cast<Map<String, dynamic>>() ?? [])) {
+        for (final c in _childrenOfNode(cur)) {
           if (insertInside(c)) return true;
         }
         return false;
@@ -2569,8 +2637,8 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
       insertInside(_root);
     } else {
       bool insertSibling(Map<String, dynamic> cur) {
-        final children = (cur['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
-        final tIdx = children.indexWhere((c) => c['id'] == targetId);
+        final children = _childrenOfNode(cur);
+        final tIdx = children.indexWhere((c) => '${c['id']}' == targetId);
         if (tIdx != -1) {
           final insIdx = zone == 'up' ? tIdx : tIdx + 1;
           children.insert(insIdx.clamp(0, children.length), removedNode!);
@@ -2619,7 +2687,7 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
                 title: const Text('添加同级节点'),
                 onTap: () {
                   Navigator.pop(ctx);
-                  _addSiblingNodeDialog(node['id'] as String);
+                  _addSiblingNodeDialog('${node['id']}');
                 },
               ),
             if (!isRoot)
@@ -2628,7 +2696,7 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
                 title: const Text('删除此节点及其子节点', style: TextStyle(color: Colors.redAccent)),
                 onTap: () async {
                   Navigator.pop(ctx);
-                  _deleteNodeById(_root, node['id'] as String);
+                  _deleteNodeById(_root, '${node['id']}');
                   await _saveToDb();
                   setState(() {});
                 },
@@ -2687,9 +2755,9 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
           FilledButton(
             onPressed: () async {
               if (ctrl.text.trim().isEmpty) return;
-              final children = (parentNode['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+              final children = _childrenOfNode(parentNode);
               children.add({
-                'id': '${DateTime.now().microsecondsSinceEpoch}',
+                'id': '${DateTime.now().microsecondsSinceEpoch}_${math.Random().nextInt(9999)}',
                 'text': ctrl.text.trim(),
                 'collapsed': false,
                 'children': <Map<String, dynamic>>[],
@@ -2726,11 +2794,11 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
             onPressed: () async {
               if (ctrl.text.trim().isEmpty) return;
               bool insertAfter(Map<String, dynamic> cur) {
-                final children = (cur['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
-                final idx = children.indexWhere((c) => c['id'] == targetId);
+                final children = _childrenOfNode(cur);
+                final idx = children.indexWhere((c) => '${c['id']}' == targetId);
                 if (idx != -1) {
                   children.insert(idx + 1, {
-                    'id': '${DateTime.now().microsecondsSinceEpoch}',
+                    'id': '${DateTime.now().microsecondsSinceEpoch}_${math.Random().nextInt(9999)}',
                     'text': ctrl.text.trim(),
                     'collapsed': false,
                     'children': <Map<String, dynamic>>[],
@@ -2757,8 +2825,8 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
   }
 
   bool _deleteNodeById(Map<String, dynamic> cur, String targetId) {
-    final children = (cur['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
-    final idx = children.indexWhere((c) => c['id'] == targetId);
+    final children = _childrenOfNode(cur);
+    final idx = children.indexWhere((c) => '${c['id']}' == targetId);
     if (idx != -1) {
       children.removeAt(idx);
       cur['children'] = children;
@@ -2793,10 +2861,10 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
     const double hGap = 68.0;
 
     double measureSubtree(Map<String, dynamic> n, int depth) {
-      final id = n['id'] as String;
+      final id = '${n['id']}';
       final sz = _measureNodeSize('${n['text'] ?? ''}', depth);
       sizeCache[id] = sz;
-      final children = (n['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+      final children = _childrenOfNode(n);
       final isCollapsed = n['collapsed'] == true;
       if (children.isEmpty || isCollapsed) {
         subHeightCache[id] = sz.height;
@@ -2817,7 +2885,7 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
     double maxBottom = math.max(600, totalTreeH + 160);
 
     void assignCoords(Map<String, dynamic> n, String? parentId, int depth, double leftX, double topY) {
-      final id = n['id'] as String;
+      final id = '${n['id']}';
       final sz = sizeCache[id]!;
       final subH = subHeightCache[id]!;
       final nodeTop = topY + (subH - sz.height) / 2;
@@ -2835,20 +2903,20 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
         subtreeHeight: subH,
       ));
 
-      final children = (n['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+      final children = _childrenOfNode(n);
       final isCollapsed = n['collapsed'] == true;
       if (children.isEmpty || isCollapsed) return;
 
       double childrenTotalH = 0;
       for (int i = 0; i < children.length; i++) {
         if (i > 0) childrenTotalH += vGap;
-        childrenTotalH += subHeightCache[children[i]['id'] as String]!;
+        childrenTotalH += subHeightCache['${children[i]['id']}']!;
       }
 
       double curY = topY + (subH - childrenTotalH) / 2;
       final childLeftX = rect.right + hGap;
       for (final c in children) {
-        final cid = c['id'] as String;
+        final cid = '${c['id']}';
         final cSubH = subHeightCache[cid]!;
         assignCoords(c, id, depth + 1, childLeftX, curY);
         curY += cSubH + vGap;
@@ -2978,7 +3046,7 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
                     ),
                     ...layout.nodes.map((info) {
                       final isRoot = info.depth == 0;
-                      final children = (info.node['children'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+                      final children = _childrenOfNode(info.node);
                       final hasChildren = children.isNotEmpty;
                       final isCollapsed = info.node['collapsed'] == true;
                       final hiddenCount = isCollapsed ? _countDescendants(info.node) : 0;
