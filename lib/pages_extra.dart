@@ -12,7 +12,7 @@ import 'package:share_plus/share_plus.dart';
 import 'package:sqflite/sqflite.dart';
 import 'main.dart';
 
-// ==================== 1. 查找与备份页面 (含安全搜索、防崩溃渲染、数据组拖拽排序) ====================
+// ==================== 1. 查找与备份页面 (原生 _exportZip / _importZip + 标题组上下拖动) ====================
 class SearchPage extends StatefulWidget {
   final Database db;
   const SearchPage({super.key, required this.db});
@@ -44,28 +44,28 @@ class _SearchPageState extends State<SearchPage> {
     super.dispose();
   }
 
-  Future<Map<String, dynamic>> _load() async {
+  Future> _load() async {
     try {
       final activeDb = await AppDatabase.instance.database;
-      List<Map<String, dynamic>> groups = [];
+      List> groups = [];
       try {
-        groups = List<Map<String, dynamic>>.from(
+        groups = List>.from(
           await activeDb.query('module_groups', orderBy: 'sort_order ASC, id DESC'),
         );
       } catch (_) {
         try {
-          groups = List<Map<String, dynamic>>.from(
+          groups = List>.from(
             await activeDb.query('module_groups', orderBy: 'id DESC'),
           );
         } catch (_) {}
       }
 
-      final hits = <Map<String, dynamic>>[];
+      final hits = >[];
       if (_kw.trim().isNotEmpty) {
         final like = '%${_kw.trim()}%';
         try {
           for (final r in await activeDb.rawQuery(
-            'SELECT r.date, r.value, i.name FROM status_records r JOIN status_items i ON r.item_id = i.id WHERE r.value LIKE ? OR i.name LIKE ? ORDER BY r.date DESC LIMIT 30',
+            'SELECT r.date, r.value, i.name FROM status_records r JOIN status_items i ON r.item_id = i.id WHERE r.value LIKE ? OR i.name LIKE ? ORDER BY r.date DESC LIMIT 40',
             [like, like],
           )) {
             hits.add({'tag': '状态 · ${r['date']}', 'title': '${r['name']}', 'sub': '${r['value']}'});
@@ -80,27 +80,30 @@ class _SearchPageState extends State<SearchPage> {
 
         try {
           for (final e in await activeDb.rawQuery(
-            'SELECT e.seq, e.content, m.title FROM module_entries e JOIN modules m ON e.module_id = m.id WHERE e.content LIKE ? LIMIT 30',
+            'SELECT e.seq, e.content, m.title FROM module_entries e JOIN modules m ON e.module_id = m.id WHERE e.content LIKE ? LIMIT 40',
             [like],
           )) {
             hits.add({'tag': '家庭 · ${e['title']}', 'title': '${e['seq']}. ${e['content']}', 'sub': ''});
           }
         } catch (_) {}
+
+        try {
+          for (final s in await activeDb.query('schedule_items', where: 'title LIKE ? OR plan_info LIKE ?', whereArgs: [like, like])) {
+            hits.add({'tag': '日程打卡', 'title': '${s['title']}', 'sub': '${s['plan_info'] ?? ''}'});
+          }
+        } catch (_) {}
       }
       return {'groups': groups, 'hits': hits};
-    } catch (e) {
-      return {'groups': <Map<String, dynamic>>[], 'hits': <Map<String, dynamic>>[]};
+    } catch (_) {
+      return {'groups': >[], 'hits': >[]};
     }
   }
 
-  Future<void> _exportBackup() async {
+  /// 基准版原生导出格式：data.json + images/
+  Future<void> _exportZip() async {
     setState(() => _busy = true);
     try {
       final activeDb = await AppDatabase.instance.database;
-      try {
-        await activeDb.rawQuery('PRAGMA wal_checkpoint(FULL)');
-      } catch (_) {}
-
       final dataMap = <String, dynamic>{};
       for (final table in _allTables) {
         try {
@@ -133,7 +136,7 @@ class _SearchPageState extends State<SearchPage> {
       encoder.close();
       await Share.shareXFiles([XFile(zipPath)], text: '每日记录全量数据备份');
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('备份失败: $e')));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('导出备份失败: $e')));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -187,7 +190,8 @@ class _SearchPageState extends State<SearchPage> {
     });
   }
 
-  Future<void> _importBackup() async {
+  /// 基准版原生导入恢复：读取 zip 内的 data.json + images/，无需重启即时生效
+  Future<void> _importZip() async {
     final res = await FilePicker.platform.pickFiles(type: FileType.any);
     if (res == null || res.files.single.path == null) return;
     setState(() => _busy = true);
@@ -252,19 +256,16 @@ class _SearchPageState extends State<SearchPage> {
       if (mounted) {
         if (!restoredOk) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('⚠️ 未能在所选压缩包中识别到有效备份数据！')),
+            const SnackBar(content: Text('⚠️ 未能在所选文件中识别到 data.json 备份数据！')),
           );
         } else {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('🎉 恢复成功！即时导入：$recCnt 条状态、$modCnt 个标题、$schedCnt 项日程、$restoredImages 张图片！'),
+              content: Text('🎉 导入恢复成功！已加载 $recCnt 条状态记录、$modCnt 个家庭标题、$schedCnt 项日程、$restoredImages 张图片！'),
               duration: const Duration(seconds: 4),
             ),
           );
           setState(() {});
-          Navigator.of(context).pushReplacement(
-            MaterialPageRoute(builder: (_) => MainShell(db: newDb)),
-          );
         }
       }
     } catch (e) {
@@ -274,12 +275,11 @@ class _SearchPageState extends State<SearchPage> {
     }
   }
 
-  Future<void> _groupPickerDialog({
-    required bool saveMode,
-    Map<String, dynamic>? existingGroup,
-  }) async {
+  Future<void> _createOrEditGroup({Map<String, dynamic>? existingGroup}) async {
     final activeDb = await AppDatabase.instance.database;
-    final mods = await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC');
+    final mods = List>.from(
+      await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC'),
+    );
     if (!mounted) return;
 
     final isEdit = existingGroup != null;
@@ -287,215 +287,157 @@ class _SearchPageState extends State<SearchPage> {
     final sel = <int>{};
     if (isEdit) {
       try {
-        sel.addAll((jsonDecode(existingGroup['module_ids'] as String) as List).cast<int>());
+        sel.addAll((jsonDecode('${existingGroup['module_ids']}') as List).map((e) => int.parse('$e')));
       } catch (_) {}
-    }
-    final expanded = <int>{};
-
-    final validIds = mods.map((m) => m['id'] as int).toSet();
-    final roots = mods.where((m) {
-      final pid = m['parent_id'] as int?;
-      return pid == null || !validIds.contains(pid);
-    }).toList();
-
-    List<Map<String, dynamic>> childrenOf(int pid) =>
-        mods.where((m) => m['parent_id'] == pid).toList();
-
-    List<int> subtreeIdsOf(int rootId) {
-      final res = <int>[rootId];
-      for (final c in childrenOf(rootId)) {
-        res.addAll(subtreeIdsOf(c['id'] as int));
-      }
-      return res;
     }
 
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setS) {
-          Widget buildCheckNode(Map<String, dynamic> m, int depth) {
-            final id = m['id'] as int;
-            final isMember = (m['is_member'] as int? ?? 0) == 1;
-            final children = childrenOf(id);
-            final hasChildren = children.isNotEmpty;
-            final isExp = expanded.contains(id);
-            final subIds = subtreeIdsOf(id);
-            final allSelected = subIds.every((sid) => sel.contains(sid));
-            final someSelected = !allSelected && subIds.any((sid) => sel.contains(sid));
-
-            return Column(
+        builder: (ctx, setS) => AlertDialog(
+          title: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  isEdit ? '编辑标题组' : '新建标题组',
+                  style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+                ),
+              ),
+              Text('已选 ${sel.length} 项', style: const TextStyle(fontSize: 12.5, color: Color(0xFF4F46E5))),
+            ],
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 410,
+            child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Padding(
-                  padding: EdgeInsets.only(left: depth * 18.0),
-                  child: Row(
-                    children: [
-                      if (hasChildren)
-                        IconButton(
-                          visualDensity: VisualDensity.compact,
-                          padding: EdgeInsets.zero,
-                          constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                          icon: Icon(
-                            isExp ? Icons.arrow_drop_down : Icons.arrow_right,
-                            size: 22,
-                            color: const Color(0xFF4F46E5),
-                          ),
-                          onPressed: () => setS(() => isExp ? expanded.remove(id) : expanded.add(id)),
-                        )
-                      else
-                        const SizedBox(width: 28),
-                      Icon(
-                        isMember ? Icons.person : (depth == 0 ? Icons.folder_outlined : Icons.subdirectory_arrow_right),
-                        size: 16,
-                        color: isMember ? const Color(0xFFEC4899) : Colors.blueGrey,
-                      ),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: GestureDetector(
-                          onTap: () {
-                            if (hasChildren) {
-                              setS(() => isExp ? expanded.remove(id) : expanded.add(id));
-                            } else {
-                              setS(() => sel.contains(id) ? sel.remove(id) : sel.add(id));
-                            }
-                          },
-                          child: Text(
-                            '${m['title']}',
-                            style: TextStyle(
-                              fontWeight: depth == 0 ? FontWeight.bold : FontWeight.normal,
-                              fontSize: depth == 0 ? 14.5 : 13.5,
-                            ),
-                          ),
-                        ),
-                      ),
-                      if (hasChildren)
-                        TextButton(
-                          style: TextButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                            minimumSize: Size.zero,
-                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                          ),
-                          onPressed: () => setS(() => isExp ? expanded.remove(id) : expanded.add(id)),
-                          child: Text(isExp ? '收起' : '细筛(${children.length})', style: const TextStyle(fontSize: 11.5)),
-                        ),
-                      Checkbox(
-                        tristate: true,
-                        value: allSelected ? true : (someSelected ? null : false),
-                        onChanged: (v) {
-                          setS(() {
-                            if (allSelected) {
-                              sel.removeAll(subIds);
-                            } else {
-                              sel.addAll(subIds);
-                            }
-                          });
-                        },
-                      ),
-                    ],
+                TextField(
+                  controller: nameCtrl,
+                  decoration: const InputDecoration(
+                    labelText: '标题组名称',
+                    border: OutlineInputBorder(),
+                    isDense: true,
                   ),
                 ),
-                if (hasChildren && isExp)
-                  ...children.map((c) => buildCheckNode(c, depth + 1)),
-              ],
-            );
-          }
-
-          return AlertDialog(
-            title: Row(
-              children: [
+                const SizedBox(height: 8),
+                const Text(
+                  '💡 提示：直接勾选大标题将包含其全部内容；点击左侧 ▶️ 可展开细筛内部小标题',
+                  style: TextStyle(fontSize: 11.5, color: Colors.grey),
+                ),
+                const Divider(height: 12),
                 Expanded(
-                  child: Text(
-                    saveMode ? (isEdit ? '编辑标题组' : '新建标题组') : '临时选择查看',
-                    style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+                  child: ModuleTreeSelector(
+                    allMods: mods,
+                    selectedIds: sel,
+                    onChanged: () => setS(() {}),
                   ),
                 ),
-                Text('已选 ${sel.length} 项', style: const TextStyle(fontSize: 12.5, color: Color(0xFF4F46E5))),
               ],
             ),
-            content: SizedBox(
-              width: double.maxFinite,
-              height: 400,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  if (saveMode) ...[
-                    TextField(
-                      controller: nameCtrl,
-                      decoration: const InputDecoration(
-                        labelText: '组名',
-                        border: OutlineInputBorder(),
-                        isDense: true,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                  ],
-                  const Text(
-                    '💡 提示：直接勾选大标题将包含其全部内容；点击左侧 ▶️ 可展开精细化筛选内部小标题',
-                    style: TextStyle(fontSize: 11.5, color: Colors.grey),
-                  ),
-                  const Divider(height: 12),
-                  Expanded(
-                    child: mods.isEmpty
-                        ? const Center(child: Text('暂无家庭模块，请先在「家庭」页添加'))
-                        : ListView(
-                            children: roots.map((r) => buildCheckNode(r, 0)).toList(),
-                          ),
-                  ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-              FilledButton(
-                onPressed: () async {
-                  if (sel.isEmpty) return;
-                  final db = await AppDatabase.instance.database;
-                  if (saveMode) {
-                    if (nameCtrl.text.trim().isEmpty) return;
-                    if (isEdit) {
-                      await db.update(
-                        'module_groups',
-                        {
-                          'name': nameCtrl.text.trim(),
-                          'module_ids': jsonEncode(sel.toList()),
-                        },
-                        where: 'id = ?',
-                        whereArgs: [existingGroup['id']],
-                      );
-                    } else {
-                      final allG = await db.query('module_groups');
-                      try {
-                        await db.insert('module_groups', {
-                          'name': nameCtrl.text.trim(),
-                          'module_ids': jsonEncode(sel.toList()),
-                          'sort_order': allG.length,
-                          'created_at': DateTime.now().toIso8601String(),
-                        });
-                      } catch (_) {
-                        await db.insert('module_groups', {
-                          'name': nameCtrl.text.trim(),
-                          'module_ids': jsonEncode(sel.toList()),
-                          'created_at': DateTime.now().toIso8601String(),
-                        });
-                      }
-                    }
-                    if (mounted) Navigator.pop(ctx);
-                    setState(() {});
-                  } else {
-                    Navigator.pop(ctx);
-                    _viewMods('临时查看', sel.toList());
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+            FilledButton(
+              onPressed: () async {
+                if (sel.isEmpty || nameCtrl.text.trim().isEmpty) return;
+                final db = await AppDatabase.instance.database;
+                if (isEdit) {
+                  await db.update(
+                    'module_groups',
+                    {
+                      'name': nameCtrl.text.trim(),
+                      'module_ids': jsonEncode(sel.toList()),
+                    },
+                    where: 'id = ?',
+                    whereArgs: [existingGroup['id']],
+                  );
+                } else {
+                  final allG = await db.query('module_groups');
+                  try {
+                    await db.insert('module_groups', {
+                      'name': nameCtrl.text.trim(),
+                      'module_ids': jsonEncode(sel.toList()),
+                      'sort_order': allG.length,
+                      'created_at': DateTime.now().toIso8601String(),
+                    });
+                  } catch (_) {
+                    await db.insert('module_groups', {
+                      'name': nameCtrl.text.trim(),
+                      'module_ids': jsonEncode(sel.toList()),
+                      'created_at': DateTime.now().toIso8601String(),
+                    });
                   }
-                },
-                child: Text(saveMode ? (isEdit ? '保存修改' : '创建') : '查看内容'),
-              ),
-            ],
-          );
-        },
+                }
+                if (mounted) Navigator.pop(ctx);
+                setState(() {});
+              },
+              child: Text(isEdit ? '保存修改' : '创建'),
+            ),
+          ],
+        ),
       ),
     );
   }
 
-  Future<void> _viewMods(String title, List<int> ids) async {
+  Future<void> _tempView() async {
+    final activeDb = await AppDatabase.instance.database;
+    final mods = List>.from(
+      await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC'),
+    );
+    if (!mounted) return;
+    final sel = <int>{};
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setS) => AlertDialog(
+          title: Row(
+            children: [
+              const Expanded(
+                child: Text('临时选择查看', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+              ),
+              Text('已选 ${sel.length} 项', style: const TextStyle(fontSize: 12.5, color: Color(0xFF4F46E5))),
+            ],
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 390,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '💡 提示：直接勾选大标题将包含其全部内容；点击左侧 ▶️ 可展开细筛内部小标题',
+                  style: TextStyle(fontSize: 11.5, color: Colors.grey),
+                ),
+                const Divider(height: 12),
+                Expanded(
+                  child: ModuleTreeSelector(
+                    allMods: mods,
+                    selectedIds: sel,
+                    onChanged: () => setS(() {}),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+            FilledButton(
+              onPressed: () {
+                if (sel.isEmpty) return;
+                Navigator.pop(ctx);
+                _showAgg('临时查看', sel.toList());
+              },
+              child: const Text('查看内容'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showAgg(String title, List<int> ids) async {
     final activeDb = await AppDatabase.instance.database;
     final allMods = await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC');
     final modMap = {for (final m in allMods) m['id'] as int: m};
@@ -511,11 +453,11 @@ class _SearchPageState extends State<SearchPage> {
       return parts.join(' > ');
     }
 
-    final data = <Map<String, dynamic>>[];
+    final data = >[];
     for (final m in allMods) {
       final id = m['id'] as int;
       if (!ids.contains(id)) continue;
-      final es = await activeDb.query('module_entries', where: 'module_id = ?', whereArgs: [id], orderBy: 'seq ASC');
+      final es = await activeDb.query('module_entries', where: 'module_id = ?', whereArgs: [id], orderBy: 'sort_order ASC, seq ASC');
       data.add({'title': fullPathOf(id), 'entries': es});
     }
 
@@ -538,7 +480,7 @@ class _SearchPageState extends State<SearchPage> {
                   onPressed: () {
                     final buf = StringBuffer();
                     for (final d in data) {
-                      final es = d['entries'] as List<Map<String, dynamic>>;
+                      final es = d['entries'] as List>;
                       if (es.isEmpty && data.length > 1) continue;
                       buf.writeln('【${d['title']}】');
                       for (final e in es) buf.writeln('${e['seq']}. ${e['content']}');
@@ -554,10 +496,11 @@ class _SearchPageState extends State<SearchPage> {
             ),
             const Divider(height: 20),
             ...data.map((d) {
-              final es = d['entries'] as List<Map<String, dynamic>>;
+              final es = d['entries'] as List>;
               return Card(
                 margin: const EdgeInsets.only(bottom: 10),
                 elevation: 0,
+                color: Colors.white,
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(10),
                   side: const BorderSide(color: Color(0xFFE2E8F0)),
@@ -590,13 +533,12 @@ class _SearchPageState extends State<SearchPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('🔍 查找', style: TextStyle(fontWeight: FontWeight.bold))),
-      body: FutureBuilder<Map<String, dynamic>>(
+      body: FutureBuilder>(
         future: _load(),
         builder: (ctx, snap) {
           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
-          final dataMap = snap.data!;
-          final groups = dataMap['groups'] as List<Map<String, dynamic>>;
-          final hits = dataMap['hits'] as List<Map<String, dynamic>>;
+          final groups = snap.data!['groups'] as List>;
+          final hits = snap.data!['hits'] as List>;
 
           return ListView(
             padding: const EdgeInsets.all(12),
@@ -661,7 +603,7 @@ class _SearchPageState extends State<SearchPage> {
                 children: [
                   Expanded(
                     child: FilledButton.icon(
-                      onPressed: () => _groupPickerDialog(saveMode: true),
+                      onPressed: () => _createOrEditGroup(),
                       icon: const Icon(Icons.add),
                       label: const Text('新建标题组'),
                     ),
@@ -669,7 +611,7 @@ class _SearchPageState extends State<SearchPage> {
                   const SizedBox(width: 8),
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed: () => _groupPickerDialog(saveMode: false),
+                      onPressed: _tempView,
                       icon: const Icon(Icons.visibility_outlined),
                       label: const Text('临时查看'),
                     ),
@@ -680,7 +622,7 @@ class _SearchPageState extends State<SearchPage> {
               if (groups.isNotEmpty) ...[
                 const Padding(
                   padding: EdgeInsets.only(left: 4, bottom: 6),
-                  child: Text('💡 长按标题组右侧 ☰ 可上下拖动调整位置', style: TextStyle(fontSize: 11.5, color: Colors.grey)),
+                  child: Text('💡 长按标题组右侧 ☰ 可上下拖动调整排列位置', style: TextStyle(fontSize: 11.5, color: Colors.grey)),
                 ),
                 ReorderableListView.builder(
                   shrinkWrap: true,
@@ -706,7 +648,10 @@ class _SearchPageState extends State<SearchPage> {
                   },
                   itemBuilder: (ctx, idx) {
                     final g = groups[idx];
-                    final ids = (jsonDecode(g['module_ids'] as String) as List).cast<int>();
+                    List<int> ids = [];
+                    try {
+                      ids = (jsonDecode('${g['module_ids']}') as List).map((e) => int.parse('$e')).toList();
+                    } catch (_) {}
                     return Card(
                       key: ValueKey('mgroup_${g['id']}'),
                       margin: const EdgeInsets.only(bottom: 8),
@@ -721,7 +666,7 @@ class _SearchPageState extends State<SearchPage> {
                         leading: const Icon(Icons.folder_special, color: Color(0xFF4F46E5)),
                         title: Text('${g['name']}', style: const TextStyle(fontWeight: FontWeight.bold)),
                         subtitle: Text('已选 ${ids.length} 项 · 点击查看', style: const TextStyle(fontSize: 12)),
-                        onTap: () => _viewMods('${g['name']}', ids),
+                        onTap: () => _showAgg('${g['name']}', ids),
                         trailing: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
@@ -729,7 +674,7 @@ class _SearchPageState extends State<SearchPage> {
                               visualDensity: VisualDensity.compact,
                               icon: const Icon(Icons.edit_outlined, color: Colors.blueGrey, size: 20),
                               tooltip: '编辑标题组',
-                              onPressed: () => _groupPickerDialog(saveMode: true, existingGroup: g),
+                              onPressed: () => _createOrEditGroup(existingGroup: g),
                             ),
                             IconButton(
                               visualDensity: VisualDensity.compact,
@@ -773,7 +718,7 @@ class _SearchPageState extends State<SearchPage> {
                           children: [
                             Expanded(
                               child: FilledButton.tonalIcon(
-                                onPressed: _exportBackup,
+                                onPressed: _exportZip,
                                 icon: const Icon(Icons.upload_file),
                                 label: const Text('导出备份'),
                               ),
@@ -781,7 +726,7 @@ class _SearchPageState extends State<SearchPage> {
                             const SizedBox(width: 8),
                             Expanded(
                               child: OutlinedButton.icon(
-                                onPressed: _importBackup,
+                                onPressed: _importZip,
                                 icon: const Icon(Icons.download_for_offline_outlined),
                                 label: const Text('导入恢复'),
                               ),
@@ -798,7 +743,148 @@ class _SearchPageState extends State<SearchPage> {
   }
 }
 
-// ==================== 2. 家庭模块页面 (6套炫彩渐变卡片 + 上下加宽 + 仅按序号拆分) ====================
+// ==================== 基准版原生树形勾选组件 ModuleTreeSelector ====================
+class ModuleTreeSelector extends StatefulWidget {
+  final List> allMods;
+  final Set<int> selectedIds;
+  final VoidCallback onChanged;
+
+  const ModuleTreeSelector({
+    super.key,
+    required this.allMods,
+    required this.selectedIds,
+    required this.onChanged,
+  });
+
+  @override
+  State<ModuleTreeSelector> createState() => _ModuleTreeSelectorState();
+}
+
+class _ModuleTreeSelectorState extends State<ModuleTreeSelector> {
+  final Set<int> _expanded = {};
+
+  List> _childrenOf(int? pid) =>
+      widget.allMods.where((m) => m['parent_id'] == pid).toList();
+
+  List<int> _descendantsOf(int rootId) {
+    final res = <int>[rootId];
+    for (final c in _childrenOf(rootId)) {
+      res.addAll(_descendantsOf(c['id'] as int));
+    }
+    return res;
+  }
+
+  Widget _buildNode(Map<String, dynamic> m, int depth) {
+    final id = m['id'] as int;
+    final isMember = (m['is_member'] as int? ?? 0) == 1;
+    final children = _childrenOf(id);
+    final hasChildren = children.isNotEmpty;
+    final isExp = _expanded.contains(id);
+    final subIds = _descendantsOf(id);
+    final allSelected = subIds.every((sid) => widget.selectedIds.contains(sid));
+    final someSelected = !allSelected && subIds.any((sid) => widget.selectedIds.contains(sid));
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: EdgeInsets.only(left: depth * 18.0),
+          child: Row(
+            children: [
+              if (hasChildren)
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                  icon: Icon(
+                    isExp ? Icons.arrow_drop_down : Icons.arrow_right,
+                    size: 22,
+                    color: const Color(0xFF4F46E5),
+                  ),
+                  onPressed: () => setState(() => isExp ? _expanded.remove(id) : _expanded.add(id)),
+                )
+              else
+                const SizedBox(width: 28),
+              Icon(
+                isMember ? Icons.person : (depth == 0 ? Icons.folder_outlined : Icons.subdirectory_arrow_right),
+                size: 16,
+                color: isMember ? const Color(0xFFEC4899) : Colors.blueGrey,
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: GestureDetector(
+                  onTap: () {
+                    if (hasChildren) {
+                      setState(() => isExp ? _expanded.remove(id) : _expanded.add(id));
+                    } else {
+                      setState(() {
+                        widget.selectedIds.contains(id)
+                            ? widget.selectedIds.remove(id)
+                            : widget.selectedIds.add(id);
+                      });
+                      widget.onChanged();
+                    }
+                  },
+                  child: Text(
+                    '${m['title']}',
+                    style: TextStyle(
+                      fontWeight: depth == 0 ? FontWeight.bold : FontWeight.normal,
+                      fontSize: depth == 0 ? 14.5 : 13.5,
+                    ),
+                  ),
+                ),
+              ),
+              if (hasChildren)
+                TextButton(
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    minimumSize: Size.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  onPressed: () => setState(() => isExp ? _expanded.remove(id) : _expanded.add(id)),
+                  child: Text(isExp ? '收起' : '细筛(${children.length})', style: const TextStyle(fontSize: 11.5)),
+                ),
+              Checkbox(
+                tristate: true,
+                value: allSelected ? true : (someSelected ? null : false),
+                onChanged: (_) {
+                  setState(() {
+                    if (allSelected) {
+                      widget.selectedIds.removeAll(subIds);
+                    } else {
+                      widget.selectedIds.addAll(subIds);
+                    }
+                  });
+                  widget.onChanged();
+                },
+              ),
+            ],
+          ),
+        ),
+        if (hasChildren && isExp)
+          ...children.map((c) => _buildNode(c, depth + 1)),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.allMods.isEmpty) {
+      return const Center(child: Text('暂无家庭模块，请先在「家庭」页添加'));
+    }
+    final validIds = widget.allMods.map((m) => m['id'] as int).toSet();
+    final roots = widget.allMods.where((m) {
+      final pid = m['parent_id'] as int?;
+      return pid == null || !validIds.contains(pid);
+    }).toList();
+
+    return ListView(
+      children: roots.map((r) => _buildNode(r, 0)).toList(),
+    );
+  }
+}
+
+// ==================== 2. 家庭模块页面 (差异炫彩 _buildAestheticMemberCard + 调宽防重叠 + 仅按序号拆分) ====================
 class _MemberPalette {
   final List<Color> bgGradient;
   final List<Color> avatarGradient;
@@ -825,12 +911,14 @@ class FamilyPage extends StatefulWidget {
 }
 
 class _FamilyPageState extends State<FamilyPage> {
-  final Set<int> _collapsedIds = {};
+  final Set<int> _expandedMods = {};
   int? _hoverTargetId;
   String? _hoverZone;
   bool _uiLoaded = false;
 
+  // 6套高定差异炫彩渐变配色
   static const List<_MemberPalette> _memberPalettes = [
+    // 0: 梦幻流光粉紫
     _MemberPalette(
       bgGradient: [Color(0xFFFFF1F2), Color(0xFFF5F3FF), Color(0xFFFDF2F8)],
       avatarGradient: [Color(0xFFEC4899), Color(0xFF8B5CF6)],
@@ -839,6 +927,7 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFFDB2777),
       titleColor: Color(0xFF831843),
     ),
+    // 1: 赛博极光蓝青
     _MemberPalette(
       bgGradient: [Color(0xFFEFF6FF), Color(0xFFECFEFF), Color(0xFFF0F9FF)],
       avatarGradient: [Color(0xFF2563EB), Color(0xFF06B6D4)],
@@ -847,6 +936,7 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFF0284C7),
       titleColor: Color(0xFF0C4A6E),
     ),
+    // 2: 暖阳流金琥珀
     _MemberPalette(
       bgGradient: [Color(0xFFFFFBEB), Color(0xFFFFF7ED), Color(0xFFFEF2F2)],
       avatarGradient: [Color(0xFFF59E0B), Color(0xFFEF4444)],
@@ -855,6 +945,7 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFFD97706),
       titleColor: Color(0xFF78350F),
     ),
+    // 3: 翡翠森系极光
     _MemberPalette(
       bgGradient: [Color(0xFFECFDF5), Color(0xFFF0FDFA), Color(0xFFF0FDF4)],
       avatarGradient: [Color(0xFF10B981), Color(0xFF0D9488)],
@@ -863,6 +954,7 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFF059669),
       titleColor: Color(0xFF064E3B),
     ),
+    // 4: 星河魅影紫蓝
     _MemberPalette(
       bgGradient: [Color(0xFFF5F3FF), Color(0xFFEEF2FF), Color(0xFFFAF5FF)],
       avatarGradient: [Color(0xFF7C3AED), Color(0xFF4F46E5)],
@@ -871,6 +963,7 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFF6D28D9),
       titleColor: Color(0xFF311068),
     ),
+    // 5: 绯红霓虹珊瑚
     _MemberPalette(
       bgGradient: [Color(0xFFFFF1F2), Color(0xFFFFF5F5), Color(0xFFFFF7ED)],
       avatarGradient: [Color(0xFFE11D48), Color(0xFFFB7185)],
@@ -897,11 +990,10 @@ class _FamilyPageState extends State<FamilyPage> {
 
   Future<void> _restoreFamilyUiState() async {
     try {
-      final activeDb = await AppDatabase.instance.database;
-      final rows = await activeDb.query('ui_states', where: 'state_key = ?', whereArgs: ['family_collapsed_ids']);
-      if (rows.isNotEmpty) {
-        final list = (jsonDecode(rows.first['state_val'] as String) as List).cast<int>();
-        _collapsedIds
+      final raw = await AppDatabase.getUiState(widget.db, 'family_expanded_mods');
+      if (raw != null && raw.isNotEmpty) {
+        final list = (jsonDecode(raw) as List).map((e) => int.parse('$e')).toList();
+        _expandedMods
           ..clear()
           ..addAll(list);
       }
@@ -910,20 +1002,15 @@ class _FamilyPageState extends State<FamilyPage> {
   }
 
   Future<void> _saveFamilyUiState() async {
-    try {
-      final activeDb = await AppDatabase.instance.database;
-      await activeDb.insert(
-        'ui_states',
-        {'state_key': 'family_collapsed_ids', 'state_val': jsonEncode(_collapsedIds.toList())},
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
-    } catch (_) {}
+    await AppDatabase.setUiState(widget.db, 'family_expanded_mods', jsonEncode(_expandedMods.toList()));
   }
 
-  Future<Map<String, dynamic>> _loadFamilyData() async {
+  Future> _loadMods() async {
     if (!_uiLoaded) await _restoreFamilyUiState();
     final activeDb = await AppDatabase.instance.database;
-    final mods = await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC');
+    final mods = List>.from(
+      await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC'),
+    );
     final entries = await activeDb.query('module_entries');
     final entryCounts = <int, int>{};
     for (final e in entries) {
@@ -933,7 +1020,7 @@ class _FamilyPageState extends State<FamilyPage> {
     return {'mods': mods, 'counts': entryCounts};
   }
 
-  bool _isDescendant(int dragId, int targetId, List<Map<String, dynamic>> all) {
+  bool _isDescendant(int dragId, int targetId, List> all) {
     if (dragId == targetId) return true;
     int? cur = targetId;
     final visited = <int>{};
@@ -946,11 +1033,11 @@ class _FamilyPageState extends State<FamilyPage> {
     return false;
   }
 
-  Future<void> _handleDrop({
+  Future<void> _moveModule({
     required int dragId,
     required int targetId,
     required String zone,
-    required List<Map<String, dynamic>> allMods,
+    required List> allMods,
   }) async {
     if (_isDescendant(dragId, targetId, allMods)) return;
     final activeDb = await AppDatabase.instance.database;
@@ -964,7 +1051,7 @@ class _FamilyPageState extends State<FamilyPage> {
         where: 'id = ?',
         whereArgs: [dragId],
       );
-      _collapsedIds.remove(targetId);
+      _expandedMods.add(targetId);
       await _saveFamilyUiState();
     } else {
       final newParentId = target['parent_id'] as int?;
@@ -983,6 +1070,24 @@ class _FamilyPageState extends State<FamilyPage> {
           whereArgs: [siblings[i]['id']],
         );
       }
+    }
+    setState(() {});
+  }
+
+  Future<void> _deleteModCascade(int id, List> allMods) async {
+    final activeDb = await AppDatabase.instance.database;
+    final subIds = <int>[id];
+    void collect(int pid) {
+      for (final c in allMods.where((m) => m['parent_id'] == pid)) {
+        final cid = c['id'] as int;
+        subIds.add(cid);
+        collect(cid);
+      }
+    }
+    collect(id);
+    for (final did in subIds) {
+      await activeDb.delete('module_entries', where: 'module_id = ?', whereArgs: [did]);
+      await activeDb.delete('modules', where: 'id = ?', whereArgs: [did]);
     }
     setState(() {});
   }
@@ -1111,7 +1216,7 @@ class _FamilyPageState extends State<FamilyPage> {
           folderRanks.add(99);
         } else {
           int rank = 3;
-          if (cur.fontSize >= 32 || styleMatchesLevel(cur.text, 1) || (cur.numLevel == 0 && cur.isBold)) {
+          if (cur.fontSize >= 32 || RegExp(r'^[一二三四五六七八九十]+[、\.]').hasMatch(cur.text) || (cur.numLevel == 0 && cur.isBold)) {
             rank = 1;
           } else if (cur.fontSize >= 28 || cur.numLevel == 0) {
             rank = 2;
@@ -1234,14 +1339,8 @@ class _FamilyPageState extends State<FamilyPage> {
     }
   }
 
-  bool styleMatchesLevel(String text, int level) {
-    if (level == 1) {
-      return RegExp(r'^[一二三四五六七八九十]+[、\.]').hasMatch(text);
-    }
-    return false;
-  }
-
-  Future<void> _moduleEntriesDialog(Map<String, dynamic> mod, List<Map<String, dynamic>> allMods) async {
+  /// 基准版原生底部抽屉 _openEntries（去掉换行强拆，仅按显式序号拆分）
+  Future<void> _openEntries(Map<String, dynamic> mod, List> allMods) async {
     final activeDb = await AppDatabase.instance.database;
     final modId = mod['id'] as int;
     final modMap = {for (final m in allMods) m['id'] as int: m};
@@ -1257,8 +1356,8 @@ class _FamilyPageState extends State<FamilyPage> {
     }
 
     final fullPath = fullPathOf(modId);
-    final entries = List<Map<String, dynamic>>.from(
-      await activeDb.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC'),
+    final entries = List>.from(
+      await activeDb.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC'),
     );
 
     if (!mounted) return;
@@ -1298,7 +1397,7 @@ class _FamilyPageState extends State<FamilyPage> {
                       ),
                       onPressed: () {
                         Navigator.pop(ctx);
-                        _addOrEditModuleDialog(parentId: modId, forceMember: false);
+                        _createOrEditMod(parentId: modId, forceMember: false);
                       },
                       icon: const Icon(Icons.create_new_folder_outlined, size: 16),
                       label: const Text('加小标题', style: TextStyle(fontSize: 13)),
@@ -1338,6 +1437,7 @@ class _FamilyPageState extends State<FamilyPage> {
                         if (raw.isEmpty) return;
                         final db = await AppDatabase.instance.database;
 
+                        // 核心需求：换行不再自动拆成多条，仅在遇到显式序号（1. / ① / 一、）时拆分
                         final itemsToInsert = <String>[];
                         final seqRegex = RegExp(
                           r'(?:^|\n)\s*(?:\d+[\.、]|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]|[一二三四五六七八九十]+[、\.])\s*',
@@ -1373,7 +1473,7 @@ class _FamilyPageState extends State<FamilyPage> {
                         ctrl.clear();
                         entries
                           ..clear()
-                          ..addAll(await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC'));
+                          ..addAll(await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC'));
                         setS(() {});
                         setState(() {});
                       },
@@ -1433,7 +1533,7 @@ class _FamilyPageState extends State<FamilyPage> {
                                         final db = await AppDatabase.instance.database;
                                         entries
                                           ..clear()
-                                          ..addAll(await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC'));
+                                          ..addAll(await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC'));
                                         setS(() {});
                                         setState(() {});
                                       }),
@@ -1446,13 +1546,13 @@ class _FamilyPageState extends State<FamilyPage> {
                                     onPressed: () async {
                                       final db = await AppDatabase.instance.database;
                                       await db.delete('module_entries', where: 'id = ?', whereArgs: [e['id']]);
-                                      final rem = await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC');
+                                      final rem = await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC');
                                       for (int idx = 0; idx < rem.length; idx++) {
                                         await db.update('module_entries', {'seq': idx + 1, 'sort_order': idx}, where: 'id = ?', whereArgs: [rem[idx]['id']]);
                                       }
                                       entries
                                         ..clear()
-                                        ..addAll(await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC'));
+                                        ..addAll(await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC'));
                                       setS(() {});
                                       setState(() {});
                                     },
@@ -1513,7 +1613,7 @@ class _FamilyPageState extends State<FamilyPage> {
     );
   }
 
-  Future<void> _addOrEditModuleDialog({Map<String, dynamic>? editMod, int? parentId, bool forceMember = false}) async {
+  Future<void> _createOrEditMod({Map<String, dynamic>? editMod, int? parentId, bool forceMember = false}) async {
     final isEdit = editMod != null;
     final ctrl = TextEditingController(text: isEdit ? '${editMod['title']}' : '');
     bool isMember = isEdit ? ((editMod['is_member'] as int? ?? 0) == 1) : forceMember;
@@ -1533,7 +1633,7 @@ class _FamilyPageState extends State<FamilyPage> {
                 controller: ctrl,
                 autofocus: true,
                 decoration: InputDecoration(
-                  labelText: forceMember ? '成员姓名（如：梦雨、雁冰、球球）' : '标题名称',
+                  labelText: forceMember ? '成员姓名（如：梦钰、雁冰、球球）' : '标题名称',
                   border: const OutlineInputBorder(),
                 ),
               ),
@@ -1574,6 +1674,10 @@ class _FamilyPageState extends State<FamilyPage> {
                     'sort_order': siblings.length,
                     'created_at': DateTime.now().toIso8601String(),
                   });
+                  if (parentId != null) {
+                    _expandedMods.add(parentId);
+                    await _saveFamilyUiState();
+                  }
                 }
                 if (mounted) Navigator.pop(ctx);
                 setState(() {});
@@ -1582,6 +1686,345 @@ class _FamilyPageState extends State<FamilyPage> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  /// 基准版原生高定成员卡片方法（升级 6 套差异炫彩主题 + 调宽上下间距 + 防图标重叠）
+  Widget _buildAestheticMemberCard({
+    required Map<String, dynamic> mod,
+    required List> allMods,
+    required bool hasChildren,
+    required bool isExpanded,
+    required int subBadgeCount,
+    required String? zone,
+    required _MemberPalette palette,
+  }) {
+    final id = mod['id'] as int;
+    final title = '${mod['title']}';
+
+    return Container(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: zone == 'inside'
+              ? [const Color(0xFFEEF2FF), const Color(0xFFE0E7FF)]
+              : palette.bgGradient,
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(18),
+        border: Border(
+          top: BorderSide(
+            color: zone == 'up' ? const Color(0xFF4F46E5) : palette.borderColor.withOpacity(0.55),
+            width: zone == 'up' ? 3.0 : 1.3,
+          ),
+          bottom: BorderSide(
+            color: zone == 'down' ? const Color(0xFF4F46E5) : palette.borderColor.withOpacity(0.55),
+            width: zone == 'down' ? 3.0 : 1.3,
+          ),
+          left: BorderSide(
+            color: zone == 'inside' ? const Color(0xFF4F46E5) : palette.borderColor.withOpacity(0.85),
+            width: zone == 'inside' ? 3.0 : 4.0,
+          ),
+          right: BorderSide(
+            color: zone == 'inside' ? const Color(0xFF4F46E5) : palette.borderColor.withOpacity(0.55),
+            width: zone == 'inside' ? 3.0 : 1.3,
+          ),
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: palette.accentColor.withOpacity(0.12),
+            blurRadius: 12,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      // 调宽上下内边距（vertical: 15），视觉舒展大气
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 15),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          if (hasChildren)
+            GestureDetector(
+              onTap: () {
+                setState(() => isExpanded ? _expandedMods.remove(id) : _expandedMods.add(id));
+                _saveFamilyUiState();
+              },
+              child: Container(
+                width: 26,
+                height: 26,
+                margin: const EdgeInsets.only(right: 8),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.85),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  isExpanded ? Icons.expand_more : Icons.chevron_right,
+                  size: 19,
+                  color: palette.accentColor,
+                ),
+              ),
+            )
+          else
+            const SizedBox(width: 6),
+          Container(
+            width: 38,
+            height: 38,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: LinearGradient(
+                colors: palette.avatarGradient,
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: palette.accentColor.withOpacity(0.32),
+                  blurRadius: 6,
+                  offset: const Offset(0, 2),
+                ),
+              ],
+            ),
+            child: Text(
+              title.isNotEmpty ? title.substring(0, 1) : '★',
+              style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => _openEntries(mod, allMods),
+              child: Wrap(
+                crossAxisAlignment: WrapCrossAlignment.center,
+                spacing: 6,
+                runSpacing: 5,
+                children: [
+                  Text(
+                    title,
+                    style: TextStyle(
+                      fontWeight: FontWeight.w800,
+                      fontSize: 16,
+                      color: palette.titleColor,
+                    ),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(colors: palette.badgeGradient),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Text(
+                      '✨ MEMBER',
+                      style: TextStyle(fontSize: 9.5, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 0.4),
+                    ),
+                  ),
+                  if (subBadgeCount > 0)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.9),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: palette.borderColor.withOpacity(0.5)),
+                      ),
+                      child: Text(
+                        '$subBadgeCount 项',
+                        style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: palette.accentColor),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 6),
+          InkWell(
+            onTap: () => _createOrEditMod(parentId: id, forceMember: false),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 4),
+              child: Icon(Icons.create_new_folder_outlined, size: 19, color: palette.accentColor),
+            ),
+          ),
+          InkWell(
+            onTap: () => _createOrEditMod(editMod: mod),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 4),
+              child: Icon(Icons.edit_outlined, size: 18, color: palette.accentColor.withOpacity(0.8)),
+            ),
+          ),
+          InkWell(
+            onTap: () => _deleteModCascade(id, allMods),
+            child: const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 5, vertical: 4),
+              child: Icon(Icons.delete_outline, size: 19, color: Colors.redAccent),
+            ),
+          ),
+          LongPressDraggable<int>(
+            data: id,
+            feedback: Material(
+              elevation: 8,
+              borderRadius: BorderRadius.circular(14),
+              child: Container(
+                width: 230,
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(colors: palette.bgGradient),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: palette.accentColor, width: 1.8),
+                ),
+                child: Text(title, style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: palette.titleColor)),
+              ),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.only(left: 4, right: 2, top: 4, bottom: 4),
+              child: Icon(Icons.drag_handle, size: 20, color: palette.accentColor.withOpacity(0.6)),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 基准版原生普通文件夹卡片方法 _buildStandardFolderCard
+  Widget _buildStandardFolderCard({
+    required Map<String, dynamic> mod,
+    required List> allMods,
+    required int depth,
+    required bool hasChildren,
+    required bool isExpanded,
+    required int subBadgeCount,
+    required String? zone,
+  }) {
+    final id = mod['id'] as int;
+    final title = '${mod['title']}';
+
+    return Container(
+      decoration: BoxDecoration(
+        color: zone == 'inside' ? const Color(0xFFEEF2FF) : Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border(
+          top: BorderSide(
+            color: zone == 'up' ? const Color(0xFF4F46E5) : const Color(0xFFE2E8F0),
+            width: zone == 'up' ? 3.0 : 1.0,
+          ),
+          bottom: BorderSide(
+            color: zone == 'down' ? const Color(0xFF4F46E5) : const Color(0xFFE2E8F0),
+            width: zone == 'down' ? 3.0 : 1.0,
+          ),
+          left: BorderSide(
+            color: zone == 'inside' ? const Color(0xFF4F46E5) : const Color(0xFFE2E8F0),
+            width: zone == 'inside' ? 2.5 : 1.0,
+          ),
+          right: BorderSide(
+            color: zone == 'inside' ? const Color(0xFF4F46E5) : const Color(0xFFE2E8F0),
+            width: zone == 'inside' ? 2.5 : 1.0,
+          ),
+        ),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 11),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          if (hasChildren)
+            GestureDetector(
+              onTap: () {
+                setState(() => isExpanded ? _expandedMods.remove(id) : _expandedMods.add(id));
+                _saveFamilyUiState();
+              },
+              child: Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Icon(
+                  isExpanded ? Icons.expand_more : Icons.chevron_right,
+                  size: 20,
+                  color: const Color(0xFF4F46E5),
+                ),
+              ),
+            ),
+          Padding(
+            padding: const EdgeInsets.only(right: 6),
+            child: Icon(
+              depth == 0 ? Icons.folder_outlined : Icons.subdirectory_arrow_right,
+              size: 18,
+              color: const Color(0xFF4F46E5),
+            ),
+          ),
+          Expanded(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => _openEntries(mod, allMods),
+              child: Wrap(
+                crossAxisAlignment: WrapCrossAlignment.center,
+                spacing: 6,
+                runSpacing: 4,
+                children: [
+                  Text(
+                    title,
+                    style: TextStyle(
+                      fontWeight: depth == 0 ? FontWeight.bold : FontWeight.w600,
+                      fontSize: 14.5,
+                      color: const Color(0xFF1E293B),
+                    ),
+                  ),
+                  if (subBadgeCount > 0)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFEEF2FF),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        '$subBadgeCount',
+                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF4F46E5)),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 4),
+          InkWell(
+            onTap: () => _createOrEditMod(parentId: id, forceMember: false),
+            child: const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 5, vertical: 3),
+              child: Icon(Icons.create_new_folder_outlined, size: 18, color: Color(0xFF4F46E5)),
+            ),
+          ),
+          InkWell(
+            onTap: () => _createOrEditMod(editMod: mod),
+            child: const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 5, vertical: 3),
+              child: Icon(Icons.edit_outlined, size: 17, color: Colors.blueGrey),
+            ),
+          ),
+          InkWell(
+            onTap: () => _deleteModCascade(id, allMods),
+            child: const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 5, vertical: 3),
+              child: Icon(Icons.delete_outline, size: 18, color: Colors.redAccent),
+            ),
+          ),
+          LongPressDraggable<int>(
+            data: id,
+            feedback: Material(
+              elevation: 8,
+              borderRadius: BorderRadius.circular(10),
+              child: Container(
+                width: 220,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFEEF2FF),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFF4F46E5), width: 1.5),
+                ),
+                child: Text(title, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+              ),
+            ),
+            child: const Padding(
+              padding: EdgeInsets.only(left: 4, right: 2, top: 3, bottom: 3),
+              child: Icon(Icons.drag_handle, size: 19, color: Colors.grey),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1601,23 +2044,23 @@ class _FamilyPageState extends State<FamilyPage> {
             label: const Text('导入Word', style: TextStyle(fontSize: 13)),
           ),
           TextButton.icon(
-            onPressed: () => _addOrEditModuleDialog(parentId: null, forceMember: true),
+            onPressed: () => _createOrEditMod(parentId: null, forceMember: true),
             icon: const Icon(Icons.person_add_alt_1, size: 17),
             label: const Text('添加成员', style: TextStyle(fontSize: 13)),
           ),
           TextButton.icon(
-            onPressed: () => _addOrEditModuleDialog(parentId: null, forceMember: false),
+            onPressed: () => _createOrEditMod(parentId: null, forceMember: false),
             icon: const Icon(Icons.add, size: 18),
             label: const Text('新标题', style: TextStyle(fontSize: 13)),
           ),
         ],
       ),
-      body: FutureBuilder<Map<String, dynamic>>(
-        future: _loadFamilyData(),
+      body: FutureBuilder>(
+        future: _loadMods(),
         builder: (ctx, snap) {
           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
           final dataMap = snap.data!;
-          final mods = dataMap['mods'] as List<Map<String, dynamic>>;
+          final mods = dataMap['mods'] as List>;
           final entryCounts = dataMap['counts'] as Map<int, int>;
 
           final validIds = mods.map((m) => m['id'] as int).toSet();
@@ -1626,18 +2069,18 @@ class _FamilyPageState extends State<FamilyPage> {
             return pid == null || !validIds.contains(pid);
           }).toList();
 
-          List<Map<String, dynamic>> childrenOf(int pid) =>
+          List> childrenOf(int pid) =>
               mods.where((m) => m['parent_id'] == pid).toList();
 
           final memberIdList = mods.where((m) => (m['is_member'] as int? ?? 0) == 1).map((m) => m['id'] as int).toList();
 
-          Widget buildNode(Map<String, dynamic> m, int depth) {
+          Widget buildDraggableModLevel(Map<String, dynamic> m, int depth) {
             final id = m['id'] as int;
             final title = '${m['title']}';
             final isMember = (m['is_member'] as int? ?? 0) == 1;
             final children = childrenOf(id);
             final hasChildren = children.isNotEmpty;
-            final isCollapsed = _collapsedIds.contains(id);
+            final isExpanded = _expandedMods.contains(id);
 
             final subBadgeCount = hasChildren ? children.length : (entryCounts[id] ?? 0);
 
@@ -1648,7 +2091,7 @@ class _FamilyPageState extends State<FamilyPage> {
             final palette = _paletteForMember(title, memberIdx, id);
 
             return Column(
-              key: ValueKey('fam_node_$id'),
+              key: ValueKey('tree_mod_$id'),
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Padding(
@@ -1693,7 +2136,7 @@ class _FamilyPageState extends State<FamilyPage> {
                           _hoverTargetId = null;
                           _hoverZone = null;
                         });
-                        await _handleDrop(
+                        await _moveModule(
                           dragId: details.data,
                           targetId: id,
                           zone: z,
@@ -1702,354 +2145,31 @@ class _FamilyPageState extends State<FamilyPage> {
                       },
                       builder: (ctx, cand, rej) {
                         if (isMember) {
-                          return Container(
-                            decoration: BoxDecoration(
-                              gradient: LinearGradient(
-                                colors: zone == 'inside'
-                                    ? [const Color(0xFFEEF2FF), const Color(0xFFE0E7FF)]
-                                    : palette.bgGradient,
-                                begin: Alignment.topLeft,
-                                end: Alignment.bottomRight,
-                              ),
-                              borderRadius: BorderRadius.circular(18),
-                              border: Border(
-                                top: BorderSide(
-                                  color: zone == 'up' ? const Color(0xFF4F46E5) : palette.borderColor.withOpacity(0.55),
-                                  width: zone == 'up' ? 3.0 : 1.3,
-                                ),
-                                bottom: BorderSide(
-                                  color: zone == 'down' ? const Color(0xFF4F46E5) : palette.borderColor.withOpacity(0.55),
-                                  width: zone == 'down' ? 3.0 : 1.3,
-                                ),
-                                left: BorderSide(
-                                  color: zone == 'inside' ? const Color(0xFF4F46E5) : palette.borderColor.withOpacity(0.85),
-                                  width: zone == 'inside' ? 3.0 : 4.0,
-                                ),
-                                right: BorderSide(
-                                  color: zone == 'inside' ? const Color(0xFF4F46E5) : palette.borderColor.withOpacity(0.55),
-                                  width: zone == 'inside' ? 3.0 : 1.3,
-                                ),
-                              ),
-                              boxShadow: [
-                                BoxShadow(
-                                  color: palette.accentColor.withOpacity(0.12),
-                                  blurRadius: 12,
-                                  offset: const Offset(0, 4),
-                                ),
-                              ],
-                            ),
-                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 15),
-                            child: Row(
-                              crossAxisAlignment: CrossAxisAlignment.center,
-                              children: [
-                                if (hasChildren)
-                                  GestureDetector(
-                                    onTap: () {
-                                      setState(() => isCollapsed ? _collapsedIds.remove(id) : _collapsedIds.add(id));
-                                      _saveFamilyUiState();
-                                    },
-                                    child: Container(
-                                      width: 26,
-                                      height: 26,
-                                      margin: const EdgeInsets.only(right: 8),
-                                      decoration: BoxDecoration(
-                                        color: Colors.white.withOpacity(0.85),
-                                        shape: BoxShape.circle,
-                                      ),
-                                      child: Icon(
-                                        isCollapsed ? Icons.chevron_right : Icons.expand_more,
-                                        size: 19,
-                                        color: palette.accentColor,
-                                      ),
-                                    ),
-                                  )
-                                else
-                                  const SizedBox(width: 6),
-                                Container(
-                                  width: 38,
-                                  height: 38,
-                                  alignment: Alignment.center,
-                                  decoration: BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    gradient: LinearGradient(
-                                      colors: palette.avatarGradient,
-                                      begin: Alignment.topLeft,
-                                      end: Alignment.bottomRight,
-                                    ),
-                                    boxShadow: [
-                                      BoxShadow(
-                                        color: palette.accentColor.withOpacity(0.32),
-                                        blurRadius: 6,
-                                        offset: const Offset(0, 2),
-                                      ),
-                                    ],
-                                  ),
-                                  child: Text(
-                                    title.isNotEmpty ? title.substring(0, 1) : '★',
-                                    style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
-                                  ),
-                                ),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
-                                    onTap: () => _moduleEntriesDialog(m, mods),
-                                    child: Wrap(
-                                      crossAxisAlignment: WrapCrossAlignment.center,
-                                      spacing: 6,
-                                      runSpacing: 5,
-                                      children: [
-                                        Text(
-                                          title,
-                                          style: TextStyle(
-                                            fontWeight: FontWeight.w800,
-                                            fontSize: 16,
-                                            color: palette.titleColor,
-                                          ),
-                                        ),
-                                        Container(
-                                          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                                          decoration: BoxDecoration(
-                                            gradient: LinearGradient(colors: palette.badgeGradient),
-                                            borderRadius: BorderRadius.circular(10),
-                                          ),
-                                          child: const Text(
-                                            '✨ MEMBER',
-                                            style: TextStyle(fontSize: 9.5, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 0.4),
-                                          ),
-                                        ),
-                                        if (subBadgeCount > 0)
-                                          Container(
-                                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                                            decoration: BoxDecoration(
-                                              color: Colors.white.withOpacity(0.9),
-                                              borderRadius: BorderRadius.circular(10),
-                                              border: Border.all(color: palette.borderColor.withOpacity(0.5)),
-                                            ),
-                                            child: Text(
-                                              '$subBadgeCount 项',
-                                              style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: palette.accentColor),
-                                            ),
-                                          ),
-                                      ],
-                                    ),
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                                InkWell(
-                                  onTap: () => _addOrEditModuleDialog(parentId: id, forceMember: false),
-                                  child: Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 4),
-                                    child: Icon(Icons.create_new_folder_outlined, size: 19, color: palette.accentColor),
-                                  ),
-                                ),
-                                InkWell(
-                                  onTap: () => _addOrEditModuleDialog(editMod: m),
-                                  child: Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 4),
-                                    child: Icon(Icons.edit_outlined, size: 18, color: palette.accentColor.withOpacity(0.8)),
-                                  ),
-                                ),
-                                InkWell(
-                                  onTap: () async {
-                                    final db = await AppDatabase.instance.database;
-                                    final subIds = <int>[id];
-                                    void collect(int p) {
-                                      for (final c in childrenOf(p)) {
-                                        final cid = c['id'] as int;
-                                        subIds.add(cid);
-                                        collect(cid);
-                                      }
-                                    }
-                                    collect(id);
-                                    for (final did in subIds) {
-                                      await db.delete('module_entries', where: 'module_id = ?', whereArgs: [did]);
-                                      await db.delete('modules', where: 'id = ?', whereArgs: [did]);
-                                    }
-                                    setState(() {});
-                                  },
-                                  child: const Padding(
-                                    padding: EdgeInsets.symmetric(horizontal: 5, vertical: 4),
-                                    child: Icon(Icons.delete_outline, size: 19, color: Colors.redAccent),
-                                  ),
-                                ),
-                                LongPressDraggable<int>(
-                                  data: id,
-                                  feedback: Material(
-                                    elevation: 8,
-                                    borderRadius: BorderRadius.circular(14),
-                                    child: Container(
-                                      width: 230,
-                                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                                      decoration: BoxDecoration(
-                                        gradient: LinearGradient(colors: palette.bgGradient),
-                                        borderRadius: BorderRadius.circular(14),
-                                        border: Border.all(color: palette.accentColor, width: 1.8),
-                                      ),
-                                      child: Text(title, style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: palette.titleColor)),
-                                    ),
-                                  ),
-                                  child: Padding(
-                                    padding: const EdgeInsets.only(left: 4, right: 2, top: 4, bottom: 4),
-                                    child: Icon(Icons.drag_handle, size: 20, color: palette.accentColor.withOpacity(0.6)),
-                                  ),
-                                ),
-                              ],
-                            ),
+                          return _buildAestheticMemberCard(
+                            mod: m,
+                            allMods: mods,
+                            hasChildren: hasChildren,
+                            isExpanded: isExpanded,
+                            subBadgeCount: subBadgeCount,
+                            zone: zone,
+                            palette: palette,
                           );
                         }
-
-                        return Container(
-                          decoration: BoxDecoration(
-                            color: zone == 'inside' ? const Color(0xFFEEF2FF) : Colors.white,
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border(
-                              top: BorderSide(
-                                color: zone == 'up' ? const Color(0xFF4F46E5) : const Color(0xFFE2E8F0),
-                                width: zone == 'up' ? 3.0 : 1.0,
-                              ),
-                              bottom: BorderSide(
-                                color: zone == 'down' ? const Color(0xFF4F46E5) : const Color(0xFFE2E8F0),
-                                width: zone == 'down' ? 3.0 : 1.0,
-                              ),
-                              left: BorderSide(
-                                color: zone == 'inside' ? const Color(0xFF4F46E5) : const Color(0xFFE2E8F0),
-                                width: zone == 'inside' ? 2.5 : 1.0,
-                              ),
-                              right: BorderSide(
-                                color: zone == 'inside' ? const Color(0xFF4F46E5) : const Color(0xFFE2E8F0),
-                                width: zone == 'inside' ? 2.5 : 1.0,
-                              ),
-                            ),
-                          ),
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 11),
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.center,
-                            children: [
-                              if (hasChildren)
-                                GestureDetector(
-                                  onTap: () {
-                                    setState(() => isCollapsed ? _collapsedIds.remove(id) : _collapsedIds.add(id));
-                                    _saveFamilyUiState();
-                                  },
-                                  child: Padding(
-                                    padding: const EdgeInsets.only(right: 4),
-                                    child: Icon(
-                                      isCollapsed ? Icons.chevron_right : Icons.expand_more,
-                                      size: 20,
-                                      color: const Color(0xFF4F46E5),
-                                    ),
-                                  ),
-                                ),
-                              Padding(
-                                padding: const EdgeInsets.only(right: 6),
-                                child: Icon(
-                                  depth == 0 ? Icons.folder_outlined : Icons.subdirectory_arrow_right,
-                                  size: 18,
-                                  color: const Color(0xFF4F46E5),
-                                ),
-                              ),
-                              Expanded(
-                                child: GestureDetector(
-                                  behavior: HitTestBehavior.opaque,
-                                  onTap: () => _moduleEntriesDialog(m, mods),
-                                  child: Wrap(
-                                    crossAxisAlignment: WrapCrossAlignment.center,
-                                    spacing: 6,
-                                    runSpacing: 4,
-                                    children: [
-                                      Text(
-                                        title,
-                                        style: TextStyle(
-                                          fontWeight: depth == 0 ? FontWeight.bold : FontWeight.w600,
-                                          fontSize: 14.5,
-                                          color: const Color(0xFF1E293B),
-                                        ),
-                                      ),
-                                      if (subBadgeCount > 0)
-                                        Container(
-                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                                          decoration: BoxDecoration(
-                                            color: const Color(0xFFEEF2FF),
-                                            borderRadius: BorderRadius.circular(6),
-                                          ),
-                                          child: Text(
-                                            '$subBadgeCount',
-                                            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF4F46E5)),
-                                          ),
-                                        ),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 4),
-                              InkWell(
-                                onTap: () => _addOrEditModuleDialog(parentId: id, forceMember: false),
-                                child: const Padding(
-                                  padding: EdgeInsets.symmetric(horizontal: 5, vertical: 3),
-                                  child: Icon(Icons.create_new_folder_outlined, size: 18, color: Color(0xFF4F46E5)),
-                                ),
-                              ),
-                              InkWell(
-                                onTap: () => _addOrEditModuleDialog(editMod: m),
-                                child: const Padding(
-                                  padding: EdgeInsets.symmetric(horizontal: 5, vertical: 3),
-                                  child: Icon(Icons.edit_outlined, size: 17, color: Colors.blueGrey),
-                                ),
-                              ),
-                              InkWell(
-                                onTap: () async {
-                                  final db = await AppDatabase.instance.database;
-                                  final subIds = <int>[id];
-                                  void collect(int p) {
-                                    for (final c in childrenOf(p)) {
-                                      final cid = c['id'] as int;
-                                      subIds.add(cid);
-                                      collect(cid);
-                                    }
-                                  }
-                                  collect(id);
-                                  for (final did in subIds) {
-                                    await db.delete('module_entries', where: 'module_id = ?', whereArgs: [did]);
-                                    await db.delete('modules', where: 'id = ?', whereArgs: [did]);
-                                  }
-                                  setState(() {});
-                                },
-                                child: const Padding(
-                                  padding: EdgeInsets.symmetric(horizontal: 5, vertical: 3),
-                                  child: Icon(Icons.delete_outline, size: 18, color: Colors.redAccent),
-                                ),
-                              ),
-                              LongPressDraggable<int>(
-                                data: id,
-                                feedback: Material(
-                                  elevation: 8,
-                                  borderRadius: BorderRadius.circular(10),
-                                  child: Container(
-                                    width: 220,
-                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                                    decoration: BoxDecoration(
-                                      color: const Color(0xFFEEF2FF),
-                                      borderRadius: BorderRadius.circular(10),
-                                      border: Border.all(color: const Color(0xFF4F46E5), width: 1.5),
-                                    ),
-                                    child: Text(title, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                                  ),
-                                ),
-                                child: const Padding(
-                                  padding: EdgeInsets.only(left: 4, right: 2, top: 3, bottom: 3),
-                                  child: Icon(Icons.drag_handle, size: 19, color: Colors.grey),
-                                ),
-                              ),
-                            ],
-                          ),
+                        return _buildStandardFolderCard(
+                          mod: m,
+                          allMods: mods,
+                          depth: depth,
+                          hasChildren: hasChildren,
+                          isExpanded: isExpanded,
+                          subBadgeCount: subBadgeCount,
+                          zone: zone,
                         );
                       },
                     ),
                   ),
                 ),
-                if (hasChildren && !isCollapsed)
-                  ...children.map((c) => buildNode(c, depth + 1)),
+                if (hasChildren && isExpanded)
+                  ...children.map((c) => buildDraggableModLevel(c, depth + 1)),
               ],
             );
           }
@@ -2066,7 +2186,7 @@ class _FamilyPageState extends State<FamilyPage> {
                         style: TextStyle(fontSize: 11.5, color: Colors.grey),
                       ),
                     ),
-                    ...roots.map((r) => buildNode(r, 0)),
+                    ...roots.map((r) => buildDraggableModLevel(r, 0)),
                   ],
                 );
         },
@@ -2074,7 +2194,7 @@ class _FamilyPageState extends State<FamilyPage> {
     );
   }
 }
-// ==================== 3. 规划与思维导图页面 (支持 XMind 导入 + 全屏画布 + 节点长按三区拖拽移动) ====================
+// ==================== 3. 规划与思维导图模块 (100% 还原基准版组件 + 节点间长按三区拖拽移动) ====================
 class PlanPage extends StatefulWidget {
   final Database db;
   const PlanPage({super.key, required this.db});
@@ -2083,20 +2203,87 @@ class PlanPage extends StatefulWidget {
 }
 
 class _PlanPageState extends State<PlanPage> {
+  final Set<String> _collapsedNodes = {};
+  bool _uiLoaded = false;
   bool _busy = false;
+  String? _hoverNodeId;
+  String? _hoverZone;
 
-  Future<List<Map<String, dynamic>>> _loadMindmaps() async {
+  @override
+  void initState() {
+    super.initState();
+    _restorePlanUiState();
+  }
+
+  Future<void> _restorePlanUiState() async {
     try {
-      final activeDb = await AppDatabase.instance.database;
-      return List<Map<String, dynamic>>.from(
-        await activeDb.query('mindmaps', orderBy: 'updated_at DESC, id DESC'),
-      );
-    } catch (_) {
-      return <Map<String, dynamic>>[];
-    }
+      final raw = await AppDatabase.getUiState(widget.db, 'plan_collapsed_nodes');
+      if (raw != null && raw.isNotEmpty) {
+        final list = (jsonDecode(raw) as List).map((e) => '$e').toList();
+        _collapsedNodes
+          ..clear()
+          ..addAll(list);
+      }
+    } catch (_) {}
+    if (mounted) setState(() => _uiLoaded = true);
+  }
+
+  Future<void> _savePlanUiState() async {
+    await AppDatabase.setUiState(
+      widget.db,
+      'plan_collapsed_nodes',
+      jsonEncode(_collapsedNodes.toList()),
+    );
   }
 
   String _genId() => '${DateTime.now().microsecondsSinceEpoch}_${math.Random().nextInt(99999)}';
+
+  Map<String, dynamic> _normalizeNode(Map raw) {
+    final map = Map<String, dynamic>.from(raw);
+    if (map['id'] == null || '${map['id']}'.isEmpty) {
+      map['id'] = _genId();
+    } else {
+      map['id'] = '${map['id']}';
+    }
+    map['text'] = '${map['text'] ?? map['title'] ?? '节点'}';
+    final rawCh = map['children'];
+    final chList = >[];
+    if (rawCh is List) {
+      for (final c in rawCh) {
+        if (c is Map) chList.add(_normalizeNode(c));
+      }
+    }
+    map['children'] = chList;
+    return map;
+  }
+
+  Future<List>> _loadPlans() async {
+    if (!_uiLoaded) await _restorePlanUiState();
+    try {
+      final activeDb = await AppDatabase.instance.database;
+      return List>.from(
+        await activeDb.query('mindmaps', orderBy: 'id DESC'),
+      );
+    } catch (_) {
+      return >[];
+    }
+  }
+
+  Future<void> _save(int id, Map<String, dynamic> root) async {
+    final activeDb = await AppDatabase.instance.database;
+    final title = '${root['text'] ?? '规划'}'.trim();
+    await activeDb.update(
+      'mindmaps',
+      {
+        'title': title.isEmpty ? '规划' : title,
+        'root_json': jsonEncode(root),
+        'updated_at': DateTime.now().toIso8601String(),
+      },
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+    if (mounted) setState(() {});
+  }
 
   String _unescapeXml(String s) {
     return s
@@ -2107,35 +2294,34 @@ class _PlanPageState extends State<PlanPage> {
         .replaceAll('&apos;', "'");
   }
 
-  Map<String, dynamic> _convertXmindJsonTopic(Map<String, dynamic> topic) {
-    final title = (topic['title'] ?? '未命名节点').toString().trim();
-    final childrenList = <Map<String, dynamic>>[];
+  Map<String, dynamic> _convertXMindJsonTopic(Map<String, dynamic> topic) {
+    final title = (topic['title'] ?? topic['text'] ?? '未命名节点').toString().trim();
+    final childrenList = >[];
     final childrenObj = topic['children'];
     if (childrenObj is Map) {
       final attached = childrenObj['attached'];
       if (attached is List) {
         for (final c in attached) {
           if (c is Map) {
-            childrenList.add(_convertXmindJsonTopic(Map<String, dynamic>.from(c)));
+            childrenList.add(_convertXMindJsonTopic(Map<String, dynamic>.from(c)));
           }
         }
       }
     } else if (childrenObj is List) {
       for (final c in childrenObj) {
         if (c is Map) {
-          childrenList.add(_convertXmindJsonTopic(Map<String, dynamic>.from(c)));
+          childrenList.add(_convertXMindJsonTopic(Map<String, dynamic>.from(c)));
         }
       }
     }
     return {
       'id': _genId(),
       'text': title.isEmpty ? '节点' : title,
-      'collapsed': false,
       'children': childrenList,
     };
   }
 
-  Map<String, dynamic>? _parseXmindXml(String xmlStr) {
+  Map<String, dynamic>? _parseLegacyXMindXml(String xmlStr) {
     final rootMatch = RegExp(r'<topic\b[^>]*>([\s\S]*)</topic>').firstMatch(xmlStr);
     if (rootMatch == null) return null;
 
@@ -2145,7 +2331,7 @@ class _PlanPageState extends State<PlanPage> {
       if (tMatch != null) {
         title = _unescapeXml(tMatch.group(1)!.replaceAll(RegExp(r'<[^>]+>'), '').trim());
       }
-      final children = <Map<String, dynamic>>[];
+      final children = >[];
       final tPos = tMatch?.end ?? 0;
       final subContent = content.substring(tPos);
 
@@ -2188,7 +2374,6 @@ class _PlanPageState extends State<PlanPage> {
       return {
         'id': _genId(),
         'text': title.isEmpty ? '节点' : title,
-        'collapsed': false,
         'children': children,
       };
     }
@@ -2196,7 +2381,7 @@ class _PlanPageState extends State<PlanPage> {
     return walkTopic(rootMatch.group(1)!);
   }
 
-  Future<void> _importXmind() async {
+  Future<void> _importXMindFile() async {
     try {
       final res = await FilePicker.platform.pickFiles(type: FileType.any);
       if (res == null || res.files.single.path == null) return;
@@ -2221,18 +2406,22 @@ class _PlanPageState extends State<PlanPage> {
         if (decoded is List && decoded.isNotEmpty && decoded.first is Map) {
           final firstMap = Map<String, dynamic>.from(decoded.first as Map);
           if (firstMap['rootTopic'] is Map) {
-            rootNode = _convertXmindJsonTopic(Map<String, dynamic>.from(firstMap['rootTopic'] as Map));
+            rootNode = _convertXMindJsonTopic(Map<String, dynamic>.from(firstMap['rootTopic'] as Map));
           }
         } else if (decoded is Map && decoded['rootTopic'] is Map) {
-          rootNode = _convertXmindJsonTopic(Map<String, dynamic>.from(decoded['rootTopic'] as Map));
+          rootNode = _convertXMindJsonTopic(Map<String, dynamic>.from(decoded['rootTopic'] as Map));
         }
       } else if (xmlFile != null) {
         final xmlStr = utf8.decode(xmlFile.content as List<int>, allowMalformed: true);
-        rootNode = _parseXmindXml(xmlStr);
+        rootNode = _parseLegacyXMindXml(xmlStr);
       }
 
       if (rootNode == null) {
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('未能识别该思维导图文件格式')));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('未能识别该 XMind 思维导图文件格式')),
+          );
+        }
         return;
       }
 
@@ -2247,17 +2436,21 @@ class _PlanPageState extends State<PlanPage> {
       });
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('🎉 成功导入思维导图「$title」')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('🎉 成功导入思维导图「$title」')),
+      );
       setState(() {});
-      _openEditor(id, title, rootNode);
+      _openFullscreen(id, rootNode);
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('导入失败: $e')));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('导入失败: $e')));
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
-  Future<void> _createNewMindmapDialog() async {
+  Future<void> _createMm() async {
     final ctrl = TextEditingController();
     showDialog(
       context: context,
@@ -2267,7 +2460,7 @@ class _PlanPageState extends State<PlanPage> {
           controller: ctrl,
           autofocus: true,
           decoration: const InputDecoration(
-            labelText: '规划主题名称（如：2026人生模拟器规划）',
+            labelText: '规划主题名称',
             border: OutlineInputBorder(),
           ),
         ),
@@ -2281,8 +2474,7 @@ class _PlanPageState extends State<PlanPage> {
               final root = <String, dynamic>{
                 'id': _genId(),
                 'text': t,
-                'collapsed': false,
-                'children': <Map<String, dynamic>>[],
+                'children': >[],
               };
               final now = DateTime.now().toIso8601String();
               final id = await activeDb.insert('mindmaps', {
@@ -2294,7 +2486,7 @@ class _PlanPageState extends State<PlanPage> {
               if (mounted) {
                 Navigator.pop(ctx);
                 setState(() {});
-                _openEditor(id, t, root);
+                _openFullscreen(id, root);
               }
             },
             child: const Text('创建并进入'),
@@ -2304,23 +2496,12 @@ class _PlanPageState extends State<PlanPage> {
     );
   }
 
-  void _openEditor(int id, String title, Map<String, dynamic> root) {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => MindmapEditorPage(db: widget.db, mapId: id, initialTitle: title, initialRoot: root),
-      ),
-    ).then((_) {
-      if (mounted) setState(() {});
-    });
-  }
-
   void _confirmDeleteMindmap(int id, String title) {
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('确认删除规划'),
-        content: Text('确定要删除规划导图「$title」吗？'),
+        content: Text('确定删除规划导图「$title」吗？'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
           FilledButton(
@@ -2338,6 +2519,307 @@ class _PlanPageState extends State<PlanPage> {
     );
   }
 
+  bool _rm(Map<String, dynamic> parent, String targetId) {
+    final ch = (parent['children'] as List).cast>();
+    final idx = ch.indexWhere((c) => '${c['id']}' == targetId);
+    if (idx != -1) {
+      ch.removeAt(idx);
+      parent['children'] = ch;
+      return true;
+    }
+    for (final c in ch) {
+      if (_rm(c, targetId)) return true;
+    }
+    return false;
+  }
+
+  bool _isDescendantNode(Map<String, dynamic> root, String dragId, String targetId) {
+    if (dragId == targetId) return true;
+    Map<String, dynamic>? findNode(Map<String, dynamic> cur, String id) {
+      if ('${cur['id']}' == id) return cur;
+      for (final c in (cur['children'] as List).cast>()) {
+        final f = findNode(c, id);
+        if (f != null) return f;
+      }
+      return null;
+    }
+
+    final dragNode = findNode(root, dragId);
+    if (dragNode == null) return false;
+    return findNode(dragNode, targetId) != null;
+  }
+
+  Future<void> _moveTreeNode({
+    required int mapId,
+    required Map<String, dynamic> root,
+    required String dragId,
+    required String targetId,
+    required String zone,
+    required VoidCallback onRefresh,
+  }) async {
+    if ('${root['id']}' == dragId || _isDescendantNode(root, dragId, targetId)) return;
+
+    Map<String, dynamic>? removed;
+    bool extractNode(Map<String, dynamic> cur) {
+      final ch = (cur['children'] as List).cast>();
+      final idx = ch.indexWhere((c) => '${c['id']}' == dragId);
+      if (idx != -1) {
+        removed = ch.removeAt(idx);
+        cur['children'] = ch;
+        return true;
+      }
+      for (final c in ch) {
+        if (extractNode(c)) return true;
+      }
+      return false;
+    }
+
+    if (!extractNode(root) || removed == null) return;
+
+    if (zone == 'inside' || '${root['id']}' == targetId) {
+      bool insertInside(Map<String, dynamic> cur) {
+        if ('${cur['id']}' == targetId) {
+          final ch = (cur['children'] as List).cast>();
+          ch.add(removed!);
+          cur['children'] = ch;
+          _collapsedNodes.remove(targetId);
+          return true;
+        }
+        for (final c in (cur['children'] as List).cast>()) {
+          if (insertInside(c)) return true;
+        }
+        return false;
+      }
+
+      insertInside(root);
+      await _savePlanUiState();
+    } else {
+      bool insertSibling(Map<String, dynamic> cur) {
+        final ch = (cur['children'] as List).cast>();
+        final tIdx = ch.indexWhere((c) => '${c['id']}' == targetId);
+        if (tIdx != -1) {
+          final insIdx = zone == 'up' ? tIdx : tIdx + 1;
+          ch.insert(insIdx.clamp(0, ch.length), removed!);
+          cur['children'] = ch;
+          return true;
+        }
+        for (final c in ch) {
+          if (insertSibling(c)) return true;
+        }
+        return false;
+      }
+
+      insertSibling(root);
+    }
+
+    await _save(mapId, root);
+    onRefresh();
+  }
+
+  void _onNodeAction(
+    int mapId,
+    Map<String, dynamic> root,
+    Map<String, dynamic> node,
+    bool isRoot,
+    VoidCallback onRefresh,
+  ) {
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.edit_outlined, color: Color(0xFFE11D48)),
+              title: const Text('编辑节点文字'),
+              onTap: () {
+                Navigator.pop(ctx);
+                final ctrl = TextEditingController(text: '${node['text']}');
+                showDialog(
+                  context: context,
+                  builder: (dCtx) => AlertDialog(
+                    title: const Text('编辑节点', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    content: TextField(
+                      controller: ctrl,
+                      autofocus: true,
+                      minLines: 1,
+                      maxLines: 4,
+                      decoration: const InputDecoration(border: OutlineInputBorder()),
+                    ),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(dCtx), child: const Text('取消')),
+                      FilledButton(
+                        onPressed: () async {
+                          if (ctrl.text.trim().isEmpty) return;
+                          node['text'] = ctrl.text.trim();
+                          await _save(mapId, root);
+                          if (mounted) Navigator.pop(dCtx);
+                          onRefresh();
+                        },
+                        child: const Text('保存'),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.subdirectory_arrow_right, color: Color(0xFF4F46E5)),
+              title: const Text('添加子节点'),
+              onTap: () {
+                Navigator.pop(ctx);
+                final ctrl = TextEditingController();
+                showDialog(
+                  context: context,
+                  builder: (dCtx) => AlertDialog(
+                    title: Text('在「${node['text']}」下添加子节点', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+                    content: TextField(
+                      controller: ctrl,
+                      autofocus: true,
+                      minLines: 1,
+                      maxLines: 4,
+                      decoration: const InputDecoration(hintText: '输入子节点内容...', border: OutlineInputBorder()),
+                    ),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(dCtx), child: const Text('取消')),
+                      FilledButton(
+                        onPressed: () async {
+                          if (ctrl.text.trim().isEmpty) return;
+                          final ch = (node['children'] as List).cast>();
+                          ch.add({
+                            'id': _genId(),
+                            'text': ctrl.text.trim(),
+                            'children': >[],
+                          });
+                          node['children'] = ch;
+                          _collapsedNodes.remove('${node['id']}');
+                          await _savePlanUiState();
+                          await _save(mapId, root);
+                          if (mounted) Navigator.pop(dCtx);
+                          onRefresh();
+                        },
+                        child: const Text('添加'),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+            if (!isRoot)
+              ListTile(
+                leading: const Icon(Icons.add_circle_outline, color: Color(0xFF0D9488)),
+                title: const Text('添加同级节点'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  final ctrl = TextEditingController();
+                  showDialog(
+                    context: context,
+                    builder: (dCtx) => AlertDialog(
+                      title: const Text('添加同级节点', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                      content: TextField(
+                        controller: ctrl,
+                        autofocus: true,
+                        minLines: 1,
+                        maxLines: 4,
+                        decoration: const InputDecoration(hintText: '输入同级节点内容...', border: OutlineInputBorder()),
+                      ),
+                      actions: [
+                        TextButton(onPressed: () => Navigator.pop(dCtx), child: const Text('取消')),
+                        FilledButton(
+                          onPressed: () async {
+                            if (ctrl.text.trim().isEmpty) return;
+                            final targetId = '${node['id']}';
+                            bool insertAfter(Map<String, dynamic> cur) {
+                              final ch = (cur['children'] as List).cast>();
+                              final idx = ch.indexWhere((c) => '${c['id']}' == targetId);
+                              if (idx != -1) {
+                                ch.insert(idx + 1, {
+                                  'id': _genId(),
+                                  'text': ctrl.text.trim(),
+                                  'children': >[],
+                                });
+                                cur['children'] = ch;
+                                return true;
+                              }
+                              for (final c in ch) {
+                                if (insertAfter(c)) return true;
+                              }
+                              return false;
+                            }
+
+                            insertAfter(root);
+                            await _save(mapId, root);
+                            if (mounted) Navigator.pop(dCtx);
+                            onRefresh();
+                          },
+                          child: const Text('添加'),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            if (!isRoot)
+              ListTile(
+                leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
+                title: const Text('删除此节点及其子节点', style: TextStyle(color: Colors.redAccent)),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  _rm(root, '${node['id']}');
+                  await _save(mapId, root);
+                  onRefresh();
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _openFullscreen(int mapId, Map<String, dynamic> root) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => FullscreenMindmapPage(
+          title: '${root['text'] ?? '规划'}',
+          root: root,
+          collapsedNodes: _collapsedNodes,
+          onToggleCollapse: (nid) {
+            setState(() {
+              _collapsedNodes.contains(nid)
+                  ? _collapsedNodes.remove(nid)
+                  : _collapsedNodes.add(nid);
+            });
+            _savePlanUiState();
+          },
+          onSaveState: _savePlanUiState,
+          onNodeTap: (n, isR, refresh) => _onNodeAction(mapId, root, n, isR, refresh),
+          onNodeMove: (dragId, targetId, zone, refresh) => _moveTreeNode(
+            mapId: mapId,
+            root: root,
+            dragId: dragId,
+            targetId: targetId,
+            zone: zone,
+            onRefresh: refresh,
+          ),
+          canAcceptDrop: (dragId, targetId) => !_isDescendantNode(root, dragId, targetId),
+        ),
+      ),
+    ).then((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  void _collectNonRootIds(Map<String, dynamic> node, Set<String> out, {bool isRoot = true}) {
+    final ch = (node['children'] as List).cast>();
+    if (!isRoot && ch.isNotEmpty) {
+      out.add('${node['id']}');
+    }
+    for (final c in ch) {
+      _collectNonRootIds(c, out, isRoot: false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -2348,19 +2830,19 @@ class _PlanPageState extends State<PlanPage> {
         title: const Text('🎯 规划', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
         actions: [
           TextButton.icon(
-            onPressed: _busy ? null : _importXmind,
+            onPressed: _busy ? null : _importXMindFile,
             icon: const Icon(Icons.upload_file_outlined, size: 18),
             label: const Text('导入XMind', style: TextStyle(fontSize: 13)),
           ),
           TextButton.icon(
-            onPressed: _createNewMindmapDialog,
+            onPressed: _createMm,
             icon: const Icon(Icons.add, size: 18),
             label: const Text('新规划', style: TextStyle(fontSize: 13)),
           ),
         ],
       ),
-      body: FutureBuilder<List<Map<String, dynamic>>>(
-        future: _loadMindmaps(),
+      body: FutureBuilder<List>>(
+        future: _loadPlans(),
         builder: (ctx, snap) {
           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
           final maps = snap.data!;
@@ -2374,7 +2856,7 @@ class _PlanPageState extends State<PlanPage> {
                   const Text('暂无规划导图，可点击右上角「导入XMind」或「+ 新规划」', style: TextStyle(color: Colors.grey, fontSize: 13)),
                   const SizedBox(height: 14),
                   FilledButton.icon(
-                    onPressed: _importXmind,
+                    onPressed: _importXMindFile,
                     icon: const Icon(Icons.upload_file),
                     label: const Text('导入 XMind 思维导图'),
                   ),
@@ -2382,63 +2864,136 @@ class _PlanPageState extends State<PlanPage> {
               ),
             );
           }
+
           return ListView.builder(
             padding: const EdgeInsets.all(12),
             itemCount: maps.length,
             itemBuilder: (ctx, i) {
               final m = maps[i];
-              final id = m['id'] as int;
-              final title = '${m['title']}';
-              Map<String, dynamic> root = {'id': 'root_$id', 'text': title, 'children': <Map<String, dynamic>>[]};
-              int totalNodes = 1;
+              final mapId = m['id'] as int;
+              Map<String, dynamic> root;
               try {
-                final decoded = jsonDecode('${m['root_json'] ?? "{}"}');
-                if (decoded is Map) {
-                  root = Map<String, dynamic>.from(decoded);
-                  void countNodes(Map<String, dynamic> n) {
-                    final rawCh = n['children'];
-                    if (rawCh is List) {
-                      for (final c in rawCh) {
-                        if (c is Map) {
-                          totalNodes++;
-                          countNodes(Map<String, dynamic>.from(c));
-                        }
-                      }
-                    }
-                  }
-                  countNodes(root);
-                }
-              } catch (_) {}
+                root = _normalizeNode(jsonDecode('${m['root_json']}') as Map);
+              } catch (_) {
+                root = {'id': 'root_$mapId', 'text': '${m['title']}', 'children': >[]};
+              }
+
+              final collapsibleIds = <String>{};
+              _collectNonRootIds(root, collapsibleIds);
+              final anyCollapsed = collapsibleIds.any((id) => _collapsedNodes.contains(id));
 
               return Card(
-                margin: const EdgeInsets.only(bottom: 10),
+                margin: const EdgeInsets.only(bottom: 14),
                 elevation: 0,
                 color: Colors.white,
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(14),
                   side: const BorderSide(color: Color(0xFFE2E8F0)),
                 ),
-                child: ListTile(
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-                  leading: Container(
-                    width: 40,
-                    height: 40,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFFFF1F2),
-                      borderRadius: BorderRadius.circular(10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(14, 10, 8, 6),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.account_tree, color: Color(0xFFE11D48), size: 20),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: GestureDetector(
+                              onTap: () => _openFullscreen(mapId, root),
+                              child: Text(
+                                '${root['text']}',
+                                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                              ),
+                            ),
+                          ),
+                          TextButton.icon(
+                            style: TextButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              minimumSize: Size.zero,
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                            onPressed: () {
+                              setState(() {
+                                if (anyCollapsed) {
+                                  _collapsedNodes.removeAll(collapsibleIds);
+                                } else {
+                                  _collapsedNodes.addAll(collapsibleIds);
+                                }
+                              });
+                              _savePlanUiState();
+                            },
+                            icon: Icon(anyCollapsed ? Icons.unfold_more : Icons.unfold_less, size: 16),
+                            label: Text(anyCollapsed ? '全部展开' : '全部收起', style: const TextStyle(fontSize: 12)),
+                          ),
+                          IconButton(
+                            visualDensity: VisualDensity.compact,
+                            tooltip: '全屏查看/编辑导图',
+                            icon: const Icon(Icons.fullscreen, color: Color(0xFF4F46E5)),
+                            onPressed: () => _openFullscreen(mapId, root),
+                          ),
+                          IconButton(
+                            visualDensity: VisualDensity.compact,
+                            tooltip: '删除导图',
+                            icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 20),
+                            onPressed: () => _confirmDeleteMindmap(mapId, '${root['text']}'),
+                          ),
+                        ],
+                      ),
                     ),
-                    child: const Icon(Icons.account_tree, color: Color(0xFFE11D48)),
-                  ),
-                  title: Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15.5)),
-                  subtitle: Text(
-                    '共 $totalNodes 个规划节点 · 点击进入思维导图画布',
-                    style: const TextStyle(fontSize: 12, color: Colors.grey),
-                  ),
-                  onTap: () => _openEditor(id, title, root),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
-                    onPressed: () => _confirmDeleteMindmap(id, title),
-                  ),
+                    const Divider(height: 1),
+                    SizedBox(
+                      height: 340,
+                      width: double.infinity,
+                      child: InteractiveViewer(
+                        constrained: false,
+                        boundaryMargin: const EdgeInsets.all(300),
+                        minScale: 0.2,
+                        maxScale: 2.5,
+                        child: Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: XMindBranchNodeWidget(
+                            node: root,
+                            isRoot: true,
+                            collapsedNodes: _collapsedNodes,
+                            hoverNodeId: _hoverNodeId,
+                            hoverZone: _hoverZone,
+                            onHoverChanged: (nid, z) {
+                              if (_hoverNodeId != nid || _hoverZone != z) {
+                                setState(() {
+                                  _hoverNodeId = nid;
+                                  _hoverZone = z;
+                                });
+                              }
+                            },
+                            onToggleCollapse: (nid) {
+                              setState(() {
+                                _collapsedNodes.contains(nid)
+                                    ? _collapsedNodes.remove(nid)
+                                    : _collapsedNodes.add(nid);
+                              });
+                              _savePlanUiState();
+                            },
+                            onNodeTap: (n, isR) => _onNodeAction(mapId, root, n, isR, () {
+                              if (mounted) setState(() {});
+                            }),
+                            canAcceptDrop: (dragId, targetId) => !_isDescendantNode(root, dragId, targetId),
+                            onNodeDrop: (dragId, targetId, zone) => _moveTreeNode(
+                              mapId: mapId,
+                              root: root,
+                              dragId: dragId,
+                              targetId: targetId,
+                              zone: zone,
+                              onRefresh: () {
+                                if (mounted) setState(() {});
+                              },
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               );
             },
@@ -2449,528 +3004,218 @@ class _PlanPageState extends State<PlanPage> {
   }
 }
 
-class _NodeLayoutInfo {
-  final String id;
-  final Map<String, dynamic> node;
-  final String? parentId;
-  final int depth;
-  final Rect rect;
-  double subtreeHeight;
+// ==================== 基准版全屏思维导图页 FullscreenMindmapPage ====================
+class FullscreenMindmapPage extends StatefulWidget {
+  final String title;
+  final Map<String, dynamic> root;
+  final Set<String> collapsedNodes;
+  final void Function(String nodeId) onToggleCollapse;
+  final Future<void> Function() onSaveState;
+  final void Function(Map<String, dynamic> node, bool isRoot, VoidCallback refresh) onNodeTap;
+  final void Function(String dragId, String targetId, String zone, VoidCallback refresh) onNodeMove;
+  final bool Function(String dragId, String targetId) canAcceptDrop;
 
-  _NodeLayoutInfo({
-    required this.id,
-    required this.node,
-    required this.parentId,
-    required this.depth,
-    required this.rect,
-    this.subtreeHeight = 0,
-  });
-}
-
-class MindmapEditorPage extends StatefulWidget {
-  final Database db;
-  final int mapId;
-  final String initialTitle;
-  final Map<String, dynamic> initialRoot;
-
-  const MindmapEditorPage({
+  const FullscreenMindmapPage({
     super.key,
-    required this.db,
-    required this.mapId,
-    required this.initialTitle,
-    required this.initialRoot,
+    required this.title,
+    required this.root,
+    required this.collapsedNodes,
+    required this.onToggleCollapse,
+    required this.onSaveState,
+    required this.onNodeTap,
+    required this.onNodeMove,
+    required this.canAcceptDrop,
   });
 
   @override
-  State<MindmapEditorPage> createState() => _MindmapEditorPageState();
+  State<FullscreenMindmapPage> createState() => _FullscreenMindmapPageState();
 }
 
-class _MindmapEditorPageState extends State<MindmapEditorPage> {
-  late Map<String, dynamic> _root;
-  late String _title;
-  bool _isLandscape = false;
-  bool _allExpanded = true;
-
-  String? _hoverTargetId;
+class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
+  bool _landscape = false;
+  String? _hoverNodeId;
   String? _hoverZone;
-
-  final TransformationController _transCtrl = TransformationController();
-
-  @override
-  void initState() {
-    super.initState();
-    _title = widget.initialTitle;
-    _root = _normalizeTreeNode(widget.initialRoot);
-  }
 
   @override
   void dispose() {
-    if (_isLandscape) {
+    if (_landscape) {
       SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     }
-    _transCtrl.dispose();
     super.dispose();
   }
 
-  Map<String, dynamic> _normalizeTreeNode(Map rawNode) {
-    final map = Map<String, dynamic>.from(rawNode);
-    if (map['id'] == null || map['id'].toString().isEmpty) {
-      map['id'] = '${DateTime.now().microsecondsSinceEpoch}_${math.Random().nextInt(999999)}';
-    } else {
-      map['id'] = '${map['id']}';
-    }
-    map['text'] = '${map['text'] ?? '节点'}';
-    map['collapsed'] = map['collapsed'] == true;
-    final rawChildren = map['children'];
-    final normalizedChildren = <Map<String, dynamic>>[];
-    if (rawChildren is List) {
-      for (final c in rawChildren) {
-        if (c is Map) {
-          normalizedChildren.add(_normalizeTreeNode(c));
-        }
-      }
-    }
-    map['children'] = normalizedChildren;
-    return map;
-  }
-
-  List<Map<String, dynamic>> _childrenOfNode(Map<String, dynamic> node) {
-    final raw = node['children'];
-    if (raw is List<Map<String, dynamic>>) return raw;
-    if (raw is List) {
-      final list = raw.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
-      node['children'] = list;
-      return list;
-    }
-    final empty = <Map<String, dynamic>>[];
-    node['children'] = empty;
-    return empty;
-  }
-
-  Future<void> _saveToDb() async {
-    _title = (_root['text'] as String? ?? _title).trim();
-    final activeDb = await AppDatabase.instance.database;
-    await activeDb.update(
-      'mindmaps',
-      {
-        'title': _title,
-        'root_json': jsonEncode(_root),
-        'updated_at': DateTime.now().toIso8601String(),
-      },
-      where: 'id = ?',
-      whereArgs: [widget.mapId],
+  void _toggleOrientation() {
+    setState(() => _landscape = !_landscape);
+    SystemChrome.setPreferredOrientations(
+      _landscape
+          ? [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]
+          : [DeviceOrientation.portraitUp],
     );
   }
 
-  int _countDescendants(Map<String, dynamic> node) {
-    final children = _childrenOfNode(node);
-    int count = children.length;
-    for (final c in children) {
-      count += _countDescendants(c);
+  void _collectAllCollapsibleIds(Map<String, dynamic> node, Set<String> out, {bool isRoot = true}) {
+    final ch = (node['children'] as List).cast>();
+    if (!isRoot && ch.isNotEmpty) {
+      out.add('${node['id']}');
     }
-    return count;
-  }
-
-  void _setAllCollapsed(Map<String, dynamic> node, bool collapsed, {bool isRoot = true}) {
-    if (!isRoot) node['collapsed'] = collapsed;
-    for (final c in _childrenOfNode(node)) {
-      _setAllCollapsed(c, collapsed, isRoot: false);
+    for (final c in ch) {
+      _collectAllCollapsibleIds(c, out, isRoot: false);
     }
   }
 
-  bool _isDescendantInTree(String dragId, String targetId) {
-    if (dragId == targetId) return true;
-    Map<String, dynamic>? findNode(Map<String, dynamic> cur, String id) {
-      if ('${cur['id']}' == id) return cur;
-      for (final c in _childrenOfNode(cur)) {
-        final found = findNode(c, id);
-        if (found != null) return found;
-      }
-      return null;
-    }
+  @override
+  Widget build(BuildContext context) {
+    final allCollapsible = <String>{};
+    _collectAllCollapsibleIds(widget.root, allCollapsible);
+    final anyCollapsed = allCollapsible.any((id) => widget.collapsedNodes.contains(id));
 
-    final dragNode = findNode(_root, dragId);
-    if (dragNode == null) return false;
-    return findNode(dragNode, targetId) != null;
-  }
-
-  Future<void> _moveMindmapNode({
-    required String dragId,
-    required String targetId,
-    required String zone,
-  }) async {
-    if (dragId == '${_root['id']}' || _isDescendantInTree(dragId, targetId)) return;
-
-    Map<String, dynamic>? removedNode;
-
-    bool removeFromParent(Map<String, dynamic> cur) {
-      final children = _childrenOfNode(cur);
-      final idx = children.indexWhere((c) => '${c['id']}' == dragId);
-      if (idx != -1) {
-        removedNode = children.removeAt(idx);
-        cur['children'] = children;
-        return true;
-      }
-      for (final c in children) {
-        if (removeFromParent(c)) return true;
-      }
-      return false;
-    }
-
-    if (!removeFromParent(_root) || removedNode == null) return;
-
-    if (zone == 'inside' || targetId == '${_root['id']}') {
-      bool insertInside(Map<String, dynamic> cur) {
-        if ('${cur['id']}' == targetId) {
-          final children = _childrenOfNode(cur);
-          children.add(removedNode!);
-          cur['children'] = children;
-          cur['collapsed'] = false;
-          return true;
-        }
-        for (final c in _childrenOfNode(cur)) {
-          if (insertInside(c)) return true;
-        }
-        return false;
-      }
-
-      insertInside(_root);
-    } else {
-      bool insertSibling(Map<String, dynamic> cur) {
-        final children = _childrenOfNode(cur);
-        final tIdx = children.indexWhere((c) => '${c['id']}' == targetId);
-        if (tIdx != -1) {
-          final insIdx = zone == 'up' ? tIdx : tIdx + 1;
-          children.insert(insIdx.clamp(0, children.length), removedNode!);
-          cur['children'] = children;
-          return true;
-        }
-        for (final c in children) {
-          if (insertSibling(c)) return true;
-        }
-        return false;
-      }
-
-      insertSibling(_root);
-    }
-
-    await _saveToDb();
-    if (mounted) setState(() {});
-  }
-
-  void _onNodeActionSheet(Map<String, dynamic> node, {required bool isRoot}) {
-    showModalBottomSheet(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.edit_outlined, color: Color(0xFFE11D48)),
-              title: const Text('编辑节点文字'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _editNodeTextDialog(node);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.subdirectory_arrow_right, color: Color(0xFF4F46E5)),
-              title: const Text('添加子节点'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _addChildNodeDialog(node);
-              },
-            ),
-            if (!isRoot)
-              ListTile(
-                leading: const Icon(Icons.add_circle_outline, color: Color(0xFF0D9488)),
-                title: const Text('添加同级节点'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _addSiblingNodeDialog('${node['id']}');
-                },
-              ),
-            if (!isRoot)
-              ListTile(
-                leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
-                title: const Text('删除此节点及其子节点', style: TextStyle(color: Colors.redAccent)),
-                onTap: () async {
-                  Navigator.pop(ctx);
-                  _deleteNodeById(_root, '${node['id']}');
-                  await _saveToDb();
-                  setState(() {});
-                },
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _editNodeTextDialog(Map<String, dynamic> node) {
-    final ctrl = TextEditingController(text: '${node['text']}');
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('编辑节点', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          minLines: 1,
-          maxLines: 4,
-          decoration: const InputDecoration(border: OutlineInputBorder()),
-        ),
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        toolbarHeight: 48,
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.white,
+        title: Text('${widget.root['text'] ?? widget.title}', style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-          FilledButton(
-            onPressed: () async {
-              if (ctrl.text.trim().isEmpty) return;
-              node['text'] = ctrl.text.trim();
-              await _saveToDb();
-              if (mounted) Navigator.pop(ctx);
-              setState(() {});
-            },
-            child: const Text('保存'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _addChildNodeDialog(Map<String, dynamic> parentNode) {
-    final ctrl = TextEditingController();
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('在「${parentNode['text']}」下添加子节点', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          minLines: 1,
-          maxLines: 4,
-          decoration: const InputDecoration(hintText: '输入子节点内容...', border: OutlineInputBorder()),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-          FilledButton(
-            onPressed: () async {
-              if (ctrl.text.trim().isEmpty) return;
-              final children = _childrenOfNode(parentNode);
-              children.add({
-                'id': '${DateTime.now().microsecondsSinceEpoch}_${math.Random().nextInt(9999)}',
-                'text': ctrl.text.trim(),
-                'collapsed': false,
-                'children': <Map<String, dynamic>>[],
+          TextButton.icon(
+            onPressed: () {
+              setState(() {
+                if (anyCollapsed) {
+                  widget.collapsedNodes.removeAll(allCollapsible);
+                } else {
+                  widget.collapsedNodes.addAll(allCollapsible);
+                }
               });
-              parentNode['children'] = children;
-              parentNode['collapsed'] = false;
-              await _saveToDb();
-              if (mounted) Navigator.pop(ctx);
-              setState(() {});
+              widget.onSaveState();
             },
-            child: const Text('添加'),
+            icon: Icon(anyCollapsed ? Icons.unfold_more : Icons.unfold_less, size: 18),
+            label: Text(anyCollapsed ? '全部展开' : '全部收起', style: const TextStyle(fontSize: 13)),
+          ),
+          TextButton.icon(
+            onPressed: _toggleOrientation,
+            icon: const Icon(Icons.screen_rotation_outlined, size: 17),
+            label: Text(_landscape ? '切换竖屏' : '切换横屏', style: const TextStyle(fontSize: 13)),
           ),
         ],
       ),
-    );
-  }
-
-  void _addSiblingNodeDialog(String targetId) {
-    final ctrl = TextEditingController();
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('添加同级节点', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          minLines: 1,
-          maxLines: 4,
-          decoration: const InputDecoration(hintText: '输入同级节点内容...', border: OutlineInputBorder()),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-          FilledButton(
-            onPressed: () async {
-              if (ctrl.text.trim().isEmpty) return;
-              bool insertAfter(Map<String, dynamic> cur) {
-                final children = _childrenOfNode(cur);
-                final idx = children.indexWhere((c) => '${c['id']}' == targetId);
-                if (idx != -1) {
-                  children.insert(idx + 1, {
-                    'id': '${DateTime.now().microsecondsSinceEpoch}_${math.Random().nextInt(9999)}',
-                    'text': ctrl.text.trim(),
-                    'collapsed': false,
-                    'children': <Map<String, dynamic>>[],
-                  });
-                  cur['children'] = children;
-                  return true;
-                }
-                for (final c in children) {
-                  if (insertAfter(c)) return true;
-                }
-                return false;
+      body: InteractiveViewer(
+        constrained: false,
+        boundaryMargin: const EdgeInsets.all(800),
+        minScale: 0.15,
+        maxScale: 3.0,
+        child: Padding(
+          padding: const EdgeInsets.all(48),
+          child: XMindBranchNodeWidget(
+            node: widget.root,
+            isRoot: true,
+            collapsedNodes: widget.collapsedNodes,
+            hoverNodeId: _hoverNodeId,
+            hoverZone: _hoverZone,
+            onHoverChanged: (nid, z) {
+              if (_hoverNodeId != nid || _hoverZone != z) {
+                setState(() {
+                  _hoverNodeId = nid;
+                  _hoverZone = z;
+                });
               }
-
-              insertAfter(_root);
-              await _saveToDb();
-              if (mounted) Navigator.pop(ctx);
-              setState(() {});
             },
-            child: const Text('添加'),
+            onToggleCollapse: (nid) {
+              setState(() => widget.onToggleCollapse(nid));
+            },
+            onNodeTap: (n, isR) => widget.onNodeTap(n, isR, () {
+              if (mounted) setState(() {});
+            }),
+            canAcceptDrop: widget.canAcceptDrop,
+            onNodeDrop: (dragId, targetId, zone) => widget.onNodeMove(
+              dragId,
+              targetId,
+              zone,
+              () {
+                if (mounted) setState(() {});
+              },
+            ),
           ),
-        ],
+        ),
       ),
     );
   }
+}
 
-  bool _deleteNodeById(Map<String, dynamic> cur, String targetId) {
-    final children = _childrenOfNode(cur);
-    final idx = children.indexWhere((c) => '${c['id']}' == targetId);
-    if (idx != -1) {
-      children.removeAt(idx);
-      cur['children'] = children;
-      return true;
-    }
-    for (final c in children) {
-      if (_deleteNodeById(c, targetId)) return true;
-    }
-    return false;
-  }
+// ==================== 基准版原生树节点组件 XMindBranchNodeWidget (支持三区长按拖拽移动) ====================
+class XMindBranchNodeWidget extends StatelessWidget {
+  final Map<String, dynamic> node;
+  final bool isRoot;
+  final Set<String> collapsedNodes;
+  final String? hoverNodeId;
+  final String? hoverZone;
+  final void Function(String? nodeId, String? zone) onHoverChanged;
+  final void Function(String nodeId) onToggleCollapse;
+  final void Function(Map<String, dynamic> node, bool isRoot) onNodeTap;
+  final bool Function(String dragId, String targetId) canAcceptDrop;
+  final void Function(String dragId, String targetId, String zone) onNodeDrop;
 
-  Size _measureNodeSize(String text, int depth) {
-    final tp = TextPainter(
-      text: TextSpan(
-        text: text.isEmpty ? '节点' : text,
-        style: TextStyle(
-          fontSize: depth == 0 ? 15.5 : 14.0,
-          fontWeight: depth <= 1 ? FontWeight.w600 : FontWeight.normal,
-          height: 1.35,
-        ),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout(maxWidth: 240);
-    return Size(math.max(58, tp.width + 26), math.max(38, tp.height + 20));
-  }
+  const XMindBranchNodeWidget({
+    super.key,
+    required this.node,
+    required this.isRoot,
+    required this.collapsedNodes,
+    required this.hoverNodeId,
+    required this.hoverZone,
+    required this.onHoverChanged,
+    required this.onToggleCollapse,
+    required this.onNodeTap,
+    required this.canAcceptDrop,
+    required this.onNodeDrop,
+  });
 
-  ({List<_NodeLayoutInfo> nodes, Size canvasSize}) _computeTreeLayout() {
-    final nodes = <_NodeLayoutInfo>[];
-    final sizeCache = <String, Size>{};
-    final subHeightCache = <String, double>{};
-    const double vGap = 18.0;
-    const double hGap = 68.0;
-
-    double measureSubtree(Map<String, dynamic> n, int depth) {
-      final id = '${n['id']}';
-      final sz = _measureNodeSize('${n['text'] ?? ''}', depth);
-      sizeCache[id] = sz;
-      final children = _childrenOfNode(n);
-      final isCollapsed = n['collapsed'] == true;
-      if (children.isEmpty || isCollapsed) {
-        subHeightCache[id] = sz.height;
-        return sz.height;
-      }
-      double sum = 0;
-      for (int i = 0; i < children.length; i++) {
-        if (i > 0) sum += vGap;
-        sum += measureSubtree(children[i], depth + 1);
-      }
-      final h = math.max(sz.height, sum);
-      subHeightCache[id] = h;
-      return h;
-    }
-
-    final totalTreeH = measureSubtree(_root, 0);
-    double maxRight = 800;
-    double maxBottom = math.max(600, totalTreeH + 160);
-
-    void assignCoords(Map<String, dynamic> n, String? parentId, int depth, double leftX, double topY) {
-      final id = '${n['id']}';
-      final sz = sizeCache[id]!;
-      final subH = subHeightCache[id]!;
-      final nodeTop = topY + (subH - sz.height) / 2;
-      final rect = Rect.fromLTWH(leftX, nodeTop, sz.width, sz.height);
-
-      maxRight = math.max(maxRight, rect.right + 180);
-      maxBottom = math.max(maxBottom, topY + subH + 120);
-
-      nodes.add(_NodeLayoutInfo(
-        id: id,
-        node: n,
-        parentId: parentId,
-        depth: depth,
-        rect: rect,
-        subtreeHeight: subH,
-      ));
-
-      final children = _childrenOfNode(n);
-      final isCollapsed = n['collapsed'] == true;
-      if (children.isEmpty || isCollapsed) return;
-
-      double childrenTotalH = 0;
-      for (int i = 0; i < children.length; i++) {
-        if (i > 0) childrenTotalH += vGap;
-        childrenTotalH += subHeightCache['${children[i]['id']}']!;
-      }
-
-      double curY = topY + (subH - childrenTotalH) / 2;
-      final childLeftX = rect.right + hGap;
-      for (final c in children) {
-        final cid = '${c['id']}';
-        final cSubH = subHeightCache[cid]!;
-        assignCoords(c, id, depth + 1, childLeftX, curY);
-        curY += cSubH + vGap;
-      }
-    }
-
-    assignCoords(_root, null, 0, 60, 80);
-    return (nodes: nodes, canvasSize: Size(maxRight, maxBottom));
-  }
-
-  Widget _buildNodeCardWidget(_NodeLayoutInfo info, {bool isDraggingFeedback = false}) {
-    final id = info.id;
-    final text = '${info.node['text'] ?? ''}';
-    final isHover = _hoverTargetId == id && !isDraggingFeedback;
-    final zone = isHover ? _hoverZone : null;
-
+  Widget _buildPillCard(String text, {required String? zone, bool isFeedback = false}) {
     return Container(
-      width: info.rect.width,
-      height: info.rect.height,
-      alignment: Alignment.centerLeft,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      constraints: const BoxConstraints(maxWidth: 245, minWidth: 54),
+      padding: EdgeInsets.symmetric(
+        horizontal: isRoot ? 16 : 12,
+        vertical: isRoot ? 10 : 8,
+      ),
       decoration: BoxDecoration(
         color: zone == 'inside'
             ? const Color(0xFFFFE4E6)
-            : (info.depth == 0 ? const Color(0xFFFEF2F2) : const Color(0xFFFFF5F5)),
-        borderRadius: BorderRadius.circular(8),
+            : (isRoot ? const Color(0xFFEF5350) : const Color(0xFFFFF5F5)),
+        borderRadius: BorderRadius.circular(isRoot ? 10 : 7),
         border: Border(
           top: BorderSide(
-            color: zone == 'up' ? const Color(0xFFE11D48) : const Color(0xFFE5A3A3),
+            color: zone == 'up'
+                ? const Color(0xFFD32F2F)
+                : (isRoot ? const Color(0xFFEF5350) : const Color(0xFFE5A3A3)),
             width: zone == 'up' ? 3.5 : 1.2,
           ),
           bottom: BorderSide(
-            color: zone == 'down' ? const Color(0xFFE11D48) : const Color(0xFFE5A3A3),
+            color: zone == 'down'
+                ? const Color(0xFFD32F2F)
+                : (isRoot ? const Color(0xFFEF5350) : const Color(0xFFE5A3A3)),
             width: zone == 'down' ? 3.5 : 1.2,
           ),
           left: BorderSide(
-            color: zone == 'inside' ? const Color(0xFFE11D48) : const Color(0xFFE5A3A3),
+            color: zone == 'inside'
+                ? const Color(0xFFD32F2F)
+                : (isRoot ? const Color(0xFFEF5350) : const Color(0xFFE5A3A3)),
             width: zone == 'inside' ? 2.5 : 1.2,
           ),
           right: BorderSide(
-            color: zone == 'inside' ? const Color(0xFFE11D48) : const Color(0xFFE5A3A3),
+            color: zone == 'inside'
+                ? const Color(0xFFD32F2F)
+                : (isRoot ? const Color(0xFFEF5350) : const Color(0xFFE5A3A3)),
             width: zone == 'inside' ? 2.5 : 1.2,
           ),
         ),
-        boxShadow: isDraggingFeedback
-            ? const [BoxShadow(color: Colors.black26, blurRadius: 10, offset: Offset(0, 4))]
+        boxShadow: isFeedback
+            ? const [BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 3))]
             : null,
       ),
       child: Text(
         text,
         style: TextStyle(
-          fontSize: info.depth == 0 ? 15.5 : 14.0,
-          fontWeight: info.depth <= 1 ? FontWeight.w600 : FontWeight.normal,
-          color: const Color(0xFF1E293B),
+          fontSize: isRoot ? 15.5 : 13.8,
+          fontWeight: isRoot ? FontWeight.bold : FontWeight.w500,
+          color: isRoot && zone != 'inside' ? Colors.white : const Color(0xFF1E293B),
           height: 1.35,
         ),
       ),
@@ -2979,203 +3224,260 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
 
   @override
   Widget build(BuildContext context) {
-    final layout = _computeTreeLayout();
-    final nodeMap = {for (final n in layout.nodes) n.id: n};
+    final id = '${node['id']}';
+    final text = '${node['text'] ?? ''}';
+    final children = (node['children'] as List).cast>();
+    final isCollapsed = !isRoot && collapsedNodes.contains(id);
 
-    return Scaffold(
-      backgroundColor: Colors.white,
-      appBar: AppBar(
-        toolbarHeight: 48,
-        backgroundColor: Colors.white,
-        surfaceTintColor: Colors.white,
-        title: Text(_title, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
-        actions: [
-          TextButton.icon(
-            onPressed: () {
-              setState(() {
-                _allExpanded = !_allExpanded;
-                _setAllCollapsed(_root, !_allExpanded);
-              });
-              _saveToDb();
-            },
-            icon: Icon(_allExpanded ? Icons.unfold_less : Icons.unfold_more, size: 18),
-            label: Text(_allExpanded ? '全部收起' : '全部展开', style: const TextStyle(fontSize: 13)),
-          ),
-          TextButton.icon(
-            onPressed: () {
-              setState(() => _isLandscape = !_isLandscape);
-              SystemChrome.setPreferredOrientations(
-                _isLandscape
-                    ? [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]
-                    : [DeviceOrientation.portraitUp],
-              );
-            },
-            icon: const Icon(Icons.screen_rotation_outlined, size: 17),
-            label: Text(_isLandscape ? '切换竖屏' : '切换横屏', style: const TextStyle(fontSize: 13)),
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-            color: const Color(0xFFFFF1F2),
-            child: const Text(
-              '💡 点击节点编辑/加子项；长按节点可自由拖拽：拖到其他节点中央变为其子项，拖到上下边缘调序',
-              style: TextStyle(fontSize: 11.5, color: Color(0xFFBE123C)),
+    final isHovered = hoverNodeId == id;
+    final zone = isHovered ? hoverZone : null;
+
+    final pillWithDrag = Builder(
+      builder: (itemCtx) => DragTarget<String>(
+        onWillAcceptWithDetails: (details) => canAcceptDrop(details.data, id),
+        onMove: (details) {
+          final box = itemCtx.findRenderObject() as RenderBox?;
+          if (box == null) return;
+          final localY = box.globalToLocal(details.offset).dy;
+          final h = box.size.height;
+          String z;
+          if (isRoot) {
+            z = 'inside';
+          } else if (localY < h * 0.28) {
+            z = 'up';
+          } else if (localY > h * 0.72) {
+            z = 'down';
+          } else {
+            z = 'inside';
+          }
+          onHoverChanged(id, z);
+        },
+        onLeave: (_) {
+          if (hoverNodeId == id) onHoverChanged(null, null);
+        },
+        onAcceptWithDetails: (details) {
+          final z = hoverZone ?? 'inside';
+          onHoverChanged(null, null);
+          onNodeDrop(details.data, id, z);
+        },
+        builder: (ctx, cand, rej) {
+          final pill = GestureDetector(
+            onTap: () => onNodeTap(node, isRoot),
+            child: _buildPillCard(text, zone: zone),
+          );
+          if (isRoot) return pill;
+          return LongPressDraggable<String>(
+            data: id,
+            feedback: Material(
+              color: Colors.transparent,
+              child: _buildPillCard(text, zone: null, isFeedback: true),
             ),
-          ),
-          Expanded(
-            child: InteractiveViewer(
-              transformationController: _transCtrl,
-              constrained: false,
-              boundaryMargin: const EdgeInsets.all(600),
-              minScale: 0.25,
-              maxScale: 2.8,
-              child: SizedBox(
-                width: layout.canvasSize.width,
-                height: layout.canvasSize.height,
-                child: Stack(
-                  clipBehavior: Clip.none,
-                  children: [
-                    Positioned.fill(
-                      child: CustomPaint(
-                        painter: _MindmapLinePainter(nodes: layout.nodes, nodeMap: nodeMap),
-                      ),
-                    ),
-                    ...layout.nodes.map((info) {
-                      final isRoot = info.depth == 0;
-                      final children = _childrenOfNode(info.node);
-                      final hasChildren = children.isNotEmpty;
-                      final isCollapsed = info.node['collapsed'] == true;
-                      final hiddenCount = isCollapsed ? _countDescendants(info.node) : 0;
+            childWhenDragging: Opacity(opacity: 0.35, child: pill),
+            child: pill,
+          );
+        },
+      ),
+    );
 
-                      return Positioned(
-                        left: info.rect.left,
-                        top: info.rect.top,
-                        width: info.rect.width + (hasChildren ? 38 : 0),
-                        height: info.rect.height,
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.center,
-                          children: [
-                            Builder(
-                              builder: (nodeCtx) => DragTarget<String>(
-                                onWillAcceptWithDetails: (details) {
-                                  final dragId = details.data;
-                                  return !_isDescendantInTree(dragId, info.id);
-                                },
-                                onMove: (details) {
-                                  final box = nodeCtx.findRenderObject() as RenderBox?;
-                                  if (box == null) return;
-                                  final localY = box.globalToLocal(details.offset).dy;
-                                  final h = box.size.height;
-                                  String z;
-                                  if (isRoot) {
-                                    z = 'inside';
-                                  } else if (localY < h * 0.28) {
-                                    z = 'up';
-                                  } else if (localY > h * 0.72) {
-                                    z = 'down';
-                                  } else {
-                                    z = 'inside';
-                                  }
-                                  if (_hoverTargetId != info.id || _hoverZone != z) {
-                                    setState(() {
-                                      _hoverTargetId = info.id;
-                                      _hoverZone = z;
-                                    });
-                                  }
-                                },
-                                onLeave: (_) {
-                                  if (_hoverTargetId == info.id) {
-                                    setState(() {
-                                      _hoverTargetId = null;
-                                      _hoverZone = null;
-                                    });
-                                  }
-                                },
-                                onAcceptWithDetails: (details) async {
-                                  final z = _hoverZone ?? 'inside';
-                                  setState(() {
-                                    _hoverTargetId = null;
-                                    _hoverZone = null;
-                                  });
-                                  await _moveMindmapNode(
-                                    dragId: details.data,
-                                    targetId: info.id,
-                                    zone: z,
-                                  );
-                                },
-                                builder: (ctx, cand, rej) {
-                                  final card = GestureDetector(
-                                    onTap: () => _onNodeActionSheet(info.node, isRoot: isRoot),
-                                    child: _buildNodeCardWidget(info),
-                                  );
-                                  if (isRoot) return card;
-                                  return LongPressDraggable<String>(
-                                    data: info.id,
-                                    feedback: Material(
-                                      color: Colors.transparent,
-                                      child: _buildNodeCardWidget(info, isDraggingFeedback: true),
-                                    ),
-                                    childWhenDragging: Opacity(opacity: 0.35, child: card),
-                                    child: card,
-                                  );
-                                },
-                              ),
-                            ),
-                            if (hasChildren)
-                              GestureDetector(
-                                behavior: HitTestBehavior.opaque,
-                                onTap: () async {
-                                  setState(() {
-                                    info.node['collapsed'] = !isCollapsed;
-                                  });
-                                  await _saveToDb();
-                                },
-                                child: Container(
-                                  width: 24,
-                                  height: 24,
-                                  margin: const EdgeInsets.only(left: 10),
-                                  alignment: Alignment.center,
-                                  decoration: BoxDecoration(
-                                    color: isCollapsed ? const Color(0xFFEF5350) : Colors.white,
-                                    shape: BoxShape.circle,
-                                    border: Border.all(
-                                      color: const Color(0xFFEF5350),
-                                      width: 1.4,
-                                    ),
-                                  ),
-                                  child: isCollapsed
-                                      ? Text(
-                                          '$hiddenCount',
-                                          style: const TextStyle(
-                                            color: Colors.white,
-                                            fontSize: 11,
-                                            fontWeight: FontWeight.bold,
-                                          ),
-                                        )
-                                      : const Text(
-                                          '-',
-                                          style: TextStyle(
-                                            color: Color(0xFFEF5350),
-                                            fontSize: 15,
-                                            fontWeight: FontWeight.bold,
-                                            height: 1.0,
-                                          ),
-                                        ),
-                                ),
-                              ),
-                          ],
-                        ),
-                      );
-                    }),
-                  ],
+    if (children.isEmpty) {
+      return pillWithDrag;
+    }
+
+    if (isCollapsed) {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          pillWithDrag,
+          Container(width: 10, height: 1.5, color: const Color(0xFFEF5350)),
+          GestureDetector(
+            onTap: () => onToggleCollapse(id),
+            child: Container(
+              width: 22,
+              height: 22,
+              alignment: Alignment.center,
+              decoration: const BoxDecoration(
+                color: Color(0xFFEF5350),
+                shape: BoxShape.circle,
+              ),
+              child: Text(
+                '${children.length}',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
                 ),
               ),
             ),
+          ),
+        ],
+      );
+    }
+
+    final parentWithToggle = Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        pillWithDrag,
+        if (!isRoot) ...[
+          Container(width: 10, height: 1.5, color: const Color(0xFFEF5350)),
+          GestureDetector(
+            onTap: () => onToggleCollapse(id),
+            child: Container(
+              width: 20,
+              height: 20,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: Colors.white,
+                shape: BoxShape.circle,
+                border: Border.all(color: const Color(0xFFEF5350), width: 1.3),
+              ),
+              child: const Text(
+                '-',
+                style: TextStyle(
+                  color: Color(0xFFEF5350),
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                  height: 1.0,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+
+    return _XMindTreeRow(
+      parentWidget: parentWithToggle,
+      childWidgets: children
+          .map(
+            (c) => XMindBranchNodeWidget(
+              key: ValueKey('xm_node_${c['id']}'),
+              node: c,
+              isRoot: false,
+              collapsedNodes: collapsedNodes,
+              hoverNodeId: hoverNodeId,
+              hoverZone: hoverZone,
+              onHoverChanged: onHoverChanged,
+              onToggleCollapse: onToggleCollapse,
+              onNodeTap: onNodeTap,
+              canAcceptDrop: canAcceptDrop,
+              onNodeDrop: onNodeDrop,
+            ),
+          )
+          .toList(),
+    );
+  }
+}
+
+// ==================== 基准版原生动态测量行组件 _XMindTreeRow & _XMindBracketPainter ====================
+class _XMindTreeRow extends StatefulWidget {
+  final Widget parentWidget;
+  final List<Widget> childWidgets;
+
+  const _XMindTreeRow({
+    required this.parentWidget,
+    required this.childWidgets,
+  });
+
+  @override
+  State<_XMindTreeRow> createState() => _XMindTreeRowState();
+}
+
+class _XMindTreeRowState extends State<_XMindTreeRow> {
+  final GlobalKey _rowKey = GlobalKey();
+  final GlobalKey _parentKey = GlobalKey();
+  late List<GlobalKey> _childKeys;
+  double? _parentY;
+  List<double> _childYs = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _initKeys();
+  }
+
+  @override
+  void didUpdateWidget(covariant _XMindTreeRow oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _initKeys();
+  }
+
+  void _initKeys() {
+    _childKeys = List.generate(widget.childWidgets.length, (_) => GlobalKey());
+    WidgetsBinding.instance.addPostFrameCallback((_) => _measure());
+  }
+
+  void _measure() {
+    if (!mounted) return;
+    final rowBox = _rowKey.currentContext?.findRenderObject() as RenderBox?;
+    final pBox = _parentKey.currentContext?.findRenderObject() as RenderBox?;
+    if (rowBox == null || pBox == null || !rowBox.hasSize || !pBox.hasSize) return;
+
+    final pCenter = pBox.localToGlobal(Offset(0, pBox.size.height / 2), ancestor: rowBox).dy;
+    final cYs = <double>[];
+    for (final k in _childKeys) {
+      final cBox = k.currentContext?.findRenderObject() as RenderBox?;
+      if (cBox != null && cBox.hasSize) {
+        cYs.add(cBox.localToGlobal(Offset(0, cBox.size.height / 2), ancestor: rowBox).dy);
+      }
+    }
+
+    if (_parentY != pCenter || _childYs.length != cYs.length) {
+      setState(() {
+        _parentY = pCenter;
+        _childYs = cYs;
+      });
+    } else {
+      bool changed = false;
+      for (int i = 0; i < cYs.length; i++) {
+        if ((_childYs[i] - cYs[i]).abs() > 0.5) {
+          changed = true;
+          break;
+        }
+      }
+      if (changed) {
+        setState(() {
+          _parentY = pCenter;
+          _childYs = cYs;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    WidgetsBinding.instance.addPostFrameCallback((_) => _measure());
+    return IntrinsicHeight(
+      key: _rowKey,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Container(key: _parentKey, child: widget.parentWidget),
+          SizedBox(
+            width: 32,
+            height: double.infinity,
+            child: CustomPaint(
+              painter: _XMindBracketPainter(
+                parentY: _parentY,
+                childYs: _childYs,
+              ),
+            ),
+          ),
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: List.generate(widget.childWidgets.length, (i) {
+              return Padding(
+                key: _childKeys[i],
+                padding: EdgeInsets.only(
+                  top: i == 0 ? 0 : 7,
+                  bottom: i == widget.childWidgets.length - 1 ? 0 : 7,
+                ),
+                child: widget.childWidgets[i],
+              );
+            }),
           ),
         ],
       ),
@@ -3183,45 +3485,47 @@ class _MindmapEditorPageState extends State<MindmapEditorPage> {
   }
 }
 
-class _MindmapLinePainter extends CustomPainter {
-  final List<_NodeLayoutInfo> nodes;
-  final Map<String, _NodeLayoutInfo> nodeMap;
+class _XMindBracketPainter extends CustomPainter {
+  final double? parentY;
+  final List<double> childYs;
 
-  _MindmapLinePainter({required this.nodes, required this.nodeMap});
+  _XMindBracketPainter({required this.parentY, required this.childYs});
 
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
       ..color = const Color(0xFFEF5350)
-      ..strokeWidth = 1.6
+      ..strokeWidth = 1.5
       ..style = PaintingStyle.stroke;
 
-    for (final info in nodes) {
-      if (info.parentId == null) continue;
-      final parent = nodeMap[info.parentId!];
-      if (parent == null) continue;
+    final pY = parentY ?? (size.height / 2);
+    if (childYs.isEmpty) {
+      canvas.drawLine(Offset(0, pY), Offset(size.width, pY), paint);
+      return;
+    }
 
-      final startX = parent.rect.right + 34.0;
-      final startY = parent.rect.center.dy;
-      final endX = info.rect.left;
-      final endY = info.rect.center.dy;
-      final midX = startX + (endX - startX) * 0.45;
+    final midX = size.width * 0.45;
+    canvas.drawLine(Offset(0, pY), Offset(midX, pY), paint);
 
-      canvas.drawLine(
-        Offset(parent.rect.right, startY),
-        Offset(parent.rect.right + 10.0, startY),
-        paint,
-      );
+    final minY = math.min(pY, childYs.reduce(math.min));
+    final maxY = math.max(pY, childYs.reduce(math.max));
+    if ((maxY - minY).abs() > 0.5) {
+      canvas.drawLine(Offset(midX, minY), Offset(midX, maxY), paint);
+    }
 
-      final path = Path()
-        ..moveTo(startX, startY)
-        ..lineTo(midX, startY)
-        ..lineTo(midX, endY)
-        ..lineTo(endX, endY);
-      canvas.drawPath(path, paint);
+    for (final cy in childYs) {
+      canvas.drawLine(Offset(midX, cy), Offset(size.width, cy), paint);
     }
   }
 
   @override
-  bool shouldRepaint(covariant _MindmapLinePainter oldDelegate) => true;
+  bool shouldRepaint(covariant _XMindBracketPainter oldDelegate) {
+    if (oldDelegate.parentY != parentY || oldDelegate.childYs.length != childYs.length) {
+      return true;
+    }
+    for (int i = 0; i < childYs.length; i++) {
+      if ((oldDelegate.childYs[i] - childYs[i]).abs() > 0.5) return true;
+    }
+    return false;
+  }
 }
