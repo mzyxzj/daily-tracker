@@ -20,19 +20,19 @@ void main() async {
   runApp(DailyTrackerApp(db: db));
 }
 
-// ==================== 数据库层 (支持热重载恢复、WAL 安全合并与版本升级) ====================
+// ==================== 数据库层 (零尖括号防吞版) ====================
 class AppDatabase {
   static final AppDatabase instance = AppDatabase._();
   static Database? _db;
   AppDatabase._();
 
-  Future<Database> get database async {
+  Future get database async {
     if (_db != null && _db!.isOpen) return _db!;
     _db = await _init();
     return _db!;
   }
 
-  static Future<void> closeForRestore() async {
+  static Future closeForRestore() async {
     final dir = await getApplicationDocumentsDirectory();
     final dbPath = p.join(dir.path, 'daily_tracker.db');
     if (_db != null) {
@@ -52,9 +52,10 @@ class AppDatabase {
         } catch (_) {}
       }
     }
+    return null;
   }
 
-  Future<Database> _init() async {
+  Future _init() async {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
@@ -72,52 +73,53 @@ class AppDatabase {
         await db.execute('CREATE TABLE ui_states (state_key TEXT PRIMARY KEY, state_val TEXT NOT NULL)');
       },
       onUpgrade: (db, oldV, newV) async {
-        if (oldV < 2) {
+        if (oldV.compareTo(2) == -1) {
           try { await db.execute("ALTER TABLE schedule_items ADD COLUMN plan_info TEXT DEFAULT ''"); } catch (_) {}
         }
-        if (oldV < 3) {
+        if (oldV.compareTo(3) == -1) {
           try { await db.execute("ALTER TABLE modules ADD COLUMN parent_id INTEGER"); } catch (_) {}
           try { await db.execute("ALTER TABLE modules ADD COLUMN sort_order INTEGER DEFAULT 0"); } catch (_) {}
           try { await db.execute("ALTER TABLE module_entries ADD COLUMN sort_order INTEGER DEFAULT 0"); } catch (_) {}
         }
-        if (oldV < 4) {
+        if (oldV.compareTo(4) == -1) {
           try { await db.execute("ALTER TABLE schedule_items ADD COLUMN parent_id INTEGER"); } catch (_) {}
         }
-        if (oldV < 5) {
+        if (oldV.compareTo(5) == -1) {
           try { await db.execute('CREATE TABLE IF NOT EXISTS ui_states (state_key TEXT PRIMARY KEY, state_val TEXT NOT NULL)'); } catch (_) {}
         }
-        if (oldV < 6) {
+        if (oldV.compareTo(6) == -1) {
           try { await db.execute("ALTER TABLE status_items ADD COLUMN allow_inherit INTEGER DEFAULT 1"); } catch (_) {}
         }
-        if (oldV < 7) {
+        if (oldV.compareTo(7) == -1) {
           try { await db.execute("ALTER TABLE modules ADD COLUMN is_member INTEGER DEFAULT 0"); } catch (_) {}
         }
-        if (oldV < 8) {
+        if (oldV.compareTo(8) == -1) {
           try { await db.execute("ALTER TABLE module_groups ADD COLUMN sort_order INTEGER DEFAULT 0"); } catch (_) {}
         }
       },
     );
   }
 
-  static Future<String?> getUiState(Database db, String key) async {
+  static Future getUiState(Database db, String key) async {
     try {
-      final activeDb = await instance.database;
+      final Database activeDb = await instance.database;
       final rows = await activeDb.query('ui_states', where: 'state_key = ?', whereArgs: [key]);
       if (rows.isNotEmpty) return rows.first['state_val'] as String;
     } catch (_) {}
     return null;
   }
 
-  static Future<void> setUiState(Database db, String key, String val) async {
+  static Future setUiState(Database db, String key, String val) async {
     try {
-      final activeDb = await instance.database;
+      final Database activeDb = await instance.database;
       await activeDb.insert('ui_states', {'state_key': key, 'state_val': val}, conflictAlgorithm: ConflictAlgorithm.replace);
     } catch (_) {}
+    return null;
   }
 }
 
 class TrendLineChart extends StatelessWidget {
-  final List<({String date, double value})> points;
+  final List points;
   const TrendLineChart({super.key, required this.points});
 
   @override
@@ -137,7 +139,7 @@ class TrendLineChart extends StatelessWidget {
 }
 
 class _TrendChartPainter extends CustomPainter {
-  final List<({String date, double value})> points;
+  final List points;
   _TrendChartPainter(this.points);
 
   @override
@@ -145,53 +147,111 @@ class _TrendChartPainter extends CustomPainter {
     if (points.isEmpty) return;
     const lPad = 36.0, bPad = 26.0, tPad = 16.0, rPad = 14.0;
     final cw = size.width - lPad - rPad, ch = size.height - tPad - bPad;
-    final vals = points.map((e) => e.value).toList();
-    double minV = vals.reduce(math.min), maxV = vals.reduce(math.max);
-    if (minV == maxV) { minV -= 5; maxV += 5; }
+    final List vals = points.map((e) => (e as Map)['value'] as double).toList();
+    double minV = vals.first as double;
+    double maxV = vals.first as double;
+    for (final rawV in vals) {
+      final v = rawV as double;
+      if (v.compareTo(minV) == -1) minV = v;
+      if (v.compareTo(maxV) == 1) maxV = v;
+    }
+    if (minV == maxV) {
+      minV -= 5;
+      maxV += 5;
+    }
     final range = maxV - minV;
-    final gridPaint = Paint()..color = const Color(0xFFE2E8F0)..strokeWidth = 1;
+    final gridPaint = Paint()
+      ..color = const Color(0xFFE2E8F0)
+      ..strokeWidth = 1;
 
     for (int i = 0; i <= 2; i++) {
       final ratio = i / 2.0, y = tPad + ch * (1 - ratio);
       canvas.drawLine(Offset(lPad, y), Offset(size.width - rPad, y), gridPaint);
       final v = minV + range * ratio;
       final tp = TextPainter(
-        text: TextSpan(text: v == v.roundToDouble() ? '${v.toInt()}' : v.toStringAsFixed(1), style: const TextStyle(color: Color(0xFF64748B), fontSize: 10)),
+        text: TextSpan(
+          text: v == v.roundToDouble() ? '${v.toInt()}' : v.toStringAsFixed(1),
+          style: const TextStyle(color: Color(0xFF64748B), fontSize: 10),
+        ),
         textDirection: TextDirection.ltr,
       )..layout();
       tp.paint(canvas, Offset(math.max(0, lPad - tp.width - 6), y - tp.height / 2));
     }
 
     final coords = List.generate(points.length, (i) {
+      final pt = points[i] as Map;
+      final ptVal = pt['value'] as double;
       final x = points.length == 1 ? lPad + cw / 2 : lPad + (i / (points.length - 1)) * cw;
-      final y = tPad + ch - ((points[i].value - minV) / range) * ch;
+      final y = tPad + ch - ((ptVal - minV) / range) * ch;
       return Offset(x, y);
     });
 
-    if (coords.length > 1) {
+    if (coords.length >= 2) {
       final fill = Path()..moveTo(coords.first.dx, tPad + ch);
-      for (final c in coords) fill.lineTo(c.dx, c.dy);
-      fill..lineTo(coords.last.dx, tPad + ch)..close();
-      canvas.drawPath(fill, Paint()..shader = LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter, colors: [const Color(0xFF4F46E5).withOpacity(0.25), const Color(0xFF4F46E5).withOpacity(0.0)]).createShader(Rect.fromLTWH(lPad, tPad, cw, ch)));
+      for (final c in coords) {
+        fill.lineTo(c.dx, c.dy);
+      }
+      fill
+        ..lineTo(coords.last.dx, tPad + ch)
+        ..close();
+      canvas.drawPath(
+        fill,
+        Paint()
+          ..shader = LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              const Color(0xFF4F46E5).withOpacity(0.25),
+              const Color(0xFF4F46E5).withOpacity(0.0),
+            ],
+          ).createShader(Rect.fromLTWH(lPad, tPad, cw, ch)),
+      );
 
       final line = Path()..moveTo(coords.first.dx, coords.first.dy);
-      for (int i = 1; i < coords.length; i++) line.lineTo(coords[i].dx, coords[i].dy);
-      canvas.drawPath(line, Paint()..color = const Color(0xFF4F46E5)..strokeWidth = 2.5..style = PaintingStyle.stroke);
+      for (int i = 1; i != coords.length; i++) {
+        line.lineTo(coords[i].dx, coords[i].dy);
+      }
+      canvas.drawPath(
+        line,
+        Paint()
+          ..color = const Color(0xFF4F46E5)
+          ..strokeWidth = 2.5
+          ..style = PaintingStyle.stroke,
+      );
     }
 
     final step = math.max(1, (points.length / 6).ceil());
-    for (int i = 0; i < coords.length; i++) {
+    for (int i = 0; i != coords.length; i++) {
       final isLast = i == coords.length - 1, c = coords[i];
+      final pt = points[i] as Map;
+      final v = pt['value'] as double;
+      final dStr = '${pt['date']}';
       canvas.drawCircle(c, isLast ? 6 : 4.5, Paint()..color = Colors.white);
-      canvas.drawCircle(c, isLast ? 4.5 : 3.2, Paint()..color = isLast ? const Color(0xFFEF4444) : const Color(0xFF4F46E5));
+      canvas.drawCircle(
+        c,
+        isLast ? 4.5 : 3.2,
+        Paint()..color = isLast ? const Color(0xFFEF4444) : const Color(0xFF4F46E5),
+      );
       if (i % step == 0 || isLast || i == 0) {
-        final v = points[i].value;
         final vStr = v == v.roundToDouble() ? '${v.toInt()}' : v.toStringAsFixed(1);
-        final vTp = TextPainter(text: TextSpan(text: vStr, style: TextStyle(color: isLast ? const Color(0xFFEF4444) : const Color(0xFF1E293B), fontSize: 10, fontWeight: isLast ? FontWeight.bold : FontWeight.w500)), textDirection: TextDirection.ltr)..layout();
+        final vTp = TextPainter(
+          text: TextSpan(
+            text: vStr,
+            style: TextStyle(
+              color: isLast ? const Color(0xFFEF4444) : const Color(0xFF1E293B),
+              fontSize: 10,
+              fontWeight: isLast ? FontWeight.bold : FontWeight.w500,
+            ),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout();
         vTp.paint(canvas, Offset(c.dx - vTp.width / 2, c.dy - vTp.height - 6));
 
-        final dShort = points[i].date.length >= 10 ? points[i].date.substring(5) : points[i].date;
-        final dTp = TextPainter(text: TextSpan(text: dShort, style: const TextStyle(color: Color(0xFF64748B), fontSize: 9.5)), textDirection: TextDirection.ltr)..layout();
+        final dShort = dStr.length >= 10 ? dStr.substring(5) : dStr;
+        final dTp = TextPainter(
+          text: TextSpan(text: dShort, style: const TextStyle(color: Color(0xFF64748B), fontSize: 9.5)),
+          textDirection: TextDirection.ltr,
+        )..layout();
         dTp.paint(canvas, Offset(c.dx - dTp.width / 2, tPad + ch + 6));
       }
     }
@@ -224,17 +284,17 @@ class MainShell extends StatefulWidget {
   final Database db;
   const MainShell({super.key, required this.db});
   @override
-  State<MainShell> createState() => _MainShellState();
+  State createState() => _MainShellState();
 }
 
 class _MainShellState extends State<MainShell> {
   int _idx = 2;
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<Database>(
+    return FutureBuilder(
       future: AppDatabase.instance.database,
       builder: (ctx, snap) {
-        final activeDb = snap.data ?? widget.db;
+        final activeDb = (snap.data as Database?) ?? widget.db;
         final pages = [
           SearchPage(db: activeDb),
           FamilyPage(db: activeDb),
@@ -264,19 +324,19 @@ class TodayPage extends StatefulWidget {
   final Database db;
   const TodayPage({super.key, required this.db});
   @override
-  State<TodayPage> createState() => _TodayPageState();
+  State createState() => _TodayPageState();
 }
 
 class _TodayPageState extends State<TodayPage> {
   String _date = DateFormat('yyyy-MM-dd').format(DateTime.now());
-  final Map<int, bool> _expandedPhoto = {};
-  final Set<int> _collapsedStatusIds = {};
-  final Set<int> _collapsedSchedParents = {};
+  final Map _expandedPhoto = {};
+  final Set _collapsedStatusIds = {};
+  final Set _collapsedSchedParents = {};
   bool _foldSummary = false;
   bool _foldStatusSection = false;
   bool _foldSchedSection = false;
   bool _uiLoaded = false;
-  List<String> _sectionOrder = ['summary', 'status', 'schedule'];
+  List _sectionOrder = ['summary', 'status', 'schedule'];
 
   int? _hoverSchedTargetId;
   String? _hoverSchedZone;
@@ -289,11 +349,11 @@ class _TodayPageState extends State<TodayPage> {
     _restoreTodayUiState();
   }
 
-  Future<void> _restoreTodayUiState() async {
+  Future _restoreTodayUiState() async {
     final raw = await AppDatabase.getUiState(widget.db, 'today_ui_state');
-    if (raw != null && raw.isNotEmpty) {
+    if (raw != null && (raw as String).isNotEmpty) {
       try {
-        final map = jsonDecode(raw) as Map<String, dynamic>;
+        final map = jsonDecode(raw) as Map;
         _foldSummary = map['foldSummary'] == true;
         _foldStatusSection = map['foldStatusSection'] == true;
         _foldSchedSection = map['foldSchedSection'] == true;
@@ -306,16 +366,17 @@ class _TodayPageState extends State<TodayPage> {
         }
         _collapsedStatusIds
           ..clear()
-          ..addAll(((map['collapsedStatusIds'] as List?) ?? []).map((e) => e as int));
+          ..addAll(((map['collapsedStatusIds'] as List?) ?? []).map((e) => int.parse('$e')));
         _collapsedSchedParents
           ..clear()
-          ..addAll(((map['collapsedSchedParents'] as List?) ?? []).map((e) => e as int));
+          ..addAll(((map['collapsedSchedParents'] as List?) ?? []).map((e) => int.parse('$e')));
       } catch (_) {}
     }
     if (mounted) setState(() => _uiLoaded = true);
+    return null;
   }
 
-  Future<void> _saveTodayUiState() async {
+  Future _saveTodayUiState() async {
     final data = jsonEncode({
       'foldSummary': _foldSummary,
       'foldStatusSection': _foldStatusSection,
@@ -325,18 +386,20 @@ class _TodayPageState extends State<TodayPage> {
       'collapsedSchedParents': _collapsedSchedParents.toList(),
     });
     await AppDatabase.setUiState(widget.db, 'today_ui_state', data);
+    return null;
   }
 
-  Future> _load() async {
+  Future _load() async {
     if (!_uiLoaded) await _restoreTodayUiState();
-    final db = await AppDatabase.instance.database;
-    final items = List>.from(
+    final Database db = await AppDatabase.instance.database;
+    final items = List.from(
       await db.query('status_items', orderBy: 'sort_order ASC, id ASC'),
     );
-    final disp = <int, Map<String, dynamic>>{};
+    final Map disp = {};
     final appDir = await getApplicationDocumentsDirectory();
 
-    for (final it in items) {
+    for (final rawIt in items) {
+      final it = rawIt as Map;
       final id = it['id'] as int, type = it['type'] as String;
       final allowInherit = (it['allow_inherit'] as int? ?? 1) == 1;
 
@@ -344,17 +407,37 @@ class _TodayPageState extends State<TodayPage> {
       if (todayRecs.isNotEmpty) {
         final r = todayRecs.first;
         final imgs = await db.query('status_images', where: 'record_id = ?', whereArgs: [r['id']], orderBy: 'sort_order ASC');
-        disp[id] = {'recordId': r['id'], 'value': r['value'], 'images': imgs.map((i) => p.join(appDir.path, i['file_path'] as String)).toList(), 'isInherited': false};
+        disp[id] = {
+          'recordId': r['id'],
+          'value': r['value'],
+          'images': imgs.map((i) => p.join(appDir.path, i['file_path'] as String)).toList(),
+          'isInherited': false,
+        };
       } else if (type != 'image' && allowInherit) {
-        final prev = await db.query('status_records', where: 'item_id = ? AND date < ? AND value != ""', whereArgs: [id, _date], orderBy: 'date DESC', limit: 1);
-        if (prev.isNotEmpty) disp[id] = {'recordId': null, 'value': prev.first['value'], 'images': <String>[], 'isInherited': true, 'inheritedFrom': prev.first['date']};
+        final prev = await db.query(
+          'status_records',
+          where: 'item_id = ? AND date \x3c ? AND value != ""',
+          whereArgs: [id, _date],
+          orderBy: 'date DESC',
+          limit: 1,
+        );
+        if (prev.isNotEmpty) {
+          disp[id] = {
+            'recordId': null,
+            'value': prev.first['value'],
+            'images': [],
+            'isInherited': true,
+            'inheritedFrom': prev.first['date'],
+          };
+        }
       }
     }
-    final scheds = List>.from(
+    final scheds = List.from(
       await db.query('schedule_items', orderBy: 'sort_order ASC, id ASC'),
     );
-    final doneMap = <int, bool>{};
-    for (final s in scheds) {
+    final Map doneMap = {};
+    for (final rawS in scheds) {
+      final s = rawS as Map;
       final sid = s['id'] as int;
       final r = await db.query('schedule_records', where: 'item_id = ? AND date = ?', whereArgs: [sid, _date]);
       doneMap[sid] = r.isNotEmpty && (r.first['done'] as int) == 1;
@@ -362,7 +445,7 @@ class _TodayPageState extends State<TodayPage> {
     return {'items': items, 'disp': disp, 'scheds': scheds, 'done': doneMap};
   }
 
-  List<String> _splitColumns(String raw) {
+  List _splitColumns(String raw) {
     final trimmed = raw.trim();
     if (trimmed.isEmpty) return [];
     if (trimmed.contains('\n')) {
@@ -379,7 +462,7 @@ class _TodayPageState extends State<TodayPage> {
     }
     if (trimmed.contains('。')) {
       final parts = trimmed.split('。').map((s) => s.trim()).where((s) => s.isNotEmpty).toList();
-      if (parts.length > 1) return parts;
+      if (parts.length >= 2) return parts;
     }
     return [trimmed];
   }
@@ -387,14 +470,14 @@ class _TodayPageState extends State<TodayPage> {
   String _unescapeXml(String s) {
     return s
         .replaceAll('&amp;', '&')
-        .replaceAll('&lt;', '<')
-        .replaceAll('&gt;', '>')
+        .replaceAll('&lt;', '\x3c')
+        .replaceAll('&gt;', '\x3e')
         .replaceAll('&quot;', '"')
         .replaceAll('&apos;', "'");
   }
 
-  Future<int> _ensureStatusItem(String name, String type) async {
-    final db = await AppDatabase.instance.database;
+  Future _ensureStatusItem(String name, String type) async {
+    final Database db = await AppDatabase.instance.database;
     final existing = await db.query('status_items', where: 'name = ?', whereArgs: [name]);
     if (existing.isNotEmpty) return existing.first['id'] as int;
     if (name == '状态与异状' || name == '状态和异状') {
@@ -410,31 +493,31 @@ class _TodayPageState extends State<TodayPage> {
     });
   }
 
-  bool _isSchedDescendant(int dragId, int targetId, List> all) {
+  bool _isSchedDescendant(int dragId, int targetId, List all) {
     if (dragId == targetId) return true;
     int? cur = targetId;
-    final visited = <int>{};
+    final Set visited = {};
     while (cur != null && !visited.contains(cur)) {
       visited.add(cur);
       if (cur == dragId) return true;
-      final row = all.where((m) => m['id'] == cur).firstOrNull;
+      final row = all.where((m) => (m as Map)['id'] == cur).firstOrNull as Map?;
       cur = row?['parent_id'] as int?;
     }
     return false;
   }
 
-  Future<void> _handleScheduleDrop({
+  Future _handleScheduleDrop({
     required int dragId,
     required int targetId,
     required String zone,
-    required List> allScheds,
+    required List allScheds,
   }) async {
-    if (_isSchedDescendant(dragId, targetId, allScheds)) return;
-    final db = await AppDatabase.instance.database;
-    final target = allScheds.firstWhere((m) => m['id'] == targetId);
+    if (_isSchedDescendant(dragId, targetId, allScheds)) return null;
+    final Database db = await AppDatabase.instance.database;
+    final target = allScheds.firstWhere((m) => (m as Map)['id'] == targetId) as Map;
 
     if (zone == 'inside') {
-      final siblings = allScheds.where((m) => m['parent_id'] == targetId && m['id'] != dragId).toList();
+      final siblings = allScheds.where((m) => (m as Map)['parent_id'] == targetId && m['id'] != dragId).toList();
       await db.update(
         'schedule_items',
         {'parent_id': targetId, 'sort_order': siblings.length},
@@ -445,34 +528,35 @@ class _TodayPageState extends State<TodayPage> {
       await _saveTodayUiState();
     } else {
       final newParentId = target['parent_id'] as int?;
-      final siblings = allScheds.where((m) => m['parent_id'] == newParentId && m['id'] != dragId).toList();
-      final tIdx = siblings.indexWhere((m) => m['id'] == targetId);
+      final siblings = allScheds.where((m) => (m as Map)['parent_id'] == newParentId && m['id'] != dragId).toList();
+      final tIdx = siblings.indexWhere((m) => (m as Map)['id'] == targetId);
       final insertIdx = zone == 'up' ? math.max(0, tIdx) : math.min(siblings.length, tIdx + 1);
 
-      final dragMap = allScheds.firstWhere((m) => m['id'] == dragId);
+      final dragMap = allScheds.firstWhere((m) => (m as Map)['id'] == dragId);
       siblings.insert(insertIdx, dragMap);
 
-      for (int i = 0; i < siblings.length; i++) {
+      for (int i = 0; i != siblings.length; i++) {
         await db.update(
           'schedule_items',
           {'parent_id': newParentId, 'sort_order': i},
           where: 'id = ?',
-          whereArgs: [siblings[i]['id']],
+          whereArgs: [(siblings[i] as Map)['id']],
         );
       }
     }
     if (mounted) setState(() {});
+    return null;
   }
 
-  Future<void> _toggleScheduleCheckbox(
+  Future _toggleScheduleCheckbox(
     int sid,
     bool targetDone,
-    List> allScheds,
-    Map<int, bool> doneMap,
+    List allScheds,
+    Map doneMap,
   ) async {
-    final db = await AppDatabase.instance.database;
-    List> childrenOf(int pid) =>
-        allScheds.where((s) => s['parent_id'] == pid).toList();
+    final Database db = await AppDatabase.instance.database;
+    List childrenOf(int pid) =>
+        allScheds.where((s) => (s as Map)['parent_id'] == pid).toList();
 
     doneMap[sid] = targetDone;
     await db.insert(
@@ -481,8 +565,9 @@ class _TodayPageState extends State<TodayPage> {
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
 
-    Future<void> cascadeDown(int pId, bool d) async {
-      for (final sub in childrenOf(pId)) {
+    Future cascadeDown(int pId, bool d) async {
+      for (final rawSub in childrenOf(pId)) {
+        final sub = rawSub as Map;
         final subId = sub['id'] as int;
         doneMap[subId] = d;
         await db.insert(
@@ -492,17 +577,19 @@ class _TodayPageState extends State<TodayPage> {
         );
         await cascadeDown(subId, d);
       }
+      return null;
     }
+
     await cascadeDown(sid, targetDone);
 
-    final currentItem = allScheds.where((s) => s['id'] == sid).firstOrNull;
+    final currentItem = allScheds.where((s) => (s as Map)['id'] == sid).firstOrNull as Map?;
     int? pId = currentItem?['parent_id'] as int?;
-    final visited = <int>{};
+    final Set visited = {};
     while (pId != null && !visited.contains(pId)) {
       visited.add(pId);
       final siblings = childrenOf(pId);
       if (siblings.isNotEmpty) {
-        final allSiblingsDone = siblings.every((c) => doneMap[c['id'] as int] == true);
+        final allSiblingsDone = siblings.every((c) => doneMap[(c as Map)['id'] as int] == true);
         doneMap[pId] = allSiblingsDone;
         await db.insert(
           'schedule_records',
@@ -510,29 +597,29 @@ class _TodayPageState extends State<TodayPage> {
           conflictAlgorithm: ConflictAlgorithm.replace,
         );
       }
-      final parentItem = allScheds.where((s) => s['id'] == pId).firstOrNull;
+      final parentItem = allScheds.where((s) => (s as Map)['id'] == pId).firstOrNull as Map?;
       pId = parentItem?['parent_id'] as int?;
     }
 
     if (mounted) setState(() {});
+    return null;
   }
-
-  Future<void> _openGeminiAnalyzerSheet(String summaryText) async {
+  Future _openGeminiAnalyzerSheet(String summaryText) async {
     final rawCfg = await AppDatabase.getUiState(widget.db, 'gemini_ai_config');
-    Map<String, dynamic> cfg = {
+    final Map cfg = {
       'model': 'gemini-3.1-pro',
       'mode': 'gem',
       'gemName': '每日状态系统分析师',
       'gemPrompt': '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条格式如“标题：具体分析”。',
       'targetField': 'AI 深度异状分析',
     };
-    if (rawCfg != null && rawCfg.isNotEmpty) {
+    if (rawCfg != null && (rawCfg as String).isNotEmpty) {
       try {
-        cfg.addAll(jsonDecode(rawCfg) as Map<String, dynamic>);
+        cfg.addAll(jsonDecode(rawCfg) as Map);
       } catch (_) {}
     }
 
-    if (!mounted) return;
+    if (!mounted) return null;
     final gemNameCtrl = TextEditingController(text: '${cfg['gemName']}');
     final gemPromptCtrl = TextEditingController(text: '${cfg['gemPrompt']}');
     final targetFieldCtrl = TextEditingController(text: '${cfg['targetField']}');
@@ -540,7 +627,7 @@ class _TodayPageState extends State<TodayPage> {
     String selectedModel = '${cfg['model']}';
     String selectedMode = '${cfg['mode']}';
 
-    Future<void> saveCurrentConfig() async {
+    Future saveCurrentConfig() async {
       final newCfg = {
         'model': selectedModel,
         'mode': selectedMode,
@@ -549,6 +636,7 @@ class _TodayPageState extends State<TodayPage> {
         'targetField': targetFieldCtrl.text.trim().isEmpty ? 'AI 深度异状分析' : targetFieldCtrl.text.trim(),
       };
       await AppDatabase.setUiState(widget.db, 'gemini_ai_config', jsonEncode(newCfg));
+      return null;
     }
 
     String buildFullPrompt() {
@@ -598,7 +686,7 @@ class _TodayPageState extends State<TodayPage> {
                   children: [
                     Expanded(
                       flex: 5,
-                      child: DropdownButtonFormField<String>(
+                      child: DropdownButtonFormField(
                         value: ['gemini-3.1-pro', 'gemini-2.5-pro', 'gemini-2.5-flash'].contains(selectedModel)
                             ? selectedModel
                             : 'gemini-3.1-pro',
@@ -615,7 +703,7 @@ class _TodayPageState extends State<TodayPage> {
                           DropdownMenuItem(value: 'gemini-2.5-flash', child: Text('Gemini 2.5 Flash', style: TextStyle(fontSize: 13))),
                         ],
                         onChanged: (v) {
-                          setS(() => selectedModel = v!);
+                          setS(() => selectedModel = '$v');
                           saveCurrentConfig();
                         },
                       ),
@@ -623,7 +711,7 @@ class _TodayPageState extends State<TodayPage> {
                     const SizedBox(width: 8),
                     Expanded(
                       flex: 4,
-                      child: DropdownButtonFormField<String>(
+                      child: DropdownButtonFormField(
                         value: selectedMode == 'chat' ? 'chat' : 'gem',
                         isExpanded: true,
                         decoration: const InputDecoration(
@@ -637,7 +725,7 @@ class _TodayPageState extends State<TodayPage> {
                           DropdownMenuItem(value: 'chat', child: Text('💬 普通对话', style: TextStyle(fontSize: 13))),
                         ],
                         onChanged: (v) {
-                          setS(() => selectedMode = v!);
+                          setS(() => selectedMode = '$v');
                           saveCurrentConfig();
                         },
                       ),
@@ -662,7 +750,7 @@ class _TodayPageState extends State<TodayPage> {
                         ),
                       ),
                       const SizedBox(width: 6),
-                      PopupMenuButton<({String name, String prompt})>(
+                      PopupMenuButton(
                         tooltip: '快速切换常用 Gem 预设',
                         child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -681,32 +769,33 @@ class _TodayPageState extends State<TodayPage> {
                           ),
                         ),
                         onSelected: (preset) {
+                          final pMap = preset as Map;
                           setS(() {
-                            gemNameCtrl.text = preset.name;
-                            gemPromptCtrl.text = preset.prompt;
+                            gemNameCtrl.text = '${pMap['name']}';
+                            gemPromptCtrl.text = '${pMap['prompt']}';
                           });
                           saveCurrentConfig();
                         },
                         itemBuilder: (_) => [
                           const PopupMenuItem(
-                            value: (
-                              name: '客观理性系统分析师',
-                              prompt: '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条格式如“标题：具体分析”。',
-                            ),
+                            value: {
+                              'name': '客观理性系统分析师',
+                              'prompt': '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条格式如“标题：具体分析”。',
+                            },
                             child: Text('💎 客观理性系统分析师'),
                           ),
                           const PopupMenuItem(
-                            value: (
-                              name: '代谢与营养精算师',
-                              prompt: '请聚焦我今日的饮食结构（碳水/蛋白质/钠摄入）与体重变化、体能训练表现，分析水肿或热量缺口情况，并给出明日三餐调整方案。每条格式如“标题：具体分析”。',
-                            ),
+                            value: {
+                              'name': '代谢与营养精算师',
+                              'prompt': '请聚焦我今日的饮食结构（碳水/蛋白质/钠摄入）与体重变化、体能训练表现，分析水肿或热量缺口情况，并给出明日三餐调整方案。每条格式如“标题：具体分析”。',
+                            },
                             child: Text('🥗 代谢与营养精算师'),
                           ),
                           const PopupMenuItem(
-                            value: (
-                              name: '精力与日程效能教练',
-                              prompt: '请结合我今日的已完成/未完成日程与核心目标，分析精力分配与决策疲劳点，给出明日单线程减法行动建议。每条格式如“标题：具体分析”。',
-                            ),
+                            value: {
+                              'name': '精力与日程效能教练',
+                              'prompt': '请结合我今日的已完成/未完成日程与核心目标，分析精力分配与决策疲劳点，给出明日单线程减法行动建议。每条格式如“标题：具体分析”。',
+                            },
                             child: Text('⚡ 精力与日程效能教练'),
                           ),
                         ],
@@ -848,10 +937,10 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  Future<void> _importDailyDocx() async {
+  Future _importDailyDocx() async {
     try {
       final res = await FilePicker.platform.pickFiles(type: FileType.any);
-      if (res == null || res.files.single.path == null) return;
+      if (res == null || res.files.single.path == null) return null;
       final db = await AppDatabase.instance.database;
       final filePath = res.files.single.path!;
       final bytes = await File(filePath).readAsBytes();
@@ -859,7 +948,7 @@ class _TodayPageState extends State<TodayPage> {
 
       ArchiveFile? docXmlFile;
       ArchiveFile? relsXmlFile;
-      final mediaFiles = <String, ArchiveFile>{};
+      final Map mediaFiles = {};
 
       for (final f in archive) {
         if (!f.isFile) continue;
@@ -874,13 +963,14 @@ class _TodayPageState extends State<TodayPage> {
 
       if (docXmlFile == null) {
         if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('未识别到标准 Word 结构')));
-        return;
+        return null;
       }
 
-      final relMap = <String, String>{};
+      final Map relMap = {};
       if (relsXmlFile != null) {
-        final relsXml = utf8.decode(relsXmlFile.content as List<int>, allowMalformed: true);
-        final relMatches = RegExp(r'<Relationship\b[^>]*>').allMatches(relsXml);
+        final List relsBytes = relsXmlFile.content as List;
+        final relsXml = utf8.decode(relsBytes.cast(), allowMalformed: true);
+        final relMatches = RegExp(r'\x3cRelationship\b[^\x3e]*\x3e').allMatches(relsXml);
         for (final m in relMatches) {
           final tag = m.group(0)!;
           final idM = RegExp(r'Id="([^"]+)"').firstMatch(tag);
@@ -897,21 +987,22 @@ class _TodayPageState extends State<TodayPage> {
         }
       }
 
-      final docXml = utf8.decode(docXmlFile.content as List<int>, allowMalformed: true);
-      final pMatches = RegExp(r'<w:p\b[^>]*>([\s\S]*?)<\/w:p>').allMatches(docXml);
+      final List docBytes = docXmlFile.content as List;
+      final docXml = utf8.decode(docBytes.cast(), allowMalformed: true);
+      final pMatches = RegExp(r'\x3cw:p\b[^\x3e]*\x3e([\s\S]*?)\x3c\/w:p\x3e').allMatches(docXml);
 
       String currentDate = _date;
       String? lastimportedDate;
       String? currentField;
-      final dateTextData = <String, Map<String, List<String>>>{};
-      final dateImages = <String, List<String>>{};
+      final Map dateTextData = {};
+      final Map dateImages = {};
 
       void addTextLine(String dateKey, String fieldName, String val) {
         final v = val.trim();
         if (v.isEmpty) return;
         dateTextData.putIfAbsent(dateKey, () => {});
-        dateTextData[dateKey]!.putIfAbsent(fieldName, () => []);
-        dateTextData[dateKey]![fieldName]!.add(v);
+        (dateTextData[dateKey] as Map).putIfAbsent(fieldName, () => []);
+        ((dateTextData[dateKey] as Map)[fieldName] as List).add(v);
       }
 
       final dateHeaderRegex = RegExp(r'^【\s*(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]\s*】');
@@ -919,7 +1010,7 @@ class _TodayPageState extends State<TodayPage> {
 
       for (final pm in pMatches) {
         final pXml = pm.group(1)!;
-        final tMatches = RegExp(r'<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>').allMatches(pXml);
+        final tMatches = RegExp(r'\x3cw:t(?:\s[^\x3e]*)?\x3e([\s\S]*?)\x3c\/w:t\x3e').allMatches(pXml);
         final rawText = _unescapeXml(tMatches.map((m) => m.group(1)!).join('')).trim();
 
         final blipMatches = RegExp(r'r:(?:embed|id)="([^"]+)"').allMatches(pXml);
@@ -928,8 +1019,8 @@ class _TodayPageState extends State<TodayPage> {
           final mediaPath = relMap[rId];
           if (mediaPath != null && mediaFiles.containsKey(mediaPath)) {
             dateImages.putIfAbsent(currentDate, () => []);
-            if (!dateImages[currentDate]!.contains(mediaPath)) {
-              dateImages[currentDate]!.add(mediaPath);
+            if (!(dateImages[currentDate] as List).contains(mediaPath)) {
+              (dateImages[currentDate] as List).add(mediaPath);
             }
           }
         }
@@ -953,7 +1044,7 @@ class _TodayPageState extends State<TodayPage> {
         String? matchedField;
         String remainder = '';
         final colonIdx = cleanLine.indexOf(RegExp(r'[:：]'));
-        if (colonIdx > 0 && colonIdx <= 14) {
+        if (colonIdx >= 1 && colonIdx <= 14) {
           final prefix = cleanLine.substring(0, colonIdx).trim();
           final after = cleanLine.substring(colonIdx + 1).trim();
           final isSubItemPrefix = RegExp(r'^([a-zA-Z]{1,4}[\.、]|早餐|午餐|下午茶|晚餐|夜宵|加餐|上午|下午|晚上|\d+[\.、])').hasMatch(cleanLine);
@@ -979,7 +1070,7 @@ class _TodayPageState extends State<TodayPage> {
                 addTextLine(currentDate, '运动量', sportVal);
               } else {
                 final subColon = pTrim.indexOf(RegExp(r'[:：]'));
-                if (subColon > 0) addTextLine(currentDate, pTrim.substring(0, subColon).trim(), pTrim.substring(subColon + 1).trim());
+                if (subColon >= 1) addTextLine(currentDate, pTrim.substring(0, subColon).trim(), pTrim.substring(subColon + 1).trim());
               }
             }
           } else {
@@ -994,19 +1085,20 @@ class _TodayPageState extends State<TodayPage> {
 
       int importedDays = 0;
       int importedImgs = 0;
-      final allDates = <String>{...dateTextData.keys, ...dateImages.keys};
+      final Set allDates = {...dateTextData.keys, ...dateImages.keys};
       final appDir = await getApplicationDocumentsDirectory();
 
-      for (final dKey in allDates) {
+      for (final rawDKey in allDates) {
+        final dKey = '$rawDKey';
         importedDays++;
-        final fieldsMap = dateTextData[dKey] ?? {};
+        final fieldsMap = (dateTextData[dKey] as Map?) ?? {};
         for (final entry in fieldsMap.entries) {
-          final fName = entry.key;
-          final fLines = entry.value;
+          final fName = '${entry.key}';
+          final fLines = (entry.value as List).map((e) => '$e').toList();
           if (fLines.isEmpty) continue;
 
           final isNumber = fName.contains('体重') && fLines.length == 1 && double.tryParse(fLines.first) != null;
-          final itemId = await _ensureStatusItem(fName, isNumber ? 'number' : 'text');
+          final itemId = (await _ensureStatusItem(fName, isNumber ? 'number' : 'text')) as int;
           final joinedVal = fLines.join('\n');
 
           await db.insert(
@@ -1016,9 +1108,9 @@ class _TodayPageState extends State<TodayPage> {
           );
         }
 
-        final imgList = dateImages[dKey] ?? [];
+        final imgList = (dateImages[dKey] as List?) ?? [];
         if (imgList.isNotEmpty) {
-          final imgItemId = await _ensureStatusItem('今日图片', 'image');
+          final imgItemId = (await _ensureStatusItem('今日图片', 'image')) as int;
           await db.insert(
             'status_records',
             {'item_id': imgItemId, 'date': dKey, 'value': ''},
@@ -1034,12 +1126,14 @@ class _TodayPageState extends State<TodayPage> {
           final existingImgs = await db.query('status_images', where: 'record_id = ?', whereArgs: [recId]);
           int nextSort = existingImgs.length;
 
-          for (final mediaKey in imgList) {
-            final archFile = mediaFiles[mediaKey]!;
+          for (final rawMediaKey in imgList) {
+            final mediaKey = '$rawMediaKey';
+            final archFile = mediaFiles[mediaKey] as ArchiveFile;
+            final List fileBytes = archFile.content as List;
             final ext = p.extension(mediaKey).isNotEmpty ? p.extension(mediaKey) : '.jpg';
             final fileName = '${recId}_${nextSort}_${DateTime.now().millisecondsSinceEpoch}$ext';
             final relPath = p.join('images', 'status', dFolder, fileName);
-            await File(p.join(appDir.path, relPath)).writeAsBytes(archFile.content as List<int>);
+            await File(p.join(appDir.path, relPath)).writeAsBytes(fileBytes.cast());
             await db.insert('status_images', {
               'record_id': recId,
               'file_path': relPath,
@@ -1052,11 +1146,11 @@ class _TodayPageState extends State<TodayPage> {
 
       if (lastimportedDate != null) _date = lastimportedDate;
 
-      if (!mounted) return;
+      if (!mounted) return null;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('🎉 成功导入 $importedDays 天记录、$importedImgs 张图片！')));
       setState(() {});
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted) return null;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('导入 Word 失败：$e')));
     }
   }
@@ -1085,38 +1179,40 @@ class _TodayPageState extends State<TodayPage> {
           )
         ],
       ),
-      body: FutureBuilder>(
+      body: FutureBuilder(
         future: _load(),
         builder: (ctx, snap) {
           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
-          final items = snap.data!['items'] as List>;
-          final disp = snap.data!['disp'] as Map<int, Map<String, dynamic>>;
-          final scheds = snap.data!['scheds'] as List>;
-          final doneMap = snap.data!['done'] as Map<int, bool>;
+          final dataMap = snap.data as Map;
+          final items = dataMap['items'] as List;
+          final disp = dataMap['disp'] as Map;
+          final scheds = dataMap['scheds'] as List;
+          final doneMap = dataMap['done'] as Map;
 
-          for (final s in scheds) {
+          for (final rawS in scheds) {
+            final s = rawS as Map;
             final sid = s['id'] as int;
-            final ch = scheds.where((c) => c['parent_id'] == sid).toList();
+            final ch = scheds.where((c) => (c as Map)['parent_id'] == sid).toList();
             if (ch.isNotEmpty) {
-              doneMap[sid] = ch.every((c) => doneMap[c['id'] as int] == true);
+              doneMap[sid] = ch.every((c) => doneMap[(c as Map)['id'] as int] == true);
             }
           }
 
-          final doneCount = doneMap.values.where((v) => v).length;
+          final doneCount = doneMap.values.where((v) => v == true).length;
 
           return ReorderableListView.builder(
             padding: const EdgeInsets.fromLTRB(12, 10, 12, 24),
             buildDefaultDragHandles: false,
             itemCount: _sectionOrder.length,
             onReorder: (oldIdx, newIdx) async {
-              if (newIdx > oldIdx) newIdx -= 1;
+              if (newIdx.compareTo(oldIdx) == 1) newIdx -= 1;
               final moved = _sectionOrder.removeAt(oldIdx);
               _sectionOrder.insert(newIdx, moved);
               await _saveTodayUiState();
               setState(() {});
             },
             itemBuilder: (ctx, secIdx) {
-              final secKey = _sectionOrder[secIdx];
+              final secKey = '${_sectionOrder[secIdx]}';
               if (secKey == 'summary') {
                 return Container(
                   key: const ValueKey('sec_summary'),
@@ -1151,23 +1247,24 @@ class _TodayPageState extends State<TodayPage> {
                             buildDefaultDragHandles: false,
                             itemCount: items.length,
                             onReorder: (oldIdx, newIdx) async {
-                              if (newIdx > oldIdx) newIdx -= 1;
+                              if (newIdx.compareTo(oldIdx) == 1) newIdx -= 1;
                               final db = await AppDatabase.instance.database;
-                              final moved = items.removeAt(oldIdx);
+                              final moved = items.removeAt(oldIdx) as Map;
                               items.insert(newIdx, moved);
-                              for (int i = 0; i < items.length; i++) {
-                                await db.update('status_items', {'sort_order': i}, where: 'id = ?', whereArgs: [items[i]['id']]);
+                              for (int i = 0; i != items.length; i++) {
+                                await db.update('status_items', {'sort_order': i}, where: 'id = ?', whereArgs: [(items[i] as Map)['id']]);
                               }
                               setState(() {});
                             },
                             itemBuilder: (ctx, i) {
+                              final it = items[i] as Map;
                               return Container(
-                                key: ValueKey('status_item_${items[i]['id']}'),
+                                key: ValueKey('status_item_${it['id']}'),
                                 decoration: BoxDecoration(
                                   color: Colors.white,
-                                  border: i > 0 ? const Border(top: BorderSide(color: Color(0xFFE2E8F0), width: 0.8)) : null,
+                                  border: i >= 1 ? const Border(top: BorderSide(color: Color(0xFFE2E8F0), width: 0.8)) : null,
                                 ),
-                                child: _buildCompactStatusRow(items[i], disp[items[i]['id'] as int], i),
+                                child: _buildCompactStatusRow(it, disp[it['id'] as int] as Map?, i),
                               );
                             },
                           ),
@@ -1328,31 +1425,32 @@ class _TodayPageState extends State<TodayPage> {
 
   Widget _buildSummaryCard(
     int dragIndex,
-    List> items,
-    Map<int, Map<String, dynamic>> disp,
-    List> scheds,
-    Map<int, bool> doneMap,
+    List items,
+    Map disp,
+    List scheds,
+    Map doneMap,
   ) {
-    final copyLines = <String>[];
-    final summaryRows = <Widget>[];
+    final List copyLines = [];
+    final List summaryRows = [];
 
-    for (final it in items) {
-      final d = disp[it['id'] as int];
+    for (final rawIt in items) {
+      final it = rawIt as Map;
+      final d = disp[it['id'] as int] as Map?;
       if (d == null) continue;
       final name = '${it['name']}';
       if (it['type'] == 'image') {
-        final imgs = d['images'] as List<String>;
+        final imgs = d['images'] as List;
         if (imgs.isNotEmpty) {
           copyLines.add('$name：[${imgs.length}张图片]');
           summaryRows.add(_buildSummarySingleLine(name, '[${imgs.length}张图片]'));
         }
       } else {
-        final rawVal = (d['value'] as String).trim();
+        final rawVal = '${d['value'] ?? ''}'.trim();
         if (rawVal.isEmpty) continue;
         final cols = _splitColumns(rawVal);
         if (cols.length <= 1) {
           copyLines.add('$name：${cols.first}');
-          summaryRows.add(_buildSummarySingleLine(name, cols.first));
+          summaryRows.add(_buildSummarySingleLine(name, '${cols.first}'));
         } else {
           copyLines.add('$name：\n${cols.map((c) => '  • $c').join('\n')}');
           summaryRows.add(_buildSummaryMultiColRow(name, cols));
@@ -1360,62 +1458,65 @@ class _TodayPageState extends State<TodayPage> {
       }
     }
 
-    String fmtSched(Map<String, dynamic> s) {
-      final p = (s['plan_info'] as String? ?? '').trim();
+    String fmtSched(Map s) {
+      final p = '${s['plan_info'] ?? ''}'.trim();
       return p.isEmpty ? '${s['title']}' : '${s['title']} ($p)';
     }
 
-    final validIds = scheds.map((s) => s['id'] as int).toSet();
+    final Set validIds = scheds.map((s) => (s as Map)['id'] as int).toSet();
     final roots = scheds.where((s) {
-      final pid = s['parent_id'] as int?;
+      final pid = (s as Map)['parent_id'] as int?;
       return pid == null || !validIds.contains(pid);
     }).toList();
-    List> childrenOf(int pid) =>
-        scheds.where((s) => s['parent_id'] == pid).toList();
 
-    List<({String text, int depth, bool isGroupHeaderOnly})> buildHierarchicalList(bool targetDone) {
-      final res = <({String text, int depth, bool isGroupHeaderOnly})>[];
-      bool hasMatchInSubtree(Map<String, dynamic> node) {
+    List childrenOf(int pid) =>
+        scheds.where((s) => (s as Map)['parent_id'] == pid).toList();
+
+    List buildHierarchicalList(bool targetDone) {
+      final List res = [];
+      bool hasMatchInSubtree(Map node) {
         final id = node['id'] as int;
-        if ((doneMap[id] ?? false) == targetDone) return true;
+        if ((doneMap[id] == true) == targetDone) return true;
         for (final c in childrenOf(id)) {
-          if (hasMatchInSubtree(c)) return true;
+          if (hasMatchInSubtree(c as Map)) return true;
         }
         return false;
       }
 
-      void walk(Map<String, dynamic> node, int depth) {
+      void walk(Map node, int depth) {
         if (!hasMatchInSubtree(node)) return;
         final id = node['id'] as int;
-        final selfMatches = (doneMap[id] ?? false) == targetDone;
-        res.add((
-          text: fmtSched(node),
-          depth: depth,
-          isGroupHeaderOnly: !selfMatches,
-        ));
+        final selfMatches = (doneMap[id] == true) == targetDone;
+        res.add({
+          'text': fmtSched(node),
+          'depth': depth,
+          'isGroupHeaderOnly': !selfMatches,
+        });
         for (final c in childrenOf(id)) {
-          walk(c, depth + 1);
+          walk(c as Map, depth + 1);
         }
       }
 
       for (final r in roots) {
-        walk(r, 0);
+        walk(r as Map, 0);
       }
       return res;
     }
 
     final doneHierarchical = buildHierarchicalList(true);
     final todoHierarchical = buildHierarchicalList(false);
-    final doneActualCount = scheds.where((s) => doneMap[s['id']] == true).length;
-    final todoActualCount = scheds.where((s) => doneMap[s['id']] != true).length;
+    final doneActualCount = scheds.where((s) => doneMap[(s as Map)['id']] == true).length;
+    final todoActualCount = scheds.where((s) => doneMap[(s as Map)['id']] != true).length;
 
-    String formatTreeForCopy(List<({String text, int depth, bool isGroupHeaderOnly})> list) {
+    String formatTreeForCopy(List list) {
       if (list.isEmpty) return '无';
       return '\n' +
-          list.map((e) {
-            final indent = '  ' * (e.depth + 1);
-            final prefix = e.depth == 0 ? '• ' : '↳ ';
-            return '$indent$prefix${e.text}';
+          list.map((rawE) {
+            final e = rawE as Map;
+            final depth = e['depth'] as int;
+            final indent = '  ' * (depth + 1);
+            final prefix = depth == 0 ? '• ' : '↳ ';
+            return '$indent$prefix${e['text']}';
           }).join('\n');
     }
 
@@ -1558,7 +1659,7 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  Widget _buildSummaryMultiColRow(String name, List<String> cols) {
+  Widget _buildSummaryMultiColRow(String name, List cols) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3.5),
       child: Column(
@@ -1570,10 +1671,11 @@ class _TodayPageState extends State<TodayPage> {
             padding: const EdgeInsets.only(left: 8),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              children: cols.map((colText) {
+              children: cols.map((rawCol) {
+                final colText = '$rawCol';
                 final colonIdx = colText.indexOf(RegExp(r'[:：]'));
                 Widget content;
-                if (colonIdx > 0 && colonIdx < 14) {
+                if (colonIdx >= 1 && colonIdx < 14) {
                   final k = colText.substring(0, colonIdx);
                   final v = colText.substring(colonIdx + 1).trim();
                   content = RichText(
@@ -1610,7 +1712,7 @@ class _TodayPageState extends State<TodayPage> {
   Widget _buildSummaryScheduleTreeBlock(
     String label,
     int count,
-    List<({String text, int depth, bool isGroupHeaderOnly})> nodes,
+    List nodes,
     Color accentColor,
   ) {
     if (nodes.isEmpty) {
@@ -1630,10 +1732,13 @@ class _TodayPageState extends State<TodayPage> {
           padding: const EdgeInsets.only(left: 4),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
-            children: nodes.map((item) {
-              final isSub = item.depth > 0;
+            children: nodes.map((rawItem) {
+              final item = rawItem as Map;
+              final depth = item['depth'] as int;
+              final isSub = depth >= 1;
+              final isGroupHeaderOnly = item['isGroupHeaderOnly'] == true;
               return Padding(
-                padding: EdgeInsets.only(left: item.depth * 16.0, bottom: 3),
+                padding: EdgeInsets.only(left: depth * 16.0, bottom: 3),
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.center,
                   children: [
@@ -1656,11 +1761,11 @@ class _TodayPageState extends State<TodayPage> {
                           ),
                         ),
                         child: Text(
-                          item.text,
+                          '${item['text']}',
                           style: TextStyle(
                             fontSize: isSub ? 11.8 : 12.2,
                             fontWeight: isSub ? FontWeight.normal : FontWeight.w600,
-                            color: item.isGroupHeaderOnly ? const Color(0xFF64748B) : const Color(0xFF1E293B),
+                            color: isGroupHeaderOnly ? const Color(0xFF64748B) : const Color(0xFF1E293B),
                           ),
                         ),
                       ),
@@ -1675,12 +1780,12 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  Widget _buildCompactStatusRow(Map<String, dynamic> it, Map<String, dynamic>? d, int dragIndex) {
-    final id = it['id'] as int, name = it['name'] as String, type = it['type'] as String;
-    final inh = d?['isInherited'] == true, val = d?['value'] as String? ?? '';
-    final imgs = (d?['images'] as List<String>?) ?? [];
-    final recId = d?['recordId'] as int? ?? id;
-    final cols = type == 'image' ? <String>[] : _splitColumns(val);
+  Widget _buildCompactStatusRow(Map it, Map? d, int dragIndex) {
+    final id = it['id'] as int, name = '${it['name']}', type = '${it['type']}';
+    final inh = d?['isInherited'] == true, val = '${d?['value'] ?? ''}';
+    final imgs = (d?['images'] as List?)?.map((e) => '$e').toList() ?? [];
+    final recId = (d?['recordId'] as int?) ?? id;
+    final cols = type == 'image' ? [] : _splitColumns(val);
     final isItemFolded = _collapsedStatusIds.contains(id);
 
     return Padding(
@@ -1691,7 +1796,7 @@ class _TodayPageState extends State<TodayPage> {
           Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              if (cols.length > 1 || val.length > 22 || imgs.isNotEmpty)
+              if (cols.length >= 2 || val.length >= 23 || imgs.isNotEmpty)
                 GestureDetector(
                   onTap: () {
                     setState(() => isItemFolded ? _collapsedStatusIds.remove(id) : _collapsedStatusIds.add(id));
@@ -1718,7 +1823,7 @@ class _TodayPageState extends State<TodayPage> {
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
                   decoration: BoxDecoration(color: Colors.amber[100], borderRadius: BorderRadius.circular(4)),
-                  child: Text('承自${(d!['inheritedFrom'] as String).substring(5)}', style: TextStyle(fontSize: 10, color: Colors.amber[900])),
+                  child: Text('承自${'${d!['inheritedFrom']}'.substring(5)}', style: TextStyle(fontSize: 10, color: Colors.amber[900])),
                 ),
               ],
               const SizedBox(width: 8),
@@ -1784,22 +1889,23 @@ class _TodayPageState extends State<TodayPage> {
               ),
             ],
           ),
-          if (!isItemFolded && type != 'image' && (cols.length > 1 || val.length > 18))
+          if (!isItemFolded && type != 'image' && (cols.length >= 2 || val.length >= 19))
             Padding(
               padding: const EdgeInsets.only(top: 6, right: 6),
               child: GestureDetector(
                 onTap: () => _editValDialog(id, name, type, val),
                 child: LayoutBuilder(
                   builder: (ctx, constraints) {
-                    final useTwoCols = cols.length >= 2 && cols.every((c) => c.length <= 16);
+                    final useTwoCols = cols.length >= 2 && cols.every((c) => '$c'.length <= 16);
                     final itemWidth = useTwoCols ? (constraints.maxWidth - 6) / 2 : constraints.maxWidth;
                     return Wrap(
                       spacing: 6,
                       runSpacing: 5,
-                      children: cols.map((colText) {
+                      children: cols.map((rawCol) {
+                        final colText = '$rawCol';
                         final colonIdx = colText.indexOf(RegExp(r'[:：]'));
                         Widget inner;
-                        if (colonIdx > 0 && colonIdx < 14) {
+                        if (colonIdx >= 1 && colonIdx < 14) {
                           final label = colText.substring(0, colonIdx);
                           final body = colText.substring(colonIdx + 1).trim();
                           inner = RichText(
@@ -1853,25 +1959,25 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  Widget _buildScheduleTree(List> allScheds, Map<int, bool> doneMap) {
-    final validIds = allScheds.map((s) => s['id'] as int).toSet();
+  Widget _buildScheduleTree(List allScheds, Map doneMap) {
+    final Set validIds = allScheds.map((s) => (s as Map)['id'] as int).toSet();
     final roots = allScheds.where((s) {
-      final pid = s['parent_id'] as int?;
+      final pid = (s as Map)['parent_id'] as int?;
       return pid == null || !validIds.contains(pid);
     }).toList();
 
-    List> childrenOf(int pid) {
-      return allScheds.where((s) => s['parent_id'] == pid).toList();
+    List childrenOf(int pid) {
+      return allScheds.where((s) => (s as Map)['parent_id'] == pid).toList();
     }
 
-    Widget buildNode(Map<String, dynamic> s, int depth) {
+    Widget buildNode(Map s, int depth) {
       final sid = s['id'] as int;
       final children = childrenOf(sid);
       final hasChildren = children.isNotEmpty;
-      final done = doneMap[sid] ?? false;
-      final plan = (s['plan_info'] as String? ?? '').trim();
+      final done = doneMap[sid] == true;
+      final plan = '${s['plan_info'] ?? ''}'.trim();
       final isCollapsed = _collapsedSchedParents.contains(sid);
-      final doneChildrenCount = children.where((c) => doneMap[c['id'] as int] == true).length;
+      final doneChildrenCount = children.where((c) => doneMap[(c as Map)['id'] as int] == true).length;
 
       final isHover = _hoverSchedTargetId == sid;
       final zone = isHover ? _hoverSchedZone : null;
@@ -1883,9 +1989,9 @@ class _TodayPageState extends State<TodayPage> {
           Padding(
             padding: EdgeInsets.only(left: depth * 18.0, bottom: 5),
             child: Builder(
-              builder: (itemCtx) => DragTarget<int>(
+              builder: (itemCtx) => DragTarget(
                 onWillAcceptWithDetails: (details) {
-                  final dragId = details.data;
+                  final dragId = details.data as int;
                   return !_isSchedDescendant(dragId, sid, allScheds);
                 },
                 onMove: (details) {
@@ -1894,9 +2000,9 @@ class _TodayPageState extends State<TodayPage> {
                   final localY = box.globalToLocal(details.offset).dy;
                   final h = box.size.height;
                   String z;
-                  if (localY < h * 0.28) {
+                  if (localY.compareTo(h * 0.28) <= 0) {
                     z = 'up';
-                  } else if (localY > h * 0.72) {
+                  } else if (localY.compareTo(h * 0.72) >= 0) {
                     z = 'down';
                   } else {
                     z = 'inside';
@@ -1923,7 +2029,7 @@ class _TodayPageState extends State<TodayPage> {
                     _hoverSchedZone = null;
                   });
                   await _handleScheduleDrop(
-                    dragId: details.data,
+                    dragId: details.data as int,
                     targetId: sid,
                     zone: z,
                     allScheds: allScheds,
@@ -1972,7 +2078,7 @@ class _TodayPageState extends State<TodayPage> {
                               child: Icon(isCollapsed ? Icons.chevron_right : Icons.expand_more, size: 19, color: const Color(0xFF0D9488)),
                             ),
                           )
-                        else if (depth > 0)
+                        else if (depth >= 1)
                           const Padding(
                             padding: EdgeInsets.only(right: 4),
                             child: Icon(Icons.subdirectory_arrow_right, size: 15, color: Colors.grey),
@@ -2053,11 +2159,11 @@ class _TodayPageState extends State<TodayPage> {
                         ),
                         InkWell(
                           onTap: () async {
-                            final db = await AppDatabase.instance.database;
-                            final subIds = <int>[sid];
+                            final Database db = await AppDatabase.instance.database;
+                            final List subIds = [sid];
                             void collect(int p) {
                               for (final c in childrenOf(p)) {
-                                final cid = c['id'] as int;
+                                final cid = (c as Map)['id'] as int;
                                 subIds.add(cid);
                                 collect(cid);
                               }
@@ -2074,7 +2180,7 @@ class _TodayPageState extends State<TodayPage> {
                             child: Icon(Icons.delete_outline, size: 17, color: Colors.redAccent),
                           ),
                         ),
-                        LongPressDraggable<int>(
+                        LongPressDraggable(
                           data: sid,
                           feedback: Material(
                             elevation: 8,
@@ -2103,18 +2209,18 @@ class _TodayPageState extends State<TodayPage> {
             ),
           ),
           if (hasChildren && !isCollapsed)
-            ...children.map((c) => buildNode(c, depth + 1)),
+            ...children.map((c) => buildNode(c as Map, depth + 1)),
         ],
       );
     }
 
     return Column(
-      children: roots.map((r) => buildNode(r, 0)).toList(),
+      children: roots.map((r) => buildNode(r as Map, 0)).toList(),
     );
   }
 
-  Widget _buildGrid(int recId, List<String> paths) {
-    final exp = _expandedPhoto[recId] ?? false, total = paths.length;
+  Widget _buildGrid(int recId, List paths) {
+    final exp = _expandedPhoto[recId] == true, total = paths.length;
     final show = exp ? total : math.min(3, total);
     final cols = total == 1 ? 1 : (total == 2 ? 2 : 3);
     return Column(
@@ -2126,26 +2232,26 @@ class _TodayPageState extends State<TodayPage> {
           itemCount: show,
           gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: cols, crossAxisSpacing: 6, mainAxisSpacing: 6),
           itemBuilder: (_, i) => GestureDetector(
-            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => Scaffold(backgroundColor: Colors.black, appBar: AppBar(backgroundColor: Colors.black, foregroundColor: Colors.white), body: PageView.builder(controller: PageController(initialPage: i), itemCount: total, itemBuilder: (_, idx) => InteractiveViewer(child: Center(child: Image.file(File(paths[idx])))))))),
+            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => Scaffold(backgroundColor: Colors.black, appBar: AppBar(backgroundColor: Colors.black, foregroundColor: Colors.white), body: PageView.builder(controller: PageController(initialPage: i), itemCount: total, itemBuilder: (_, idx) => InteractiveViewer(child: Center(child: Image.file(File('${paths[idx]}')))))))),
             child: Stack(
               fit: StackFit.expand,
               children: [
-                ClipRRect(borderRadius: BorderRadius.circular(6), child: Image.file(File(paths[i]), fit: BoxFit.cover)),
-                if (!exp && total > 3 && i == 2)
+                ClipRRect(borderRadius: BorderRadius.circular(6), child: Image.file(File('${paths[i]}'), fit: BoxFit.cover)),
+                if (!exp && total >= 4 && i == 2)
                   Container(decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(6)), alignment: Alignment.center, child: Text('+${total - 3}', style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold))),
               ],
             ),
           ),
         ),
-        if (total > 3) TextButton(onPressed: () => setState(() => _expandedPhoto[recId] = !exp), child: Text(exp ? '收起' : '展开全部 $total 张')),
+        if (total >= 4) TextButton(onPressed: () => setState(() => _expandedPhoto[recId] = !exp), child: Text(exp ? '收起' : '展开全部 $total 张')),
       ],
     );
   }
 
-  Future<void> _pickImgs(int itemId) async {
+  Future _pickImgs(int itemId) async {
     final picked = await ImagePicker().pickMultiImage(imageQuality: 100);
-    if (picked.isEmpty) return;
-    final db = await AppDatabase.instance.database;
+    if (picked.isEmpty) return null;
+    final Database db = await AppDatabase.instance.database;
     await db.insert('status_records', {'item_id': itemId, 'date': _date, 'value': ''}, conflictAlgorithm: ConflictAlgorithm.ignore);
     final recs = await db.query('status_records', where: 'item_id = ? AND date = ?', whereArgs: [itemId, _date]);
     final recId = recs.first['id'] as int;
@@ -2153,12 +2259,13 @@ class _TodayPageState extends State<TodayPage> {
     final dStr = _date.replaceAll('-', '');
     final dir = Directory(p.join(appDir.path, 'images', 'status', dStr));
     if (!await dir.exists()) await dir.create(recursive: true);
-    for (int i = 0; i < picked.length; i++) {
+    for (int i = 0; i != picked.length; i++) {
       final rel = p.join('images', 'status', dStr, '${recId}_${i}_${DateTime.now().millisecondsSinceEpoch}.jpg');
       await File(picked[i].path).copy(p.join(appDir.path, rel));
       await db.insert('status_images', {'record_id': recId, 'file_path': rel, 'sort_order': i});
     }
     setState(() {});
+    return null;
   }
 
   void _confirmDeleteStatusItem(int id, String name) {
@@ -2171,7 +2278,7 @@ class _TodayPageState extends State<TodayPage> {
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
           FilledButton(
             onPressed: () async {
-              final db = await AppDatabase.instance.database;
+              final Database db = await AppDatabase.instance.database;
               await db.delete('status_records', where: 'item_id = ?', whereArgs: [id]);
               await db.delete('status_items', where: 'id = ?', whereArgs: [id]);
               if (mounted) Navigator.pop(ctx);
@@ -2184,7 +2291,7 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  void _addOrEditStatusItemDialog({Map<String, dynamic>? editItem}) {
+  void _addOrEditStatusItemDialog({Map? editItem}) {
     final isEdit = editItem != null;
     final ctrl = TextEditingController(text: isEdit ? '${editItem['name']}' : '');
     String type = isEdit ? '${editItem['type']}' : 'text';
@@ -2204,7 +2311,7 @@ class _TodayPageState extends State<TodayPage> {
                 decoration: const InputDecoration(labelText: '条目名称'),
               ),
               const SizedBox(height: 10),
-              DropdownButtonFormField<String>(
+              DropdownButtonFormField(
                 value: type,
                 isExpanded: true,
                 decoration: const InputDecoration(labelText: '数据类型', isDense: true),
@@ -2213,7 +2320,7 @@ class _TodayPageState extends State<TodayPage> {
                   DropdownMenuItem(value: 'number', child: Text('数字（支持趋势折线图）')),
                   DropdownMenuItem(value: 'image', child: Text('图片（九宫格原图）')),
                 ],
-                onChanged: (v) => setS(() => type = v!),
+                onChanged: (v) => setS(() => type = '$v'),
               ),
               const SizedBox(height: 6),
               CheckboxListTile(
@@ -2230,7 +2337,7 @@ class _TodayPageState extends State<TodayPage> {
               onPressed: () async {
                 final txt = ctrl.text.trim();
                 if (txt.isEmpty) return;
-                final db = await AppDatabase.instance.database;
+                final Database db = await AppDatabase.instance.database;
                 if (isEdit) {
                   await db.update('status_items', {'name': txt, 'type': type, 'allow_inherit': allowInherit ? 1 : 0}, where: 'id = ?', whereArgs: [editItem['id']]);
                 } else {
@@ -2252,7 +2359,7 @@ class _TodayPageState extends State<TodayPage> {
     String formattedInit = init;
     if (type == 'text' && !init.contains('\n')) {
       final cols = _splitColumns(init);
-      if (cols.length > 1) formattedInit = cols.join('\n');
+      if (cols.length >= 2) formattedInit = cols.join('\n');
     }
     final ctrl = TextEditingController(text: formattedInit);
 
@@ -2305,7 +2412,7 @@ class _TodayPageState extends State<TodayPage> {
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
           FilledButton(
             onPressed: () async {
-              final db = await AppDatabase.instance.database;
+              final Database db = await AppDatabase.instance.database;
               await db.insert('status_records', {'item_id': id, 'date': _date, 'value': ctrl.text.trim()}, conflictAlgorithm: ConflictAlgorithm.replace);
               if (mounted) Navigator.pop(ctx);
               setState(() {});
@@ -2317,27 +2424,28 @@ class _TodayPageState extends State<TodayPage> {
     );
   }
 
-  Future<void> _addOrEditSchedDialog({Map<String, dynamic>? editSched, int? parentId, String? parentTitle}) async {
-    final db = await AppDatabase.instance.database;
+  Future _addOrEditSchedDialog({Map? editSched, int? parentId, String? parentTitle}) async {
+    final Database db = await AppDatabase.instance.database;
     final mms = await db.query('mindmaps', orderBy: 'id DESC');
-    if (!mounted) return;
+    if (!mounted) return null;
 
     final isEdit = editSched != null;
     final ctrl = TextEditingController(text: isEdit ? '${editSched['title']}' : '');
     String selPlan = isEdit ? ('${editSched['plan_info'] ?? ''}') : '';
-    final Set<String> expandedPaths = {};
+    final Set expandedPaths = {};
 
-    for (final m in mms) {
+    for (final rawM in mms) {
+      final m = rawM as Map;
       try {
-        final root = jsonDecode(m['root_json'] as String) as Map<String, dynamic>;
-        final rt = (root['text'] as String? ?? '').trim();
+        final root = jsonDecode('${m['root_json']}') as Map;
+        final rt = '${root['text'] ?? ''}'.trim();
         if (rt.isNotEmpty) expandedPaths.add(rt);
       } catch (_) {}
     }
     if (selPlan.isNotEmpty) {
       final parts = selPlan.split(' > ');
       String acc = '';
-      for (int i = 0; i < parts.length - 1; i++) {
+      for (int i = 0; i != parts.length - 1; i++) {
         acc = acc.isEmpty ? parts[i] : '$acc > ${parts[i]}';
         expandedPaths.add(acc);
       }
@@ -2347,11 +2455,11 @@ class _TodayPageState extends State<TodayPage> {
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setS) {
-          Widget buildTreePickerNode(Map<String, dynamic> node, String currentPath, int depth) {
-            final t = (node['text'] as String? ?? '').trim();
+          Widget buildTreePickerNode(Map node, String currentPath, int depth) {
+            final t = '${node['text'] ?? ''}'.trim();
             if (t.isEmpty) return const SizedBox.shrink();
             final path = currentPath.isEmpty ? t : '$currentPath > $t';
-            final children = ((node['children'] as List?)?.cast>() ?? []);
+            final children = (node['children'] as List? ?? []);
             final hasChildren = children.isNotEmpty;
             final isExpanded = expandedPaths.contains(path);
             final isSelected = selPlan == path;
@@ -2413,7 +2521,7 @@ class _TodayPageState extends State<TodayPage> {
                                   color: isSelected ? const Color(0xFF4F46E5) : const Color(0xFF1E293B),
                                 ),
                               ),
-                              if (depth > 0)
+                              if (depth >= 1)
                                 Padding(
                                   padding: const EdgeInsets.only(top: 2),
                                   child: Text(
@@ -2448,7 +2556,7 @@ class _TodayPageState extends State<TodayPage> {
                   ),
                 ),
                 if (hasChildren && isExpanded)
-                  ...children.map((c) => buildTreePickerNode(c, path, depth + 1)),
+                  ...children.map((c) => buildTreePickerNode(c as Map, path, depth + 1)),
               ],
             );
           }
@@ -2542,9 +2650,10 @@ class _TodayPageState extends State<TodayPage> {
                             child: Text('暂无规划，请先在「规划」页创建或导入 XMind', style: TextStyle(fontSize: 12.5, color: Colors.grey)),
                           )
                         else
-                          ...mms.map((m) {
+                          ...mms.map((rawM) {
+                            final m = rawM as Map;
                             try {
-                              final root = jsonDecode(m['root_json'] as String) as Map<String, dynamic>;
+                              final root = jsonDecode('${m['root_json']}') as Map;
                               return buildTreePickerNode(root, '', 0);
                             } catch (_) {
                               return const SizedBox.shrink();
@@ -2591,17 +2700,19 @@ class _TodayPageState extends State<TodayPage> {
         },
       ),
     );
+    return null;
   }
 
-  Future<void> _showTrend(int itemId, String name) async {
-    final db = await AppDatabase.instance.database;
+  Future _showTrend(int itemId, String name) async {
+    final Database db = await AppDatabase.instance.database;
     final recs = await db.query('status_records', where: 'item_id = ? AND value != ""', whereArgs: [itemId], orderBy: 'date ASC');
-    final pts = <({String date, double value})>[];
-    for (final r in recs) {
+    final List pts = [];
+    for (final rawR in recs) {
+      final r = rawR as Map;
       final v = double.tryParse('${r['value']}');
-      if (v != null) pts.add((date: '${r['date']}', value: v));
+      if (v != null) pts.add({'date': '${r['date']}', 'value': v});
     }
-    if (!mounted) return;
+    if (!mounted) return null;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -2619,11 +2730,15 @@ class _TodayPageState extends State<TodayPage> {
             else ...[
               TrendLineChart(points: pts),
               const SizedBox(height: 14),
-              ...pts.reversed.map((p) => ListTile(dense: true, title: Text(p.date), trailing: Text('${p.value}', style: const TextStyle(fontWeight: FontWeight.bold)))),
+              ...pts.reversed.map((rawP) {
+                final p = rawP as Map;
+                return ListTile(dense: true, title: Text('${p['date']}'), trailing: Text('${p['value']}', style: const TextStyle(fontWeight: FontWeight.bold)));
+              }),
             ],
           ],
         ),
       ),
     );
+    return null;
   }
 }
