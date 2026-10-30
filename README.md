@@ -1,1 +1,1 @@
-# daily-tracker
+# daily-tracker-规划里思维导图一个页面要显示全部，可以通过字体可以缩小来实现
