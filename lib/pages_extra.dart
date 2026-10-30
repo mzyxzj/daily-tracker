@@ -2205,7 +2205,7 @@ class _FamilyPageState extends State<FamilyPage> {
   }
 }
 
-// ==================== 3. 规划与思维导图模块 (零尖括号防吞版) ====================
+// ==================== 3. 规划与思维导图模块 (全览缩略图自适应 + 零尖括号防吞版) ====================
 class PlanPage extends StatefulWidget {
   final Database db;
   const PlanPage({super.key, required this.db});
@@ -2229,7 +2229,7 @@ class _PlanPageState extends State<PlanPage> {
   Future _restorePlanUiState() async {
     try {
       final raw = await AppDatabase.getUiState(widget.db, 'plan_collapsed_nodes');
-      if (raw != null && raw.isNotEmpty) {
+      if (raw != null && (raw as String).isNotEmpty) {
         final list = (jsonDecode(raw) as List).map((e) => '$e').toList();
         _collapsedNodes
           ..clear()
@@ -2237,6 +2237,7 @@ class _PlanPageState extends State<PlanPage> {
       }
     } catch (_) {}
     if (mounted) setState(() => _uiLoaded = true);
+    return null;
   }
 
   Future _savePlanUiState() async {
@@ -2245,6 +2246,7 @@ class _PlanPageState extends State<PlanPage> {
       'plan_collapsed_nodes',
       jsonEncode(_collapsedNodes.toList()),
     );
+    return null;
   }
 
   String _genId() => '${DateTime.now().microsecondsSinceEpoch}_${math.Random().nextInt(99999)}';
@@ -2292,6 +2294,7 @@ class _PlanPageState extends State<PlanPage> {
       whereArgs: [id],
     );
     if (mounted) setState(() {});
+    return null;
   }
 
   String _unescapeXml(String s) {
@@ -2459,6 +2462,7 @@ class _PlanPageState extends State<PlanPage> {
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+    return null;
   }
 
   Future _createMm() async {
@@ -2505,6 +2509,7 @@ class _PlanPageState extends State<PlanPage> {
         ],
       ),
     );
+    return null;
   }
 
   void _confirmDeleteMindmap(int id, String title) {
@@ -2629,6 +2634,7 @@ class _PlanPageState extends State<PlanPage> {
 
     await _save(mapId, root);
     onRefresh();
+    return null;
   }
 
   void _onNodeAction(
@@ -2960,51 +2966,56 @@ class _PlanPageState extends State<PlanPage> {
                       ),
                     ),
                     const Divider(height: 1),
-                    SizedBox(
-                      height: 340,
+                    // 缩略图容器：使用 FittedBox(fit: BoxFit.contain) + compact 紧凑小字体，确保一个页面完整显示全部导图！
+                    Container(
+                      height: 400,
                       width: double.infinity,
+                      padding: const EdgeInsets.all(8),
                       child: InteractiveViewer(
-                        constrained: false,
-                        boundaryMargin: const EdgeInsets.all(300),
-                        minScale: 0.2,
-                        maxScale: 2.5,
-                        child: Padding(
-                          padding: const EdgeInsets.all(24),
-                          child: XMindBranchNodeWidget(
-                            node: root,
-                            isRoot: true,
-                            collapsedNodes: _collapsedNodes,
-                            hoverNodeId: _hoverNodeId,
-                            hoverZone: _hoverZone,
-                            onHoverChanged: (nid, z) {
-                              if (_hoverNodeId != nid || _hoverZone != z) {
-                                setState(() {
-                                  _hoverNodeId = nid;
-                                  _hoverZone = z;
-                                });
-                              }
-                            },
-                            onToggleCollapse: (nid) {
-                              setState(() {
-                                _collapsedNodes.contains(nid)
-                                    ? _collapsedNodes.remove(nid)
-                                    : _collapsedNodes.add(nid);
-                              });
-                              _savePlanUiState();
-                            },
-                            onNodeTap: (n, isR) => _onNodeAction(mapId, root, n, isR, () {
-                              if (mounted) setState(() {});
-                            }),
-                            canAcceptDrop: (dragId, targetId) => !_isDescendantNode(root, dragId, targetId),
-                            onNodeDrop: (dragId, targetId, zone) => _moveTreeNode(
-                              mapId: mapId,
-                              root: root,
-                              dragId: dragId,
-                              targetId: targetId,
-                              zone: zone,
-                              onRefresh: () {
-                                if (mounted) setState(() {});
+                        minScale: 0.5,
+                        maxScale: 6.0,
+                        child: FittedBox(
+                          fit: BoxFit.contain,
+                          alignment: Alignment.centerLeft,
+                          child: Padding(
+                            padding: const EdgeInsets.all(12),
+                            child: XMindBranchNodeWidget(
+                              node: root,
+                              isRoot: true,
+                              compact: true,
+                              collapsedNodes: _collapsedNodes,
+                              hoverNodeId: _hoverNodeId,
+                              hoverZone: _hoverZone,
+                              onHoverChanged: (nid, z) {
+                                if (_hoverNodeId != nid || _hoverZone != z) {
+                                  setState(() {
+                                    _hoverNodeId = nid;
+                                    _hoverZone = z;
+                                  });
+                                }
                               },
+                              onToggleCollapse: (nid) {
+                                setState(() {
+                                  _collapsedNodes.contains(nid)
+                                      ? _collapsedNodes.remove(nid)
+                                      : _collapsedNodes.add(nid);
+                                });
+                                _savePlanUiState();
+                              },
+                              onNodeTap: (n, isR) => _onNodeAction(mapId, root, n, isR, () {
+                                if (mounted) setState(() {});
+                              }),
+                              canAcceptDrop: (dragId, targetId) => !_isDescendantNode(root, dragId, targetId),
+                              onNodeDrop: (dragId, targetId, zone) => _moveTreeNode(
+                                mapId: mapId,
+                                root: root,
+                                dragId: dragId,
+                                targetId: targetId,
+                                zone: zone,
+                                onRefresh: () {
+                                  if (mounted) setState(() {});
+                                },
+                              ),
                             ),
                           ),
                         ),
@@ -3119,13 +3130,14 @@ class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
       body: InteractiveViewer(
         constrained: false,
         boundaryMargin: const EdgeInsets.all(800),
-        minScale: 0.15,
-        maxScale: 3.0,
+        minScale: 0.1,
+        maxScale: 3.5,
         child: Padding(
           padding: const EdgeInsets.all(48),
           child: XMindBranchNodeWidget(
             node: widget.root,
             isRoot: true,
+            compact: false,
             collapsedNodes: widget.collapsedNodes,
             hoverNodeId: _hoverNodeId,
             hoverZone: _hoverZone,
@@ -3162,6 +3174,7 @@ class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
 class XMindBranchNodeWidget extends StatelessWidget {
   final Map node;
   final bool isRoot;
+  final bool compact;
   final Set collapsedNodes;
   final String? hoverNodeId;
   final String? hoverZone;
@@ -3175,6 +3188,7 @@ class XMindBranchNodeWidget extends StatelessWidget {
     super.key,
     required this.node,
     required this.isRoot,
+    this.compact = false,
     required this.collapsedNodes,
     required this.hoverNodeId,
     required this.hoverZone,
@@ -3186,41 +3200,44 @@ class XMindBranchNodeWidget extends StatelessWidget {
   });
 
   Widget _buildPillCard(String text, {required String? zone, bool isFeedback = false}) {
+    final double maxW = compact ? 165 : 245;
+    final double minW = compact ? 36 : 54;
+    final double hPad = compact ? (isRoot ? 10 : 7) : (isRoot ? 16 : 12);
+    final double vPad = compact ? (isRoot ? 5 : 3.5) : (isRoot ? 10 : 8);
+    final double fSize = compact ? (isRoot ? 11.5 : 9.5) : (isRoot ? 15.5 : 13.8);
+
     return Container(
-      constraints: const BoxConstraints(maxWidth: 245, minWidth: 54),
-      padding: EdgeInsets.symmetric(
-        horizontal: isRoot ? 16 : 12,
-        vertical: isRoot ? 10 : 8,
-      ),
+      constraints: BoxConstraints(maxWidth: maxW, minWidth: minW),
+      padding: EdgeInsets.symmetric(horizontal: hPad, vertical: vPad),
       decoration: BoxDecoration(
         color: zone == 'inside'
             ? const Color(0xFFFFE4E6)
             : (isRoot ? const Color(0xFFEF5350) : const Color(0xFFFFF5F5)),
-        borderRadius: BorderRadius.circular(isRoot ? 10 : 7),
+        borderRadius: BorderRadius.circular(compact ? 5 : (isRoot ? 10 : 7)),
         border: Border(
           top: BorderSide(
             color: zone == 'up'
                 ? const Color(0xFFD32F2F)
                 : (isRoot ? const Color(0xFFEF5350) : const Color(0xFFE5A3A3)),
-            width: zone == 'up' ? 3.5 : 1.2,
+            width: zone == 'up' ? 3.0 : 1.0,
           ),
           bottom: BorderSide(
             color: zone == 'down'
                 ? const Color(0xFFD32F2F)
                 : (isRoot ? const Color(0xFFEF5350) : const Color(0xFFE5A3A3)),
-            width: zone == 'down' ? 3.5 : 1.2,
+            width: zone == 'down' ? 3.0 : 1.0,
           ),
           left: BorderSide(
             color: zone == 'inside'
                 ? const Color(0xFFD32F2F)
                 : (isRoot ? const Color(0xFFEF5350) : const Color(0xFFE5A3A3)),
-            width: zone == 'inside' ? 2.5 : 1.2,
+            width: zone == 'inside' ? 2.2 : 1.0,
           ),
           right: BorderSide(
             color: zone == 'inside'
                 ? const Color(0xFFD32F2F)
                 : (isRoot ? const Color(0xFFEF5350) : const Color(0xFFE5A3A3)),
-            width: zone == 'inside' ? 2.5 : 1.2,
+            width: zone == 'inside' ? 2.2 : 1.0,
           ),
         ),
         boxShadow: isFeedback
@@ -3230,10 +3247,10 @@ class XMindBranchNodeWidget extends StatelessWidget {
       child: Text(
         text,
         style: TextStyle(
-          fontSize: isRoot ? 15.5 : 13.8,
+          fontSize: fSize,
           fontWeight: isRoot ? FontWeight.bold : FontWeight.w500,
           color: isRoot && zone != 'inside' ? Colors.white : const Color(0xFF1E293B),
-          height: 1.35,
+          height: 1.25,
         ),
       ),
     );
@@ -3300,18 +3317,21 @@ class XMindBranchNodeWidget extends StatelessWidget {
       return pillWithDrag;
     }
 
+    final double btnSize = compact ? 15 : 20;
+    final double lineLen = compact ? 6 : 10;
+
     if (isCollapsed) {
       return Row(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
           pillWithDrag,
-          Container(width: 10, height: 1.5, color: const Color(0xFFEF5350)),
+          Container(width: lineLen, height: 1.3, color: const Color(0xFFEF5350)),
           GestureDetector(
             onTap: () => onToggleCollapse(id),
             child: Container(
-              width: 22,
-              height: 22,
+              width: btnSize + 2,
+              height: btnSize + 2,
               alignment: Alignment.center,
               decoration: const BoxDecoration(
                 color: Color(0xFFEF5350),
@@ -3319,9 +3339,9 @@ class XMindBranchNodeWidget extends StatelessWidget {
               ),
               child: Text(
                 '${children.length}',
-                style: const TextStyle(
+                style: TextStyle(
                   color: Colors.white,
-                  fontSize: 11,
+                  fontSize: compact ? 8.5 : 11,
                   fontWeight: FontWeight.bold,
                 ),
               ),
@@ -3337,23 +3357,23 @@ class XMindBranchNodeWidget extends StatelessWidget {
       children: [
         pillWithDrag,
         if (!isRoot) ...[
-          Container(width: 10, height: 1.5, color: const Color(0xFFEF5350)),
+          Container(width: lineLen, height: 1.3, color: const Color(0xFFEF5350)),
           GestureDetector(
             onTap: () => onToggleCollapse(id),
             child: Container(
-              width: 20,
-              height: 20,
+              width: btnSize,
+              height: btnSize,
               alignment: Alignment.center,
               decoration: BoxDecoration(
                 color: Colors.white,
                 shape: BoxShape.circle,
-                border: Border.all(color: const Color(0xFFEF5350), width: 1.3),
+                border: Border.all(color: const Color(0xFFEF5350), width: 1.2),
               ),
-              child: const Text(
+              child: Text(
                 '-',
                 style: TextStyle(
-                  color: Color(0xFFEF5350),
-                  fontSize: 14,
+                  color: const Color(0xFFEF5350),
+                  fontSize: compact ? 11 : 14,
                   fontWeight: FontWeight.bold,
                   height: 1.0,
                 ),
@@ -3365,6 +3385,7 @@ class XMindBranchNodeWidget extends StatelessWidget {
     );
 
     return _XMindTreeRow(
+      compact: compact,
       parentWidget: parentWithToggle,
       childWidgets: children
           .map(
@@ -3372,6 +3393,7 @@ class XMindBranchNodeWidget extends StatelessWidget {
               key: ValueKey('xm_node_${(c as Map)['id']}'),
               node: c,
               isRoot: false,
+              compact: compact,
               collapsedNodes: collapsedNodes,
               hoverNodeId: hoverNodeId,
               hoverZone: hoverZone,
@@ -3388,10 +3410,12 @@ class XMindBranchNodeWidget extends StatelessWidget {
 }
 
 class _XMindTreeRow extends StatefulWidget {
+  final bool compact;
   final Widget parentWidget;
   final List childWidgets;
 
   const _XMindTreeRow({
+    this.compact = false,
     required this.parentWidget,
     required this.childWidgets,
   });
@@ -3464,6 +3488,9 @@ class _XMindTreeRowState extends State<_XMindTreeRow> {
   @override
   Widget build(BuildContext context) {
     WidgetsBinding.instance.addPostFrameCallback((_) => _measure());
+    final double vPad = widget.compact ? 2.0 : 7.0;
+    final double bracketW = widget.compact ? 18.0 : 32.0;
+
     return IntrinsicHeight(
       key: _rowKey,
       child: Row(
@@ -3472,7 +3499,7 @@ class _XMindTreeRowState extends State<_XMindTreeRow> {
         children: [
           Container(key: _parentKey, child: widget.parentWidget),
           SizedBox(
-            width: 32,
+            width: bracketW,
             height: double.infinity,
             child: CustomPaint(
               painter: _XMindBracketPainter(
@@ -3488,8 +3515,8 @@ class _XMindTreeRowState extends State<_XMindTreeRow> {
               return Padding(
                 key: _childKeys[i] as GlobalKey,
                 padding: EdgeInsets.only(
-                  top: i == 0 ? 0 : 7,
-                  bottom: i == widget.childWidgets.length - 1 ? 0 : 7,
+                  top: i == 0 ? 0 : vPad,
+                  bottom: i == widget.childWidgets.length - 1 ? 0 : vPad,
                 ),
                 child: widget.childWidgets[i] as Widget,
               );
@@ -3511,7 +3538,7 @@ class _XMindBracketPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
       ..color = const Color(0xFFEF5350)
-      ..strokeWidth = 1.5
+      ..strokeWidth = 1.3
       ..style = PaintingStyle.stroke;
 
     final pY = parentY ?? (size.height / 2);
