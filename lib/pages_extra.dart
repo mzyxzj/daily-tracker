@@ -12,7 +12,7 @@ import 'package:share_plus/share_plus.dart';
 import 'package:sqflite/sqflite.dart';
 import 'main.dart';
 
-// ==================== 1. 查找与备份页面 (原生 _exportZip / _importZip + 标题组上下拖动) ====================
+// ==================== 1. 查找与备份页面 ====================
 class SearchPage extends StatefulWidget {
   final Database db;
   const SearchPage({super.key, required this.db});
@@ -47,16 +47,12 @@ class _SearchPageState extends State<SearchPage> {
   Future> _load() async {
     try {
       final activeDb = await AppDatabase.instance.database;
-      List> groups = [];
+      List groups = [];
       try {
-        groups = List>.from(
-          await activeDb.query('module_groups', orderBy: 'sort_order ASC, id DESC'),
-        );
+        groups = await activeDb.query('module_groups', orderBy: 'sort_order ASC, id DESC');
       } catch (_) {
         try {
-          groups = List>.from(
-            await activeDb.query('module_groups', orderBy: 'id DESC'),
-          );
+          groups = await activeDb.query('module_groups', orderBy: 'id DESC');
         } catch (_) {}
       }
 
@@ -64,46 +60,53 @@ class _SearchPageState extends State<SearchPage> {
       if (_kw.trim().isNotEmpty) {
         final like = '%${_kw.trim()}%';
         try {
-          for (final r in await activeDb.rawQuery(
+          final rList = await activeDb.rawQuery(
             'SELECT r.date, r.value, i.name FROM status_records r JOIN status_items i ON r.item_id = i.id WHERE r.value LIKE ? OR i.name LIKE ? ORDER BY r.date DESC LIMIT 40',
             [like, like],
-          )) {
+          );
+          for (final r in rList) {
             hits.add({'tag': '状态 · ${r['date']}', 'title': '${r['name']}', 'sub': '${r['value']}'});
           }
         } catch (_) {}
 
         try {
-          for (final m in await activeDb.query('modules', where: 'title LIKE ?', whereArgs: [like])) {
+          final mList = await activeDb.query('modules', where: 'title LIKE ?', whereArgs: [like]);
+          for (final m in mList) {
             hits.add({'tag': '家庭标题', 'title': '${m['title']}', 'sub': '可在家庭页查看详情'});
           }
         } catch (_) {}
 
         try {
-          for (final e in await activeDb.rawQuery(
+          final eList = await activeDb.rawQuery(
             'SELECT e.seq, e.content, m.title FROM module_entries e JOIN modules m ON e.module_id = m.id WHERE e.content LIKE ? LIMIT 40',
             [like],
-          )) {
+          );
+          for (final e in eList) {
             hits.add({'tag': '家庭 · ${e['title']}', 'title': '${e['seq']}. ${e['content']}', 'sub': ''});
           }
         } catch (_) {}
 
         try {
-          for (final s in await activeDb.query('schedule_items', where: 'title LIKE ? OR plan_info LIKE ?', whereArgs: [like, like])) {
+          final sList = await activeDb.query('schedule_items', where: 'title LIKE ? OR plan_info LIKE ?', whereArgs: [like, like]);
+          for (final s in sList) {
             hits.add({'tag': '日程打卡', 'title': '${s['title']}', 'sub': '${s['plan_info'] ?? ''}'});
           }
         } catch (_) {}
       }
       return {'groups': groups, 'hits': hits};
     } catch (_) {
-      return {'groups': >[], 'hits': >[]};
+      return {'groups': [], 'hits': []};
     }
   }
 
-  /// 基准版原生导出格式：data.json + images/
   Future<void> _exportZip() async {
     setState(() => _busy = true);
     try {
       final activeDb = await AppDatabase.instance.database;
+      try {
+        await activeDb.rawQuery('PRAGMA wal_checkpoint(FULL)');
+      } catch (_) {}
+
       final dataMap = <String, dynamic>{};
       for (final table in _allTables) {
         try {
@@ -190,7 +193,6 @@ class _SearchPageState extends State<SearchPage> {
     });
   }
 
-  /// 基准版原生导入恢复：读取 zip 内的 data.json + images/，无需重启即时生效
   Future<void> _importZip() async {
     final res = await FilePicker.platform.pickFiles(type: FileType.any);
     if (res == null || res.files.single.path == null) return;
@@ -256,12 +258,12 @@ class _SearchPageState extends State<SearchPage> {
       if (mounted) {
         if (!restoredOk) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('⚠️ 未能在所选文件中识别到 data.json 备份数据！')),
+            const SnackBar(content: Text('⚠️ 未能在所选文件中识别到有效备份数据！')),
           );
         } else {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('🎉 导入恢复成功！已加载 $recCnt 条状态记录、$modCnt 个家庭标题、$schedCnt 项日程、$restoredImages 张图片！'),
+              content: Text('🎉 导入恢复成功！已加载 $recCnt 条状态记录、$modCnt 个标题、$schedCnt 项日程、$restoredImages 张图片！'),
               duration: const Duration(seconds: 4),
             ),
           );
@@ -277,9 +279,7 @@ class _SearchPageState extends State<SearchPage> {
 
   Future<void> _createOrEditGroup({Map<String, dynamic>? existingGroup}) async {
     final activeDb = await AppDatabase.instance.database;
-    final mods = List>.from(
-      await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC'),
-    );
+    final mods = await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC');
     if (!mounted) return;
 
     final isEdit = existingGroup != null;
@@ -382,9 +382,7 @@ class _SearchPageState extends State<SearchPage> {
 
   Future<void> _tempView() async {
     final activeDb = await AppDatabase.instance.database;
-    final mods = List>.from(
-      await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC'),
-    );
+    final mods = await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC');
     if (!mounted) return;
     final sel = <int>{};
 
@@ -457,7 +455,7 @@ class _SearchPageState extends State<SearchPage> {
     for (final m in allMods) {
       final id = m['id'] as int;
       if (!ids.contains(id)) continue;
-      final es = await activeDb.query('module_entries', where: 'module_id = ?', whereArgs: [id], orderBy: 'sort_order ASC, seq ASC');
+      final es = await activeDb.query('module_entries', where: 'module_id = ?', whereArgs: [id], orderBy: 'seq ASC');
       data.add({'title': fullPathOf(id), 'entries': es});
     }
 
@@ -480,7 +478,7 @@ class _SearchPageState extends State<SearchPage> {
                   onPressed: () {
                     final buf = StringBuffer();
                     for (final d in data) {
-                      final es = d['entries'] as List>;
+                      final es = d['entries'] as List;
                       if (es.isEmpty && data.length > 1) continue;
                       buf.writeln('【${d['title']}】');
                       for (final e in es) buf.writeln('${e['seq']}. ${e['content']}');
@@ -496,7 +494,7 @@ class _SearchPageState extends State<SearchPage> {
             ),
             const Divider(height: 20),
             ...data.map((d) {
-              final es = d['entries'] as List>;
+              final es = d['entries'] as List;
               return Card(
                 margin: const EdgeInsets.only(bottom: 10),
                 elevation: 0,
@@ -537,8 +535,9 @@ class _SearchPageState extends State<SearchPage> {
         future: _load(),
         builder: (ctx, snap) {
           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
-          final groups = snap.data!['groups'] as List>;
-          final hits = snap.data!['hits'] as List>;
+          final dataMap = snap.data!;
+          final groups = dataMap['groups'] as List;
+          final hits = dataMap['hits'] as List;
 
           return ListView(
             padding: const EdgeInsets.all(12),
@@ -743,9 +742,8 @@ class _SearchPageState extends State<SearchPage> {
   }
 }
 
-// ==================== 基准版原生树形勾选组件 ModuleTreeSelector ====================
 class ModuleTreeSelector extends StatefulWidget {
-  final List> allMods;
+  final List allMods;
   final Set<int> selectedIds;
   final VoidCallback onChanged;
 
@@ -763,7 +761,7 @@ class ModuleTreeSelector extends StatefulWidget {
 class _ModuleTreeSelectorState extends State<ModuleTreeSelector> {
   final Set<int> _expanded = {};
 
-  List> _childrenOf(int? pid) =>
+  List _childrenOf(int? pid) =>
       widget.allMods.where((m) => m['parent_id'] == pid).toList();
 
   List<int> _descendantsOf(int rootId) {
@@ -862,7 +860,7 @@ class _ModuleTreeSelectorState extends State<ModuleTreeSelector> {
           ),
         ),
         if (hasChildren && isExp)
-          ...children.map((c) => _buildNode(c, depth + 1)),
+          ...children.map((c) => _buildNode(Map<String, dynamic>.from(c), depth + 1)),
       ],
     );
   }
@@ -879,12 +877,12 @@ class _ModuleTreeSelectorState extends State<ModuleTreeSelector> {
     }).toList();
 
     return ListView(
-      children: roots.map((r) => _buildNode(r, 0)).toList(),
+      children: roots.map((r) => _buildNode(Map<String, dynamic>.from(r), 0)).toList(),
     );
   }
 }
 
-// ==================== 2. 家庭模块页面 (差异炫彩 _buildAestheticMemberCard + 调宽防重叠 + 仅按序号拆分) ====================
+// ==================== 2. 家庭模块页面 ====================
 class _MemberPalette {
   final List<Color> bgGradient;
   final List<Color> avatarGradient;
@@ -916,9 +914,7 @@ class _FamilyPageState extends State<FamilyPage> {
   String? _hoverZone;
   bool _uiLoaded = false;
 
-  // 6套高定差异炫彩渐变配色
   static const List<_MemberPalette> _memberPalettes = [
-    // 0: 梦幻流光粉紫
     _MemberPalette(
       bgGradient: [Color(0xFFFFF1F2), Color(0xFFF5F3FF), Color(0xFFFDF2F8)],
       avatarGradient: [Color(0xFFEC4899), Color(0xFF8B5CF6)],
@@ -927,7 +923,6 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFFDB2777),
       titleColor: Color(0xFF831843),
     ),
-    // 1: 赛博极光蓝青
     _MemberPalette(
       bgGradient: [Color(0xFFEFF6FF), Color(0xFFECFEFF), Color(0xFFF0F9FF)],
       avatarGradient: [Color(0xFF2563EB), Color(0xFF06B6D4)],
@@ -936,7 +931,6 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFF0284C7),
       titleColor: Color(0xFF0C4A6E),
     ),
-    // 2: 暖阳流金琥珀
     _MemberPalette(
       bgGradient: [Color(0xFFFFFBEB), Color(0xFFFFF7ED), Color(0xFFFEF2F2)],
       avatarGradient: [Color(0xFFF59E0B), Color(0xFFEF4444)],
@@ -945,7 +939,6 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFFD97706),
       titleColor: Color(0xFF78350F),
     ),
-    // 3: 翡翠森系极光
     _MemberPalette(
       bgGradient: [Color(0xFFECFDF5), Color(0xFFF0FDFA), Color(0xFFF0FDF4)],
       avatarGradient: [Color(0xFF10B981), Color(0xFF0D9488)],
@@ -954,7 +947,6 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFF059669),
       titleColor: Color(0xFF064E3B),
     ),
-    // 4: 星河魅影紫蓝
     _MemberPalette(
       bgGradient: [Color(0xFFF5F3FF), Color(0xFFEEF2FF), Color(0xFFFAF5FF)],
       avatarGradient: [Color(0xFF7C3AED), Color(0xFF4F46E5)],
@@ -963,7 +955,6 @@ class _FamilyPageState extends State<FamilyPage> {
       accentColor: Color(0xFF6D28D9),
       titleColor: Color(0xFF311068),
     ),
-    // 5: 绯红霓虹珊瑚
     _MemberPalette(
       bgGradient: [Color(0xFFFFF1F2), Color(0xFFFFF5F5), Color(0xFFFFF7ED)],
       avatarGradient: [Color(0xFFE11D48), Color(0xFFFB7185)],
@@ -1008,9 +999,7 @@ class _FamilyPageState extends State<FamilyPage> {
   Future> _loadMods() async {
     if (!_uiLoaded) await _restoreFamilyUiState();
     final activeDb = await AppDatabase.instance.database;
-    final mods = List>.from(
-      await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC'),
-    );
+    final mods = await activeDb.query('modules', orderBy: 'sort_order ASC, id ASC');
     final entries = await activeDb.query('module_entries');
     final entryCounts = <int, int>{};
     for (final e in entries) {
@@ -1020,7 +1009,7 @@ class _FamilyPageState extends State<FamilyPage> {
     return {'mods': mods, 'counts': entryCounts};
   }
 
-  bool _isDescendant(int dragId, int targetId, List> all) {
+  bool _isDescendant(int dragId, int targetId, List all) {
     if (dragId == targetId) return true;
     int? cur = targetId;
     final visited = <int>{};
@@ -1037,7 +1026,7 @@ class _FamilyPageState extends State<FamilyPage> {
     required int dragId,
     required int targetId,
     required String zone,
-    required List> allMods,
+    required List allMods,
   }) async {
     if (_isDescendant(dragId, targetId, allMods)) return;
     final activeDb = await AppDatabase.instance.database;
@@ -1074,7 +1063,7 @@ class _FamilyPageState extends State<FamilyPage> {
     setState(() {});
   }
 
-  Future<void> _deleteModCascade(int id, List> allMods) async {
+  Future<void> _deleteModCascade(int id, List allMods) async {
     final activeDb = await AppDatabase.instance.database;
     final subIds = <int>[id];
     void collect(int pid) {
@@ -1092,6 +1081,12 @@ class _FamilyPageState extends State<FamilyPage> {
     setState(() {});
   }
 
+  bool styleMatchesLevel(String text, int level) {
+    if (level == 1) {
+      return RegExp(r'^[一二三四五六七八九十]+[、\.]').hasMatch(text);
+    }
+    return false;
+  }
   String _unescapeXml(String s) {
     return s
         .replaceAll('&amp;', '&')
@@ -1125,17 +1120,7 @@ class _FamilyPageState extends State<FamilyPage> {
       final xmlStr = utf8.decode(docXmlFile.content as List<int>, allowMalformed: true);
       final pMatches = RegExp(r'<w:p\b[^>]*>([\s\S]*?)<\/w:p>').allMatches(xmlStr);
 
-      final parsedParas = <({
-        String text,
-        String cleanText,
-        bool isBold,
-        int fontSize,
-        int indent,
-        int? numLevel,
-        bool isHeadingStyle,
-        bool hasExplicitSeq,
-        bool endsWithColon,
-      })>[];
+      final parsedParas = >[];
 
       for (final pm in pMatches) {
         final pXml = pm.group(1)!;
@@ -1169,17 +1154,17 @@ class _FamilyPageState extends State<FamilyPage> {
         final hasExplicitSeq = RegExp(r'^(\d+[\.、]|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]|[一二三四五六七八九十]+[、\.])').hasMatch(cleanText);
         final endsWithColon = cleanText.endsWith('：') || cleanText.endsWith(':');
 
-        parsedParas.add((
-          text: rawText,
-          cleanText: cleanText,
-          isBold: isBold,
-          fontSize: maxSz,
-          indent: indent,
-          numLevel: numLevel,
-          isHeadingStyle: isHeadingStyle,
-          hasExplicitSeq: hasExplicitSeq,
-          endsWithColon: endsWithColon,
-        ));
+        parsedParas.add({
+          'text': rawText,
+          'cleanText': cleanText,
+          'isBold': isBold,
+          'fontSize': maxSz,
+          'indent': indent,
+          'numLevel': numLevel,
+          'isHeadingStyle': isHeadingStyle,
+          'hasExplicitSeq': hasExplicitSeq,
+          'endsWithColon': endsWithColon,
+        });
       }
 
       if (parsedParas.isEmpty) return;
@@ -1190,22 +1175,32 @@ class _FamilyPageState extends State<FamilyPage> {
         final prev = i > 0 ? parsedParas[i - 1] : null;
         final next = i + 1 < parsedParas.length ? parsedParas[i + 1] : null;
 
-        final txtNoColon = cur.cleanText.replaceAll(RegExp(r'[:：]$'), '').trim();
+        final curClean = cur['cleanText'] as String;
+        final curText = cur['text'] as String;
+        final curNumLvl = cur['numLevel'] as int?;
+        final curIndent = cur['indent'] as int;
+        final curExplicitSeq = cur['hasExplicitSeq'] as bool;
+        final curHeading = cur['isHeadingStyle'] as bool;
+        final curFontSz = cur['fontSize'] as int;
+        final curEndsColon = cur['endsWithColon'] as bool;
+        final curBold = cur['isBold'] as bool;
+
+        final txtNoColon = curClean.replaceAll(RegExp(r'[:：]$'), '').trim();
         final nextGetsDeeper = next != null &&
-            ((cur.numLevel != null && next.numLevel != null && next.numLevel! > cur.numLevel!) ||
-                (next.indent > cur.indent + 100) ||
-                (!cur.hasExplicitSeq && next.hasExplicitSeq));
+            ((curNumLvl != null && next['numLevel'] != null && (next['numLevel'] as int) > curNumLvl) ||
+                ((next['indent'] as int) > curIndent + 100) ||
+                (!curExplicitSeq && (next['hasExplicitSeq'] as bool)));
 
         bool isFolder = false;
-        if (cur.isHeadingStyle || cur.fontSize >= 28) {
+        if (curHeading || curFontSz >= 28) {
           isFolder = true;
-        } else if (cur.endsWithColon && txtNoColon.length <= 18) {
+        } else if (curEndsColon && txtNoColon.length <= 18) {
           isFolder = true;
-        } else if (cur.isBold && txtNoColon.length <= 16 && !cur.hasExplicitSeq) {
+        } else if (curBold && txtNoColon.length <= 16 && !curExplicitSeq) {
           isFolder = true;
-        } else if (nextGetsDeeper && txtNoColon.length <= 20 && !cur.hasExplicitSeq) {
+        } else if (nextGetsDeeper && txtNoColon.length <= 20 && !curExplicitSeq) {
           isFolder = true;
-        } else if (cur.numLevel != null && cur.numLevel! <= 1 && txtNoColon.length <= 12 && !cur.cleanText.contains('，') && !cur.cleanText.contains('。')) {
+        } else if (curNumLvl != null && curNumLvl <= 1 && txtNoColon.length <= 12 && !curClean.contains('，') && !curClean.contains('。')) {
           final prevWasShortFolder = prev != null && folderRanks.isNotEmpty && folderRanks.last < 99;
           if (nextGetsDeeper || prevWasShortFolder || i == 0) {
             isFolder = true;
@@ -1216,17 +1211,17 @@ class _FamilyPageState extends State<FamilyPage> {
           folderRanks.add(99);
         } else {
           int rank = 3;
-          if (cur.fontSize >= 32 || RegExp(r'^[一二三四五六七八九十]+[、\.]').hasMatch(cur.text) || (cur.numLevel == 0 && cur.isBold)) {
+          if (curFontSz >= 32 || styleMatchesLevel(curText, 1) || (curNumLvl == 0 && curBold)) {
             rank = 1;
-          } else if (cur.fontSize >= 28 || cur.numLevel == 0) {
+          } else if (curFontSz >= 28 || curNumLvl == 0) {
             rank = 2;
-          } else if (cur.numLevel != null) {
-            rank = 2 + cur.numLevel!;
-          } else if (cur.indent > 0) {
-            rank = 3 + (cur.indent ~/ 240);
-          } else if (cur.isBold && !cur.endsWithColon) {
+          } else if (curNumLvl != null) {
+            rank = 2 + curNumLvl;
+          } else if (curIndent > 0) {
+            rank = 3 + (curIndent ~/ 240);
+          } else if (curBold && !curEndsColon) {
             rank = 2;
-          } else if (cur.endsWithColon) {
+          } else if (curEndsColon) {
             rank = 4;
           }
           folderRanks.add(rank);
@@ -1235,7 +1230,7 @@ class _FamilyPageState extends State<FamilyPage> {
 
       int createdFolders = 0;
       int createdEntries = 0;
-      final stack = <({int rank, int id})>[];
+      final stack = >[];
 
       Future<int> createOrGetFolder(String rawTitle, int? parentId, {bool isTopLevel = false}) async {
         final cleanTitle = rawTitle
@@ -1284,46 +1279,48 @@ class _FamilyPageState extends State<FamilyPage> {
 
       for (int i = 0; i < parsedParas.length; i++) {
         final pItem = parsedParas[i];
+        final cleanText = pItem['cleanText'] as String;
+        final hasExplicitSeq = pItem['hasExplicitSeq'] as bool;
         final rank = folderRanks[i];
 
         if (rank < 99) {
-          final colonIdx = pItem.cleanText.indexOf(RegExp(r'[:：]'));
-          final hasInlineContent = colonIdx > 0 && colonIdx < pItem.cleanText.length - 1 && colonIdx <= 12;
+          final colonIdx = cleanText.indexOf(RegExp(r'[:：]'));
+          final hasInlineContent = colonIdx > 0 && colonIdx < cleanText.length - 1 && colonIdx <= 12;
 
-          while (stack.isNotEmpty && stack.last.rank >= rank) {
+          while (stack.isNotEmpty && stack.last['rank']! >= rank) {
             stack.removeLast();
           }
-          final parentId = stack.isEmpty ? null : stack.last.id;
+          final parentId = stack.isEmpty ? null : stack.last['id'];
 
           if (hasInlineContent) {
-            final fTitle = pItem.cleanText.substring(0, colonIdx).trim();
-            final inlineBody = pItem.cleanText.substring(colonIdx + 1).trim();
+            final fTitle = cleanText.substring(0, colonIdx).trim();
+            final inlineBody = cleanText.substring(colonIdx + 1).trim();
             final fid = await createOrGetFolder(fTitle, parentId, isTopLevel: parentId == null);
-            stack.add((rank: rank, id: fid));
+            stack.add({'rank': rank, 'id': fid});
             await insertEntryToFolder(fid, inlineBody);
           } else {
-            final fid = await createOrGetFolder(pItem.cleanText, parentId, isTopLevel: parentId == null);
-            stack.add((rank: rank, id: fid));
+            final fid = await createOrGetFolder(cleanText, parentId, isTopLevel: parentId == null);
+            stack.add({'rank': rank, 'id': fid});
           }
         } else {
-          final colonIdx = pItem.cleanText.indexOf(RegExp(r'[:：]'));
-          if (colonIdx > 0 && colonIdx <= 8 && !pItem.hasExplicitSeq && pItem.cleanText.length > colonIdx + 1) {
-            final subTitle = pItem.cleanText.substring(0, colonIdx).trim();
-            final body = pItem.cleanText.substring(colonIdx + 1).trim();
-            while (stack.isNotEmpty && stack.last.rank >= 8) {
+          final colonIdx = cleanText.indexOf(RegExp(r'[:：]'));
+          if (colonIdx > 0 && colonIdx <= 8 && !hasExplicitSeq && cleanText.length > colonIdx + 1) {
+            final subTitle = cleanText.substring(0, colonIdx).trim();
+            final body = cleanText.substring(colonIdx + 1).trim();
+            while (stack.isNotEmpty && stack.last['rank']! >= 8) {
               stack.removeLast();
             }
-            final parentId = stack.isEmpty ? null : stack.last.id;
+            final parentId = stack.isEmpty ? null : stack.last['id'];
             final subFid = await createOrGetFolder(subTitle, parentId);
-            stack.add((rank: 8, id: subFid));
+            stack.add({'rank': 8, 'id': subFid});
             await insertEntryToFolder(subFid, body);
           } else {
             if (stack.isEmpty) {
               final docName = p.basenameWithoutExtension(filePath);
               final rootId = await createOrGetFolder(docName, null, isTopLevel: true);
-              stack.add((rank: 1, id: rootId));
+              stack.add({'rank': 1, 'id': rootId});
             }
-            await insertEntryToFolder(stack.last.id, pItem.cleanText);
+            await insertEntryToFolder(stack.last['id']!, cleanText);
           }
         }
       }
@@ -1339,8 +1336,7 @@ class _FamilyPageState extends State<FamilyPage> {
     }
   }
 
-  /// 基准版原生底部抽屉 _openEntries（去掉换行强拆，仅按显式序号拆分）
-  Future<void> _openEntries(Map<String, dynamic> mod, List> allMods) async {
+  Future<void> _openEntries(Map<String, dynamic> mod, List allMods) async {
     final activeDb = await AppDatabase.instance.database;
     final modId = mod['id'] as int;
     final modMap = {for (final m in allMods) m['id'] as int: m};
@@ -1356,9 +1352,11 @@ class _FamilyPageState extends State<FamilyPage> {
     }
 
     final fullPath = fullPathOf(modId);
-    final entries = List>.from(
-      await activeDb.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC'),
-    );
+    final entries = >[];
+    final rawEntries = await activeDb.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC');
+    for (final r in rawEntries) {
+      entries.add(Map<String, dynamic>.from(r));
+    }
 
     if (!mounted) return;
     final ctrl = TextEditingController();
@@ -1437,7 +1435,6 @@ class _FamilyPageState extends State<FamilyPage> {
                         if (raw.isEmpty) return;
                         final db = await AppDatabase.instance.database;
 
-                        // 核心需求：换行不再自动拆成多条，仅在遇到显式序号（1. / ① / 一、）时拆分
                         final itemsToInsert = <String>[];
                         final seqRegex = RegExp(
                           r'(?:^|\n)\s*(?:\d+[\.、]|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]|[一二三四五六七八九十]+[、\.])\s*',
@@ -1471,9 +1468,10 @@ class _FamilyPageState extends State<FamilyPage> {
                         }
 
                         ctrl.clear();
+                        final updated = await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC');
                         entries
                           ..clear()
-                          ..addAll(await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC'));
+                          ..addAll(updated.map((r) => Map<String, dynamic>.from(r)));
                         setS(() {});
                         setState(() {});
                       },
@@ -1531,9 +1529,10 @@ class _FamilyPageState extends State<FamilyPage> {
                                     child: GestureDetector(
                                       onTap: () => _editEntryContentDialog(e, () async {
                                         final db = await AppDatabase.instance.database;
+                                        final updated = await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC');
                                         entries
                                           ..clear()
-                                          ..addAll(await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC'));
+                                          ..addAll(updated.map((r) => Map<String, dynamic>.from(r)));
                                         setS(() {});
                                         setState(() {});
                                       }),
@@ -1550,9 +1549,10 @@ class _FamilyPageState extends State<FamilyPage> {
                                       for (int idx = 0; idx < rem.length; idx++) {
                                         await db.update('module_entries', {'seq': idx + 1, 'sort_order': idx}, where: 'id = ?', whereArgs: [rem[idx]['id']]);
                                       }
+                                      final updated = await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC');
                                       entries
                                         ..clear()
-                                        ..addAll(await db.query('module_entries', where: 'module_id = ?', whereArgs: [modId], orderBy: 'sort_order ASC, seq ASC, id ASC'));
+                                        ..addAll(updated.map((r) => Map<String, dynamic>.from(r)));
                                       setS(() {});
                                       setState(() {});
                                     },
@@ -1690,10 +1690,9 @@ class _FamilyPageState extends State<FamilyPage> {
     );
   }
 
-  /// 基准版原生高定成员卡片方法（升级 6 套差异炫彩主题 + 调宽上下间距 + 防图标重叠）
   Widget _buildAestheticMemberCard({
     required Map<String, dynamic> mod,
-    required List> allMods,
+    required List allMods,
     required bool hasChildren,
     required bool isExpanded,
     required int subBadgeCount,
@@ -1739,7 +1738,6 @@ class _FamilyPageState extends State<FamilyPage> {
           ),
         ],
       ),
-      // 调宽上下内边距（vertical: 15），视觉舒展大气
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 15),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.center,
@@ -1885,10 +1883,9 @@ class _FamilyPageState extends State<FamilyPage> {
     );
   }
 
-  /// 基准版原生普通文件夹卡片方法 _buildStandardFolderCard
   Widget _buildStandardFolderCard({
     required Map<String, dynamic> mod,
-    required List> allMods,
+    required List allMods,
     required int depth,
     required bool hasChildren,
     required bool isExpanded,
@@ -2060,7 +2057,7 @@ class _FamilyPageState extends State<FamilyPage> {
         builder: (ctx, snap) {
           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
           final dataMap = snap.data!;
-          final mods = dataMap['mods'] as List>;
+          final mods = dataMap['mods'] as List;
           final entryCounts = dataMap['counts'] as Map<int, int>;
 
           final validIds = mods.map((m) => m['id'] as int).toSet();
@@ -2069,7 +2066,7 @@ class _FamilyPageState extends State<FamilyPage> {
             return pid == null || !validIds.contains(pid);
           }).toList();
 
-          List> childrenOf(int pid) =>
+          List childrenOf(int pid) =>
               mods.where((m) => m['parent_id'] == pid).toList();
 
           final memberIdList = mods.where((m) => (m['is_member'] as int? ?? 0) == 1).map((m) => m['id'] as int).toList();
@@ -2169,7 +2166,7 @@ class _FamilyPageState extends State<FamilyPage> {
                   ),
                 ),
                 if (hasChildren && isExpanded)
-                  ...children.map((c) => buildDraggableModLevel(c, depth + 1)),
+                  ...children.map((c) => buildDraggableModLevel(Map<String, dynamic>.from(c), depth + 1)),
               ],
             );
           }
@@ -2186,7 +2183,7 @@ class _FamilyPageState extends State<FamilyPage> {
                         style: TextStyle(fontSize: 11.5, color: Colors.grey),
                       ),
                     ),
-                    ...roots.map((r) => buildDraggableModLevel(r, 0)),
+                    ...roots.map((r) => buildDraggableModLevel(Map<String, dynamic>.from(r), 0)),
                   ],
                 );
         },
@@ -2194,7 +2191,8 @@ class _FamilyPageState extends State<FamilyPage> {
     );
   }
 }
-// ==================== 3. 规划与思维导图模块 (100% 还原基准版组件 + 节点间长按三区拖拽移动) ====================
+
+// ==================== 3. 规划与思维导图模块 (无嵌套尖括号安全版) ====================
 class PlanPage extends StatefulWidget {
   final Database db;
   const PlanPage({super.key, required this.db});
@@ -2257,15 +2255,13 @@ class _PlanPageState extends State<PlanPage> {
     return map;
   }
 
-  Future<List>> _loadPlans() async {
+  Future<List> _loadPlans() async {
     if (!_uiLoaded) await _restorePlanUiState();
     try {
       final activeDb = await AppDatabase.instance.database;
-      return List>.from(
-        await activeDb.query('mindmaps', orderBy: 'id DESC'),
-      );
+      return await activeDb.query('mindmaps', orderBy: 'id DESC');
     } catch (_) {
-      return >[];
+      return [];
     }
   }
 
@@ -2474,7 +2470,7 @@ class _PlanPageState extends State<PlanPage> {
               final root = <String, dynamic>{
                 'id': _genId(),
                 'text': t,
-                'children': >[],
+                'children': [],
               };
               final now = DateTime.now().toIso8601String();
               final id = await activeDb.insert('mindmaps', {
@@ -2520,7 +2516,7 @@ class _PlanPageState extends State<PlanPage> {
   }
 
   bool _rm(Map<String, dynamic> parent, String targetId) {
-    final ch = (parent['children'] as List).cast>();
+    final ch = List.from(parent['children'] as List? ?? []);
     final idx = ch.indexWhere((c) => '${c['id']}' == targetId);
     if (idx != -1) {
       ch.removeAt(idx);
@@ -2528,7 +2524,7 @@ class _PlanPageState extends State<PlanPage> {
       return true;
     }
     for (final c in ch) {
-      if (_rm(c, targetId)) return true;
+      if (c is Map<String, dynamic> && _rm(c, targetId)) return true;
     }
     return false;
   }
@@ -2537,9 +2533,12 @@ class _PlanPageState extends State<PlanPage> {
     if (dragId == targetId) return true;
     Map<String, dynamic>? findNode(Map<String, dynamic> cur, String id) {
       if ('${cur['id']}' == id) return cur;
-      for (final c in (cur['children'] as List).cast>()) {
-        final f = findNode(c, id);
-        if (f != null) return f;
+      final ch = cur['children'] as List? ?? [];
+      for (final c in ch) {
+        if (c is Map<String, dynamic>) {
+          final f = findNode(c, id);
+          if (f != null) return f;
+        }
       }
       return null;
     }
@@ -2561,15 +2560,15 @@ class _PlanPageState extends State<PlanPage> {
 
     Map<String, dynamic>? removed;
     bool extractNode(Map<String, dynamic> cur) {
-      final ch = (cur['children'] as List).cast>();
+      final ch = List.from(cur['children'] as List? ?? []);
       final idx = ch.indexWhere((c) => '${c['id']}' == dragId);
       if (idx != -1) {
-        removed = ch.removeAt(idx);
+        removed = Map<String, dynamic>.from(ch.removeAt(idx) as Map);
         cur['children'] = ch;
         return true;
       }
       for (final c in ch) {
-        if (extractNode(c)) return true;
+        if (c is Map<String, dynamic> && extractNode(c)) return true;
       }
       return false;
     }
@@ -2579,14 +2578,15 @@ class _PlanPageState extends State<PlanPage> {
     if (zone == 'inside' || '${root['id']}' == targetId) {
       bool insertInside(Map<String, dynamic> cur) {
         if ('${cur['id']}' == targetId) {
-          final ch = (cur['children'] as List).cast>();
+          final ch = List.from(cur['children'] as List? ?? []);
           ch.add(removed!);
           cur['children'] = ch;
           _collapsedNodes.remove(targetId);
           return true;
         }
-        for (final c in (cur['children'] as List).cast>()) {
-          if (insertInside(c)) return true;
+        final ch = cur['children'] as List? ?? [];
+        for (final c in ch) {
+          if (c is Map<String, dynamic> && insertInside(c)) return true;
         }
         return false;
       }
@@ -2595,7 +2595,7 @@ class _PlanPageState extends State<PlanPage> {
       await _savePlanUiState();
     } else {
       bool insertSibling(Map<String, dynamic> cur) {
-        final ch = (cur['children'] as List).cast>();
+        final ch = List.from(cur['children'] as List? ?? []);
         final tIdx = ch.indexWhere((c) => '${c['id']}' == targetId);
         if (tIdx != -1) {
           final insIdx = zone == 'up' ? tIdx : tIdx + 1;
@@ -2604,7 +2604,7 @@ class _PlanPageState extends State<PlanPage> {
           return true;
         }
         for (final c in ch) {
-          if (insertSibling(c)) return true;
+          if (c is Map<String, dynamic> && insertSibling(c)) return true;
         }
         return false;
       }
@@ -2685,11 +2685,11 @@ class _PlanPageState extends State<PlanPage> {
                       FilledButton(
                         onPressed: () async {
                           if (ctrl.text.trim().isEmpty) return;
-                          final ch = (node['children'] as List).cast>();
-                          ch.add({
+                          final ch = List.from(node['children'] as List? ?? []);
+                          ch.add(<String, dynamic>{
                             'id': _genId(),
                             'text': ctrl.text.trim(),
-                            'children': >[],
+                            'children': [],
                           });
                           node['children'] = ch;
                           _collapsedNodes.remove('${node['id']}');
@@ -2730,19 +2730,19 @@ class _PlanPageState extends State<PlanPage> {
                             if (ctrl.text.trim().isEmpty) return;
                             final targetId = '${node['id']}';
                             bool insertAfter(Map<String, dynamic> cur) {
-                              final ch = (cur['children'] as List).cast>();
+                              final ch = List.from(cur['children'] as List? ?? []);
                               final idx = ch.indexWhere((c) => '${c['id']}' == targetId);
                               if (idx != -1) {
-                                ch.insert(idx + 1, {
+                                ch.insert(idx + 1, <String, dynamic>{
                                   'id': _genId(),
                                   'text': ctrl.text.trim(),
-                                  'children': >[],
+                                  'children': [],
                                 });
                                 cur['children'] = ch;
                                 return true;
                               }
                               for (final c in ch) {
-                                if (insertAfter(c)) return true;
+                                if (c is Map<String, dynamic> && insertAfter(c)) return true;
                               }
                               return false;
                             }
@@ -2811,12 +2811,14 @@ class _PlanPageState extends State<PlanPage> {
   }
 
   void _collectNonRootIds(Map<String, dynamic> node, Set<String> out, {bool isRoot = true}) {
-    final ch = (node['children'] as List).cast>();
+    final ch = node['children'] as List? ?? [];
     if (!isRoot && ch.isNotEmpty) {
       out.add('${node['id']}');
     }
     for (final c in ch) {
-      _collectNonRootIds(c, out, isRoot: false);
+      if (c is Map<String, dynamic>) {
+        _collectNonRootIds(c, out, isRoot: false);
+      }
     }
   }
 
@@ -2841,7 +2843,7 @@ class _PlanPageState extends State<PlanPage> {
           ),
         ],
       ),
-      body: FutureBuilder<List>>(
+      body: FutureBuilder<List>(
         future: _loadPlans(),
         builder: (ctx, snap) {
           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
@@ -2875,7 +2877,7 @@ class _PlanPageState extends State<PlanPage> {
               try {
                 root = _normalizeNode(jsonDecode('${m['root_json']}') as Map);
               } catch (_) {
-                root = {'id': 'root_$mapId', 'text': '${m['title']}', 'children': >[]};
+                root = <String, dynamic>{'id': 'root_$mapId', 'text': '${m['title']}', 'children': []};
               }
 
               final collapsibleIds = <String>{};
@@ -3004,7 +3006,6 @@ class _PlanPageState extends State<PlanPage> {
   }
 }
 
-// ==================== 基准版全屏思维导图页 FullscreenMindmapPage ====================
 class FullscreenMindmapPage extends StatefulWidget {
   final String title;
   final Map<String, dynamic> root;
@@ -3054,12 +3055,14 @@ class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
   }
 
   void _collectAllCollapsibleIds(Map<String, dynamic> node, Set<String> out, {bool isRoot = true}) {
-    final ch = (node['children'] as List).cast>();
+    final ch = node['children'] as List? ?? [];
     if (!isRoot && ch.isNotEmpty) {
       out.add('${node['id']}');
     }
     for (final c in ch) {
-      _collectAllCollapsibleIds(c, out, isRoot: false);
+      if (c is Map<String, dynamic>) {
+        _collectAllCollapsibleIds(c, out, isRoot: false);
+      }
     }
   }
 
@@ -3141,7 +3144,6 @@ class _FullscreenMindmapPageState extends State<FullscreenMindmapPage> {
   }
 }
 
-// ==================== 基准版原生树节点组件 XMindBranchNodeWidget (支持三区长按拖拽移动) ====================
 class XMindBranchNodeWidget extends StatelessWidget {
   final Map<String, dynamic> node;
   final bool isRoot;
@@ -3226,7 +3228,7 @@ class XMindBranchNodeWidget extends StatelessWidget {
   Widget build(BuildContext context) {
     final id = '${node['id']}';
     final text = '${node['text'] ?? ''}';
-    final children = (node['children'] as List).cast>();
+    final children = node['children'] as List? ?? [];
     final isCollapsed = !isRoot && collapsedNodes.contains(id);
 
     final isHovered = hoverNodeId == id;
@@ -3353,7 +3355,7 @@ class XMindBranchNodeWidget extends StatelessWidget {
           .map(
             (c) => XMindBranchNodeWidget(
               key: ValueKey('xm_node_${c['id']}'),
-              node: c,
+              node: Map<String, dynamic>.from(c as Map),
               isRoot: false,
               collapsedNodes: collapsedNodes,
               hoverNodeId: hoverNodeId,
@@ -3370,7 +3372,6 @@ class XMindBranchNodeWidget extends StatelessWidget {
   }
 }
 
-// ==================== 基准版原生动态测量行组件 _XMindTreeRow & _XMindBracketPainter ====================
 class _XMindTreeRow extends StatefulWidget {
   final Widget parentWidget;
   final List<Widget> childWidgets;
