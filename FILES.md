@@ -11,7 +11,7 @@
 |---|---|---|
 | `pubspec.yaml` | 398 | `c219232a092a64bcafcd1e3aac1b1033` |
 | `README.md` | 3,573 | `7b11c7ac84cfd02334a547fb173757aa` |
-| `.github/workflows/build.yml` | 5,395 | `869f005f8b60072e4fc1577b28a256dc` |
+| `.github/workflows/build.yml` | 5,522 | `1b9488bba4d632454cbb8db0023738c6` |
 | `lib/main.dart` | 127,122 | `1f75104bc607e3a49efe889f264def79` |
 | `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
@@ -27,6 +27,31 @@ grep -c '^  assets:' pubspec.yaml   # 期望 0（或直接报错），有输出�
 grep -c 'Generate Android shell in temp dir' .github/workflows/build.yml   # 期望 1
 ls lib/empire_assets.dart lib/empire_data.dart lib/empire_page.dart
 md5sum lib/empire_page.dart        # 应等于上表
+```
+
+## 构建脚本修复（第 2 轮）
+
+`Generate Android shell in temp dir` 这一步之前会在 `set -e` 下以 exit 1 中断，原因：
+
+```bash
+cd "$RUNNER_TEMP"                                   # 切到临时目录
+...
+test -f android/app/build.gradle.kts || ...          # ❌ 此处已不在 workspace
+```
+
+`cd "$RUNNER_TEMP"` 之后没有切回来，于是 `test -f android/app/...` 检查的是
+`$RUNNER_TEMP/android/app/...`（不存在，真实路径是 `$RUNNER_TEMP/shell/android/...`），
+两个 `test` 都失败，复合命令退出码 1，`set -e` 立即终止整个 step，
+所以日志里既没有 `echo` 输出，也看不到任何具体报错。
+
+现在改成全程绝对路径、不再 `cd`：
+
+```bash
+SHELL_DIR="$RUNNER_TEMP/shell"
+flutter create --project-name daily_tracker --platforms android "$SHELL_DIR"
+test -d "$SHELL_DIR/android"
+cp -r "$SHELL_DIR/android" "$GITHUB_WORKSPACE/android"
+test -f "$GITHUB_WORKSPACE/android/app/build.gradle.kts" || test -f "$GITHUB_WORKSPACE/android/app/build.gradle"
 ```
 
 ## 这一版对构建流程的改动
