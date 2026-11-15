@@ -13,6 +13,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:sqflite/sqflite.dart';
 import 'pages_extra.dart';
+import 'deepseek_sheet.dart';
+import 'empire_page.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -59,7 +61,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
-      version: 8,
+      version: 9,
       onCreate: (db, v) async {
         await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, allow_inherit INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE status_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, value TEXT DEFAULT "", UNIQUE(item_id, date))');
@@ -71,6 +73,7 @@ class AppDatabase {
         await db.execute('CREATE TABLE module_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, module_ids TEXT NOT NULL, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE mindmaps (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, root_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE ui_states (state_key TEXT PRIMARY KEY, state_val TEXT NOT NULL)');
+        await db.execute("CREATE TABLE focus_items (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, title TEXT NOT NULL, next_step TEXT DEFAULT '', done_criteria TEXT DEFAULT '', multiplier REAL DEFAULT 1.0, done INTEGER DEFAULT 0, note TEXT DEFAULT '', rolled INTEGER DEFAULT 0, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)");
       },
       onUpgrade: (db, oldV, newV) async {
         if (oldV.compareTo(2) == -1) {
@@ -96,6 +99,9 @@ class AppDatabase {
         if (oldV.compareTo(8) == -1) {
           try { await db.execute("ALTER TABLE module_groups ADD COLUMN sort_order INTEGER DEFAULT 0"); } catch (_) {}
         }
+        if (oldV.compareTo(9) == -1) {
+          try { await db.execute("CREATE TABLE IF NOT EXISTS focus_items (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, title TEXT NOT NULL, next_step TEXT DEFAULT '', done_criteria TEXT DEFAULT '', multiplier REAL DEFAULT 1.0, done INTEGER DEFAULT 0, note TEXT DEFAULT '', rolled INTEGER DEFAULT 0, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)"); } catch (_) {}
+        }
       },
     );
   }
@@ -115,6 +121,34 @@ class AppDatabase {
       await activeDb.insert('ui_states', {'state_key': key, 'state_val': val}, conflictAlgorithm: ConflictAlgorithm.replace);
     } catch (_) {}
     return null;
+  }
+
+  /// 战略聚焦：把勾选完成信号聚合成帝国模块可直接读取的键，写入 ui_states。
+  /// 取消勾选会重算，因此乘数效应会自动退回。
+  static Future<Map> refreshFocusSignals(Database db, String date) async {
+    try {
+      final Database activeDb = await instance.database;
+      final dayRows = await activeDb.query(
+        'focus_items', where: 'date = ? AND done = 1', whereArgs: [date]);
+      final allRows = await activeDb.query('focus_items', where: 'done = 1');
+      double dayMul = 1.0;
+      for (final r in dayRows) {
+        final v = (r['multiplier'] as num?)?.toDouble() ?? 1.0;
+        dayMul *= v > 0 ? v : 1.0;
+      }
+      double totalMul = 1.0;
+      for (final r in allRows) {
+        final v = (r['multiplier'] as num?)?.toDouble() ?? 1.0;
+        totalMul *= v > 0 ? v : 1.0;
+      }
+      final ids = dayRows.map((r) => r['id']).toList();
+      await setUiState(db, 'focus_multiplier_$date', dayMul.toStringAsFixed(6));
+      await setUiState(db, 'focus_multiplier_total', totalMul.toStringAsFixed(6));
+      await setUiState(db, 'focus_done_ids_$date', jsonEncode(ids));
+      return {'day': dayMul, 'total': totalMul, 'count': dayRows.length};
+    } catch (_) {
+      return {'day': 1.0, 'total': 1.0, 'count': 0};
+    }
   }
 }
 
@@ -289,6 +323,7 @@ class MainShell extends StatefulWidget {
 
 class _MainShellState extends State<MainShell> {
   int _idx = 2;
+  int _empireTick = 0;
   @override
   Widget build(BuildContext context) {
     return FutureBuilder(
@@ -299,6 +334,7 @@ class _MainShellState extends State<MainShell> {
           SearchPage(db: activeDb),
           FamilyPage(db: activeDb),
           TodayPage(db: activeDb),
+          EmpirePage(db: activeDb, reloadToken: _empireTick),
           PlanPage(db: activeDb),
         ];
         return Scaffold(
@@ -306,11 +342,18 @@ class _MainShellState extends State<MainShell> {
           bottomNavigationBar: NavigationBar(
             height: 62,
             selectedIndex: _idx,
-            onDestinationSelected: (i) => setState(() => _idx = i),
+            onDestinationSelected: (i) => setState(() {
+              _idx = i;
+              if (i == 3) _empireTick++;
+            }),
             destinations: const [
               NavigationDestination(icon: Icon(Icons.search), label: '查找'),
               NavigationDestination(icon: Icon(Icons.home_outlined), label: '家庭'),
               NavigationDestination(icon: Icon(Icons.calendar_today), label: '今日'),
+              NavigationDestination(
+                  icon: Icon(Icons.account_balance_outlined),
+                  selectedIcon: Icon(Icons.account_balance),
+                  label: '帝国'),
               NavigationDestination(icon: Icon(Icons.account_tree_outlined), label: '规划'),
             ],
           ),
@@ -335,8 +378,9 @@ class _TodayPageState extends State<TodayPage> {
   bool _foldSummary = false;
   bool _foldStatusSection = false;
   bool _foldSchedSection = false;
+  bool _foldFocusSection = false;
   bool _uiLoaded = false;
-  List _sectionOrder = ['summary', 'status', 'schedule'];
+  List _sectionOrder = ['summary', 'status', 'focus', 'schedule'];
 
   int? _hoverSchedTargetId;
   String? _hoverSchedZone;
@@ -357,9 +401,10 @@ class _TodayPageState extends State<TodayPage> {
         _foldSummary = map['foldSummary'] == true;
         _foldStatusSection = map['foldStatusSection'] == true;
         _foldSchedSection = map['foldSchedSection'] == true;
+        _foldFocusSection = map['foldFocusSection'] == true;
         if (map['sectionOrder'] is List) {
           final loadedOrder = (map['sectionOrder'] as List).map((e) => '$e').toList();
-          for (final k in ['summary', 'status', 'schedule']) {
+          for (final k in ['summary', 'status', 'focus', 'schedule']) {
             if (!loadedOrder.contains(k)) loadedOrder.add(k);
           }
           _sectionOrder = loadedOrder;
@@ -381,6 +426,7 @@ class _TodayPageState extends State<TodayPage> {
       'foldSummary': _foldSummary,
       'foldStatusSection': _foldStatusSection,
       'foldSchedSection': _foldSchedSection,
+      'foldFocusSection': _foldFocusSection,
       'sectionOrder': _sectionOrder,
       'collapsedStatusIds': _collapsedStatusIds.toList(),
       'collapsedSchedParents': _collapsedSchedParents.toList(),
@@ -442,7 +488,40 @@ class _TodayPageState extends State<TodayPage> {
       final r = await db.query('schedule_records', where: 'item_id = ? AND date = ?', whereArgs: [sid, _date]);
       doneMap[sid] = r.isNotEmpty && (r.first['done'] as int) == 1;
     }
-    return {'items': items, 'disp': disp, 'scheds': scheds, 'done': doneMap};
+    // 未完成的战略聚焦顺延到今天：复制今日副本，历史原记录保留并标记已顺延，
+    // 这样查看前一天仍能看到并修改，且不会每天重复复制。
+    if (_date == _today) {
+      final pending = await db.query('focus_items',
+          where: 'date < ? AND done = 0 AND rolled = 0', whereArgs: [_date],
+          orderBy: 'date ASC, sort_order ASC, id ASC');
+      for (final r in pending) {
+        final same = await db.query('focus_items',
+            where: 'date = ? AND title = ?', whereArgs: [_date, r['title']]);
+        if (same.isNotEmpty) continue;
+        final cnt = await db.query('focus_items', where: 'date = ?', whereArgs: [_date]);
+        await db.insert('focus_items', {
+          'date': _date,
+          'title': r['title'],
+          'next_step': r['next_step'],
+          'done_criteria': r['done_criteria'],
+          'multiplier': r['multiplier'],
+          'done': 0,
+          'note': '',
+          'rolled': 0,
+          'sort_order': cnt.length,
+          'created_at': DateTime.now().toIso8601String(),
+        });
+      }
+      for (final r in pending) {
+        await db.update('focus_items', {'rolled': 1},
+            where: 'id = ?', whereArgs: [r['id'] as int]);
+      }
+    }
+    final focusRows = List.from(await db.query('focus_items',
+        where: 'date = ?', whereArgs: [_date], orderBy: 'sort_order ASC, id ASC'));
+    final focusSignal = await AppDatabase.refreshFocusSignals(db, _date);
+    return {'items': items, 'disp': disp, 'scheds': scheds, 'done': doneMap,
+            'focus': focusRows, 'signal': focusSignal};
   }
 
   List _splitColumns(String raw) {
@@ -480,6 +559,16 @@ class _TodayPageState extends State<TodayPage> {
     final Database db = await AppDatabase.instance.database;
     final existing = await db.query('status_items', where: 'name = ?', whereArgs: [name]);
     if (existing.isNotEmpty) return existing.first['id'] as int;
+    // 旧的「AI 深度异状分析」条目直接改名沿用，避免每日状态里留两条重复
+    if (name == '反思') {
+      final oldAi = await db.query('status_items',
+          where: 'name IN (?, ?)', whereArgs: ['AI 深度异状分析', 'AI深度异状分析']);
+      if (oldAi.isNotEmpty) {
+        await db.update('status_items', {'name': '反思'},
+            where: 'id = ?', whereArgs: [oldAi.first['id'] as int]);
+        return oldAi.first['id'] as int;
+      }
+    }
     if (name == '状态与异状' || name == '状态和异状') {
       final alt = await db.query('status_items', where: 'name IN (?, ?)', whereArgs: ['状态与异状', '状态和异状']);
       if (alt.isNotEmpty) return alt.first['id'] as int;
@@ -604,337 +693,39 @@ class _TodayPageState extends State<TodayPage> {
     if (mounted) setState(() {});
     return null;
   }
-  Future _openGeminiAnalyzerSheet(String summaryText) async {
-    final rawCfg = await AppDatabase.getUiState(widget.db, 'gemini_ai_config');
-    final Map cfg = {
-      'model': 'gemini-3.1-pro',
-      'mode': 'gem',
-      'gemName': '每日状态系统分析师',
-      'gemPrompt': '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条格式如“标题：具体分析”。',
-      'targetField': 'AI 深度异状分析',
-    };
-    if (rawCfg != null && (rawCfg as String).isNotEmpty) {
-      try {
-        cfg.addAll(jsonDecode(rawCfg) as Map);
-      } catch (_) {}
-    }
 
-    if (!mounted) return null;
-    final gemNameCtrl = TextEditingController(text: '${cfg['gemName']}');
-    final gemPromptCtrl = TextEditingController(text: '${cfg['gemPrompt']}');
-    final targetFieldCtrl = TextEditingController(text: '${cfg['targetField']}');
-    final resultCtrl = TextEditingController();
-    String selectedModel = '${cfg['model']}';
-    String selectedMode = '${cfg['mode']}';
-
-    Future saveCurrentConfig() async {
-      final newCfg = {
-        'model': selectedModel,
-        'mode': selectedMode,
-        'gemName': gemNameCtrl.text.trim(),
-        'gemPrompt': gemPromptCtrl.text.trim(),
-        'targetField': targetFieldCtrl.text.trim().isEmpty ? 'AI 深度异状分析' : targetFieldCtrl.text.trim(),
-      };
-      await AppDatabase.setUiState(widget.db, 'gemini_ai_config', jsonEncode(newCfg));
-      return null;
-    }
-
-    String buildFullPrompt() {
-      final header = selectedMode == 'gem'
-          ? '【当前启用 Gem：${gemNameCtrl.text.trim()} | 模型：$selectedModel】\n${gemPromptCtrl.text.trim()}\n\n'
-          : '【模型：$selectedModel】\n请客观分析以下今日状态并给出分条建议：\n\n';
-      return '$header$summaryText';
-    }
-
-    showModalBottomSheet(
+  /// 打开 DeepSeek 反思面板；返回的正文由面板负责组织，这里只负责落库。
+  Future _openDeepSeekAnalyzerSheet(String summaryText, List focusRows) async {
+    final db = await AppDatabase.instance.database;
+    final res = await showDeepSeekSheet(
       context: context,
-      isScrollControlled: true,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setS) => DraggableScrollableSheet(
-          expand: false,
-          initialChildSize: 0.88,
-          maxChildSize: 0.96,
-          builder: (_, sc) => Padding(
-            padding: EdgeInsets.fromLTRB(16, 14, 16, MediaQuery.of(ctx).viewInsets.bottom + 14),
-            child: ListView(
-              controller: sc,
-              children: [
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(6),
-                      decoration: BoxDecoration(
-                        gradient: const LinearGradient(colors: [Color(0xFF4F46E5), Color(0xFF9333EA)]),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: const Icon(Icons.auto_awesome, color: Colors.white, size: 18),
-                    ),
-                    const SizedBox(width: 8),
-                    const Expanded(
-                      child: Text('Gemini 今日状态智能分析', style: TextStyle(fontSize: 16.5, fontWeight: FontWeight.bold)),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.close, size: 20),
-                      onPressed: () => Navigator.pop(ctx),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 4),
-                const Text('💡 自动记忆上次选用的模型、对话模式与 Gem 设定，支持一键复制今日状态并拉起外部 Gemini', style: TextStyle(fontSize: 11.5, color: Colors.grey)),
-                const Divider(height: 16),
-                Row(
-                  children: [
-                    Expanded(
-                      flex: 5,
-                      child: DropdownButtonFormField(
-                        value: ['gemini-3.1-pro', 'gemini-2.5-pro', 'gemini-2.5-flash'].contains(selectedModel)
-                            ? selectedModel
-                            : 'gemini-3.1-pro',
-                        isExpanded: true,
-                        decoration: const InputDecoration(
-                          labelText: '选择模型 (Model)',
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                          contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                        ),
-                        items: const [
-                          DropdownMenuItem(value: 'gemini-3.1-pro', child: Text('Gemini 3.1 Pro', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold))),
-                          DropdownMenuItem(value: 'gemini-2.5-pro', child: Text('Gemini 2.5 Pro', style: TextStyle(fontSize: 13))),
-                          DropdownMenuItem(value: 'gemini-2.5-flash', child: Text('Gemini 2.5 Flash', style: TextStyle(fontSize: 13))),
-                        ],
-                        onChanged: (v) {
-                          setS(() => selectedModel = '$v');
-                          saveCurrentConfig();
-                        },
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      flex: 4,
-                      child: DropdownButtonFormField(
-                        value: selectedMode == 'chat' ? 'chat' : 'gem',
-                        isExpanded: true,
-                        decoration: const InputDecoration(
-                          labelText: '会话类型',
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                          contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                        ),
-                        items: const [
-                          DropdownMenuItem(value: 'gem', child: Text('💎 专属 Gem', style: TextStyle(fontSize: 13))),
-                          DropdownMenuItem(value: 'chat', child: Text('💬 普通对话', style: TextStyle(fontSize: 13))),
-                        ],
-                        onChanged: (v) {
-                          setS(() => selectedMode = '$v');
-                          saveCurrentConfig();
-                        },
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                if (selectedMode == 'gem') ...[
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: gemNameCtrl,
-                          style: const TextStyle(fontSize: 13),
-                          decoration: const InputDecoration(
-                            labelText: 'Gem 名称 / 预设角色',
-                            border: OutlineInputBorder(),
-                            isDense: true,
-                            contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                          ),
-                          onChanged: (_) => saveCurrentConfig(),
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      PopupMenuButton(
-                        tooltip: '快速切换常用 Gem 预设',
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFEEF2FF),
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: const Color(0xFFC7D2FE)),
-                          ),
-                          child: const Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(Icons.bookmarks_outlined, size: 15, color: Color(0xFF4F46E5)),
-                              SizedBox(width: 4),
-                              Text('预设Gem', style: TextStyle(fontSize: 12, color: Color(0xFF4F46E5), fontWeight: FontWeight.bold)),
-                            ],
-                          ),
-                        ),
-                        onSelected: (preset) {
-                          final pMap = preset as Map;
-                          setS(() {
-                            gemNameCtrl.text = '${pMap['name']}';
-                            gemPromptCtrl.text = '${pMap['prompt']}';
-                          });
-                          saveCurrentConfig();
-                        },
-                        itemBuilder: (_) => [
-                          const PopupMenuItem(
-                            value: {
-                              'name': '客观理性系统分析师',
-                              'prompt': '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条格式如“标题：具体分析”。',
-                            },
-                            child: Text('💎 客观理性系统分析师'),
-                          ),
-                          const PopupMenuItem(
-                            value: {
-                              'name': '代谢与营养精算师',
-                              'prompt': '请聚焦我今日的饮食结构（碳水/蛋白质/钠摄入）与体重变化、体能训练表现，分析水肿或热量缺口情况，并给出明日三餐调整方案。每条格式如“标题：具体分析”。',
-                            },
-                            child: Text('🥗 代谢与营养精算师'),
-                          ),
-                          const PopupMenuItem(
-                            value: {
-                              'name': '精力与日程效能教练',
-                              'prompt': '请结合我今日的已完成/未完成日程与核心目标，分析精力分配与决策疲劳点，给出明日单线程减法行动建议。每条格式如“标题：具体分析”。',
-                            },
-                            child: Text('⚡ 精力与日程效能教练'),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: gemPromptCtrl,
-                    minLines: 2,
-                    maxLines: 4,
-                    style: const TextStyle(fontSize: 12.5, height: 1.35),
-                    decoration: const InputDecoration(
-                      labelText: 'Gem 专属分析指令',
-                      border: OutlineInputBorder(),
-                      contentPadding: EdgeInsets.all(8),
-                    ),
-                    onChanged: (_) => saveCurrentConfig(),
-                  ),
-                  const SizedBox(height: 10),
-                ],
-                TextField(
-                  controller: targetFieldCtrl,
-                  style: const TextStyle(fontSize: 13),
-                  decoration: const InputDecoration(
-                    labelText: '导出到每日状态的条目名称',
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                    contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                  ),
-                  onChanged: (_) => saveCurrentConfig(),
-                ),
-                const SizedBox(height: 12),
-                SizedBox(
-                  width: double.infinity,
-                  child: FilledButton.icon(
-                    style: FilledButton.styleFrom(
-                      backgroundColor: const Color(0xFF4F46E5),
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    ),
-                    onPressed: () async {
-                      await saveCurrentConfig();
-                      final fullPrompt = buildFullPrompt();
-                      await Clipboard.setData(ClipboardData(text: fullPrompt));
-                      if (ctx.mounted) {
-                        ScaffoldMessenger.of(ctx).showSnackBar(
-                          const SnackBar(content: Text('✅ 已复制今日状态完整指令到剪贴板！')),
-                        );
-                      }
-                      await Share.share(fullPrompt, subject: '今日状态 Gemini 分析');
-                    },
-                    icon: const Icon(Icons.open_in_new, size: 18),
-                    label: const Text('复制并拉起外部 Gemini', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text('📥 AI 分析建议：', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
-                    TextButton.icon(
-                      style: TextButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                        minimumSize: Size.zero,
-                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      ),
-                      onPressed: () async {
-                        final clip = await Clipboard.getData(Clipboard.kTextPlain);
-                        if (clip?.text != null && clip!.text!.trim().isNotEmpty) {
-                          setS(() => resultCtrl.text = clip.text!.trim());
-                        }
-                      },
-                      icon: const Icon(Icons.content_paste, size: 14),
-                      label: const Text('一键粘贴剪贴板', style: TextStyle(fontSize: 12)),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                TextField(
-                  controller: resultCtrl,
-                  minLines: 6,
-                  maxLines: 12,
-                  style: const TextStyle(fontSize: 13.5, height: 1.45),
-                  decoration: const InputDecoration(
-                    hintText: '将外部 Gemini 的回复粘贴到此处，点击下方按钮即可自动分列导入到今日状态中...',
-                    border: OutlineInputBorder(),
-                    contentPadding: EdgeInsets.all(10),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                SizedBox(
-                  width: double.infinity,
-                  child: FilledButton.icon(
-                    style: FilledButton.styleFrom(
-                      backgroundColor: const Color(0xFF10B981),
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    ),
-                    onPressed: () async {
-                      final rawAi = resultCtrl.text.trim();
-                      if (rawAi.isEmpty || rawAi.startsWith('⚠️')) {
-                        setS(() => resultCtrl.text = '⚠️ 请先粘贴有效的 AI 分析内容后再点击导出！');
-                        return;
-                      }
-                      await saveCurrentConfig();
-                      final db = await AppDatabase.instance.database;
-                      final targetName = targetFieldCtrl.text.trim().isEmpty ? 'AI 深度异状分析' : targetFieldCtrl.text.trim();
-                      final cleanedLines = rawAi
-                          .split('\n')
-                          .map((line) => line.replaceAll('**', '').replaceFirst(RegExp(r'^[\-\*\•\d]+[\.、\s]\s*'), '').trim())
-                          .where((line) => line.isNotEmpty)
-                          .toList();
-
-                      final itemId = await _ensureStatusItem(targetName, 'text');
-                      await db.update('status_items', {'allow_inherit': 0}, where: 'id = ?', whereArgs: [itemId]);
-                      await db.insert(
-                        'status_records',
-                        {'item_id': itemId, 'date': _date, 'value': cleanedLines.join('\n')},
-                        conflictAlgorithm: ConflictAlgorithm.replace,
-                      );
-                      if (mounted) {
-                        Navigator.pop(ctx);
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text('🎉 已将 AI 分析建议导入至今日「$targetName」（共 ${cleanedLines.length} 栏）！')),
-                        );
-                        setState(() {});
-                      }
-                    },
-                    icon: const Icon(Icons.download_done, size: 18),
-                    label: const Text('导出 AI 分析建议至「每日状态」', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
+      db: db,
+      date: _date,
+      summaryText: summaryText,
+      focusRows: focusRows,
+      defaultTarget: '反思',
     );
+    if (res == null || !mounted) return null;
+    final cleanedLines = res.content
+        .split('\n')
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList();
+    if (cleanedLines.isEmpty) return null;
+
+    final itemId = await _ensureStatusItem(res.fieldName, 'text');
+    await db.update('status_items', {'allow_inherit': 0}, where: 'id = ?', whereArgs: [itemId]);
+    await db.insert(
+      'status_records',
+      {'item_id': itemId, 'date': _date, 'value': cleanedLines.join('\n')},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+    if (!mounted) return null;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('已导入今日「${res.fieldName}」（${cleanedLines.length} 行）')),
+    );
+    setState(() {});
+    return null;
   }
 
   Future _importDailyDocx() async {
@@ -1006,7 +797,7 @@ class _TodayPageState extends State<TodayPage> {
       }
 
       final dateHeaderRegex = RegExp(r'^【\s*(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]\s*】');
-      final topFields = ['基础数据', '核心目标', '饮食记录', '打卡进度', '状态与异状', '状态和异状', 'AI 深度异状分析', 'AI深度异状分析', '复盘与分析', '今日总结'];
+      final topFields = ['基础数据', '核心目标', '饮食记录', '打卡进度', '状态与异状', '状态和异状', 'AI 深度异状分析', 'AI深度异状分析', '反思', '复盘与分析', '今日总结'];
 
       for (final pm in pMatches) {
         final pXml = pm.group(1)!;
@@ -1188,6 +979,10 @@ class _TodayPageState extends State<TodayPage> {
           final disp = dataMap['disp'] as Map;
           final scheds = dataMap['scheds'] as List;
           final doneMap = dataMap['done'] as Map;
+          final focusRows = dataMap['focus'] as List;
+          final focusSignal = dataMap['signal'] as Map;
+          final focusDoneCount =
+              focusRows.where((f) => ((f as Map)['done'] as int?) == 1).length;
 
           for (final rawS in scheds) {
             final s = rawS as Map;
@@ -1217,7 +1012,7 @@ class _TodayPageState extends State<TodayPage> {
                 return Container(
                   key: const ValueKey('sec_summary'),
                   margin: const EdgeInsets.only(bottom: 14),
-                  child: _buildSummaryCard(secIdx, items, disp, scheds, doneMap),
+                  child: _buildSummaryCard(secIdx, items, disp, scheds, doneMap, focusRows),
                 );
               } else if (secKey == 'status') {
                 return Container(
@@ -1270,6 +1065,26 @@ class _TodayPageState extends State<TodayPage> {
                           ),
                   ),
                 );
+              } else if (secKey == 'focus') {
+                return Container(
+                  key: const ValueKey('sec_focus'),
+                  margin: const EdgeInsets.only(bottom: 14),
+                  child: _buildMajorSectionCard(
+                    dragIndex: secIdx,
+                    accentColor: const Color(0xFFBE185D),
+                    headerBgColor: const Color(0xFFFDF2F8),
+                    icon: '🎯',
+                    title: '战略聚焦 ($focusDoneCount/${focusRows.length})',
+                    isFolded: _foldFocusSection,
+                    onToggleFold: () {
+                      setState(() => _foldFocusSection = !_foldFocusSection);
+                      _saveTodayUiState();
+                    },
+                    actionLabel: '新聚焦',
+                    onAction: () { _addOrEditFocusDialog(null); },
+                    child: _buildFocusBody(focusRows, focusSignal),
+                  ),
+                );
               } else {
                 return Container(
                   key: const ValueKey('sec_schedule'),
@@ -1316,6 +1131,393 @@ class _TodayPageState extends State<TodayPage> {
         },
       ),
     );
+  }
+
+  Widget _buildFocusBody(List rows, Map signal) {
+    final double dayMul = (signal['day'] as num?)?.toDouble() ?? 1.0;
+    final double totalMul = (signal['total'] as num?)?.toDouble() ?? 1.0;
+    final int doneCount = (signal['count'] as int?) ?? 0;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 8, 8, 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.only(bottom: 9),
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFFFCE7F3),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xFFF9A8D4), width: 1),
+            ),
+            child: Row(
+              children: [
+                _focusKv('今日', '×${dayMul.toStringAsFixed(3)}'),
+                _focusKv('累计', '×${totalMul.toStringAsFixed(3)}'),
+                _focusKv('已突破', '$doneCount/${rows.length}'),
+              ],
+            ),
+          ),
+          if (rows.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 18),
+              child: Center(
+                child: Text('暂无战略聚焦，点击右上角「+ 新聚焦」添加',
+                    style: TextStyle(color: Colors.grey, fontSize: 13)),
+              ),
+            ),
+          ...rows.map((raw) => _buildFocusRow(raw as Map)),
+        ],
+      ),
+    );
+  }
+
+  Widget _focusKv(String label, String value) {
+    return Expanded(
+      child: Column(
+        children: [
+          Text(label,
+              style: const TextStyle(fontSize: 9, color: Color(0xFFBE185D), letterSpacing: .5)),
+          const SizedBox(height: 2),
+          Text(value,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                  fontSize: 12.5, fontWeight: FontWeight.bold, color: Color(0xFF9D174D))),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFocusRow(Map f) {
+    final bool done = ((f['done'] as int?) ?? 0) == 1;
+    final double mul = (f['multiplier'] as num?)?.toDouble() ?? 1.0;
+    final String dim = '${f['title'] ?? ''}'.trim();
+    final String step = '${f['next_step'] ?? ''}'.trim();
+    final String primary = step.isEmpty ? (dim.isEmpty ? '未命名' : dim) : step;
+    final bool showDim = dim.isNotEmpty && dim != primary;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      decoration: BoxDecoration(
+        color: done ? const Color(0xFFFDF2F8) : Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: done ? const Color(0xFFF9A8D4) : const Color(0xFFFBCFE8),
+          width: 1.1,
+        ),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(6, 6, 8, 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SizedBox(
+                  width: 32,
+                  height: 32,
+                  child: Checkbox(
+                    value: done,
+                    activeColor: const Color(0xFFBE185D),
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    onChanged: (_) { _toggleFocusDone(f); },
+                  ),
+                ),
+                const SizedBox(width: 2),
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 5),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Padding(
+                          padding: EdgeInsets.only(top: 2),
+                          child: Icon(Icons.subdirectory_arrow_right,
+                              size: 13, color: Color(0xFFBE185D)),
+                        ),
+                        const SizedBox(width: 4),
+                        Expanded(
+                          child: Text(
+                            primary,
+                            style: TextStyle(
+                              fontSize: 13.5,
+                              height: 1.35,
+                              fontWeight: FontWeight.bold,
+                              color: done ? const Color(0xFF9D174D) : const Color(0xFF0F172A),
+                              decoration: done ? TextDecoration.lineThrough : null,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                if (done)
+                  Container(
+                    margin: const EdgeInsets.only(top: 4, left: 4),
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFBCFE8),
+                      borderRadius: BorderRadius.circular(5),
+                    ),
+                    child: const Text('已突破',
+                        style: TextStyle(
+                            fontSize: 9.5, fontWeight: FontWeight.bold, color: Color(0xFF831843))),
+                  ),
+                IconButton(
+                  icon: const Icon(Icons.edit_outlined, size: 16, color: Color(0xFFBE185D)),
+                  padding: EdgeInsets.zero,
+                  visualDensity: VisualDensity.compact,
+                  constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                  onPressed: () { _addOrEditFocusDialog(f); },
+                ),
+                IconButton(
+                  icon: const Icon(Icons.delete_outline, size: 16, color: Color(0xFF94A3B8)),
+                  padding: EdgeInsets.zero,
+                  visualDensity: VisualDensity.compact,
+                  constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                  onPressed: () { _deleteFocus(f); },
+                ),
+              ],
+            ),
+            if (showDim)
+              Padding(
+                padding: const EdgeInsets.only(left: 34, top: 4, bottom: 2),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFCE7F3),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.category_outlined, size: 9, color: Color(0xFF9D174D)),
+                      const SizedBox(width: 3),
+                      Text(dim,
+                          style: const TextStyle(
+                              fontSize: 10, fontWeight: FontWeight.w600, color: Color(0xFF9D174D))),
+                    ],
+                  ),
+                ),
+              ),
+            _focusField('完成标准', '${f['done_criteria'] ?? ''}', Icons.rule),
+            _focusField('乘数效应', '×${mul.toStringAsFixed(3)}', Icons.trending_up),
+            const SizedBox(height: 6),
+            TextField(
+              controller: TextEditingController(text: '${f['note'] ?? ''}'),
+              minLines: 1,
+              maxLines: 3,
+              style: const TextStyle(fontSize: 12),
+              decoration: const InputDecoration(
+                labelText: '今日文本记录',
+                hintText: '记录推进过程、卡点或复盘…',
+                border: OutlineInputBorder(),
+                isDense: true,
+                contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+              ),
+              onChanged: (v) { _saveFocusNote(f, v); },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _focusField(String label, String value, IconData icon) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 34, top: 3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 12, color: const Color(0xFFBE185D)),
+          const SizedBox(width: 5),
+          Text('$label：',
+              style: const TextStyle(
+                  fontSize: 11.5, fontWeight: FontWeight.bold, color: Color(0xFF9D174D))),
+          Expanded(
+            child: Text(value.trim().isEmpty ? '—' : value,
+                style: const TextStyle(fontSize: 11.5, height: 1.4, color: Color(0xFF475569))),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future _toggleFocusDone(Map row) async {
+    final db = await AppDatabase.instance.database;
+    final int cur = (row['done'] as int?) ?? 0;
+    await db.update('focus_items', {'done': cur == 1 ? 0 : 1},
+        where: 'id = ?', whereArgs: [row['id'] as int]);
+    await AppDatabase.refreshFocusSignals(db, _date);
+    if (mounted) setState(() {});
+    return null;
+  }
+
+  Future _saveFocusNote(Map row, String text) async {
+    final db = await AppDatabase.instance.database;
+    await db.update('focus_items', {'note': text},
+        where: 'id = ?', whereArgs: [row['id'] as int]);
+    return null;
+  }
+
+  Future _deleteFocus(Map row) async {
+    final String name = '${row['next_step'] ?? ''}'.trim().isEmpty
+        ? '${row['title'] ?? ''}'
+        : '${row['next_step']}';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: const Text('删除这条战略聚焦？', style: TextStyle(fontSize: 16)),
+        content: Text('「$name」将被删除，其乘数效应也会从帝国信号中退回。',
+            style: const TextStyle(fontSize: 13, height: 1.5)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dctx, false), child: const Text('取消')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: const Color(0xFFBE185D)),
+            onPressed: () => Navigator.pop(dctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return null;
+    final db = await AppDatabase.instance.database;
+    await db.delete('focus_items', where: 'id = ?', whereArgs: [row['id'] as int]);
+    await AppDatabase.refreshFocusSignals(db, _date);
+    if (mounted) setState(() {});
+    return null;
+  }
+
+  InputDecoration _focusDec(String label, [String? hint]) {
+    return InputDecoration(
+      labelText: label,
+      hintText: hint,
+      hintStyle: const TextStyle(fontSize: 11.5, color: Color(0xFF94A3B8)),
+      labelStyle: const TextStyle(fontSize: 12, color: Color(0xFF9D174D)),
+      isDense: true,
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+        borderSide: const BorderSide(color: Color(0xFFF9A8D4)),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+        borderSide: const BorderSide(color: Color(0xFFBE185D), width: 1.3),
+      ),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+    );
+  }
+
+  Future _addOrEditFocusDialog([Map? existing]) async {
+    // 老数据只有「名称」没有「下一步」：按新语义把名称当作具体要做的事
+    final bool legacy = existing != null && '${existing['next_step'] ?? ''}'.trim().isEmpty;
+    final dimCtrl = TextEditingController(
+        text: (existing == null || legacy) ? '' : '${existing['title'] ?? ''}');
+    final nextCtrl = TextEditingController(
+        text: existing == null ? '' : (legacy ? '${existing['title'] ?? ''}' : '${existing['next_step'] ?? ''}'));
+    final critCtrl = TextEditingController(text: existing == null ? '' : '${existing['done_criteria'] ?? ''}');
+    final mulCtrl = TextEditingController(
+        text: existing == null ? '1.05' : '${existing['multiplier'] ?? 1.05}');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        titlePadding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
+        contentPadding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+        title: Text(existing == null ? '新增战略聚焦' : '编辑战略聚焦',
+            style: const TextStyle(fontSize: 16.5, fontWeight: FontWeight.bold)),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              TextField(
+                controller: nextCtrl,
+                minLines: 1,
+                maxLines: 3,
+                autofocus: existing == null,
+                style: const TextStyle(fontSize: 13.5, height: 1.4),
+                decoration: _focusDec('下一步 · 具体要做的事', '例：定义帝国系统的规则和架构'),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: dimCtrl,
+                style: const TextStyle(fontSize: 13),
+                decoration: _focusDec('聚焦维度 · 归属类别', '例：帝国系统 / 体能 / 关系'),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: critCtrl,
+                minLines: 1,
+                maxLines: 3,
+                style: const TextStyle(fontSize: 13, height: 1.4),
+                decoration: _focusDec('完成标准 · 怎样算突破', '例：三状态推演都不崩，且过程不枯燥'),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: mulCtrl,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                style: const TextStyle(fontSize: 13),
+                decoration: _focusDec('乘数效应', '如 1.05，突破后连乘进帝国'),
+              ),
+              const SizedBox(height: 8),
+              const Text('突破只作用于这条「下一步」，不会影响整个聚焦维度。',
+                  style: TextStyle(fontSize: 10.5, height: 1.4, color: Color(0xFF9D174D))),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dctx, false), child: const Text('取消')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: const Color(0xFFBE185D)),
+            onPressed: () => Navigator.pop(dctx, true),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return null;
+    final String step = nextCtrl.text.trim();
+    final String dim = dimCtrl.text.trim();
+    if (step.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('请填写「下一步」——它才是要突破的那件事')),
+        );
+      }
+      return null;
+    }
+    final parsed = double.tryParse(mulCtrl.text.trim()) ?? 1.0;
+    final double mul = parsed > 0 ? parsed : 1.0;
+    final String title = dim.isEmpty ? '未分类' : dim;
+    final db = await AppDatabase.instance.database;
+    if (existing == null) {
+      final cnt = await db.query('focus_items', where: 'date = ?', whereArgs: [_date]);
+      await db.insert('focus_items', {
+        'date': _date,
+        'title': title,
+        'next_step': step,
+        'done_criteria': critCtrl.text.trim(),
+        'multiplier': mul,
+        'done': 0,
+        'note': '',
+        'rolled': 0,
+        'sort_order': cnt.length,
+        'created_at': DateTime.now().toIso8601String(),
+      });
+    } else {
+      await db.update('focus_items', {
+        'title': title,
+        'next_step': step,
+        'done_criteria': critCtrl.text.trim(),
+        'multiplier': mul,
+      }, where: 'id = ?', whereArgs: [existing['id'] as int]);
+    }
+    await AppDatabase.refreshFocusSignals(db, _date);
+    if (mounted) setState(() {});
+    return null;
   }
 
   Widget _buildMajorSectionCard({
@@ -1429,6 +1631,7 @@ class _TodayPageState extends State<TodayPage> {
     Map disp,
     List scheds,
     Map doneMap,
+    List focusRows,
   ) {
     final List copyLines = [];
     final List summaryRows = [];
@@ -1597,9 +1800,9 @@ class _TodayPageState extends State<TodayPage> {
                       padding: const EdgeInsets.symmetric(horizontal: 10),
                       minimumSize: Size.zero,
                     ),
-                    onPressed: () => _openGeminiAnalyzerSheet(copyText),
+                    onPressed: () => _openDeepSeekAnalyzerSheet(copyText, focusRows),
                     icon: const Icon(Icons.auto_awesome, size: 13),
-                    label: const Text('Gemini分析', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                    label: const Text('AI 反思', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
                   ),
                 ),
                 const SizedBox(width: 4),
