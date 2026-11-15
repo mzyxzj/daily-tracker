@@ -36,6 +36,7 @@ class _SearchPageState extends State<SearchPage> {
     'module_groups',
     'mindmaps',
     'ui_states',
+    'focus_items',
   ];
 
   @override
