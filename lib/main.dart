@@ -60,7 +60,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
-      version: 8,
+      version: 9,
       onCreate: (db, v) async {
         await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, allow_inherit INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE status_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, value TEXT DEFAULT "", UNIQUE(item_id, date))');
@@ -72,6 +72,7 @@ class AppDatabase {
         await db.execute('CREATE TABLE module_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, module_ids TEXT NOT NULL, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE mindmaps (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, root_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE ui_states (state_key TEXT PRIMARY KEY, state_val TEXT NOT NULL)');
+        await db.execute("CREATE TABLE focus_items (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, title TEXT NOT NULL, next_step TEXT DEFAULT '', done_criteria TEXT DEFAULT '', multiplier REAL DEFAULT 1.0, done INTEGER DEFAULT 0, note TEXT DEFAULT '', rolled INTEGER DEFAULT 0, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)");
       },
       onUpgrade: (db, oldV, newV) async {
         if (oldV.compareTo(2) == -1) {
@@ -97,6 +98,9 @@ class AppDatabase {
         if (oldV.compareTo(8) == -1) {
           try { await db.execute("ALTER TABLE module_groups ADD COLUMN sort_order INTEGER DEFAULT 0"); } catch (_) {}
         }
+        if (oldV.compareTo(9) == -1) {
+          try { await db.execute("CREATE TABLE IF NOT EXISTS focus_items (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, title TEXT NOT NULL, next_step TEXT DEFAULT '', done_criteria TEXT DEFAULT '', multiplier REAL DEFAULT 1.0, done INTEGER DEFAULT 0, note TEXT DEFAULT '', rolled INTEGER DEFAULT 0, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)"); } catch (_) {}
+        }
       },
     );
   }
@@ -116,6 +120,34 @@ class AppDatabase {
       await activeDb.insert('ui_states', {'state_key': key, 'state_val': val}, conflictAlgorithm: ConflictAlgorithm.replace);
     } catch (_) {}
     return null;
+  }
+
+  /// 核心聚焦：把勾选完成信号聚合成帝国模块可直接读取的键，写入 ui_states。
+  /// 取消勾选会重算，因此乘数效应会自动退回。
+  static Future<Map> refreshFocusSignals(Database db, String date) async {
+    try {
+      final Database activeDb = await instance.database;
+      final dayRows = await activeDb.query(
+        'focus_items', where: 'date = ? AND done = 1', whereArgs: [date]);
+      final allRows = await activeDb.query('focus_items', where: 'done = 1');
+      double dayMul = 1.0;
+      for (final r in dayRows) {
+        final v = (r['multiplier'] as num?)?.toDouble() ?? 1.0;
+        dayMul *= v > 0 ? v : 1.0;
+      }
+      double totalMul = 1.0;
+      for (final r in allRows) {
+        final v = (r['multiplier'] as num?)?.toDouble() ?? 1.0;
+        totalMul *= v > 0 ? v : 1.0;
+      }
+      final ids = dayRows.map((r) => r['id']).toList();
+      await setUiState(db, 'focus_multiplier_$date', dayMul.toStringAsFixed(6));
+      await setUiState(db, 'focus_multiplier_total', totalMul.toStringAsFixed(6));
+      await setUiState(db, 'focus_done_ids_$date', jsonEncode(ids));
+      return {'day': dayMul, 'total': totalMul, 'count': dayRows.length};
+    } catch (_) {
+      return {'day': 1.0, 'total': 1.0, 'count': 0};
+    }
   }
 }
 
@@ -336,8 +368,9 @@ class _TodayPageState extends State<TodayPage> {
   bool _foldSummary = false;
   bool _foldStatusSection = false;
   bool _foldSchedSection = false;
+  bool _foldFocusSection = false;
   bool _uiLoaded = false;
-  List _sectionOrder = ['summary', 'status', 'schedule'];
+  List _sectionOrder = ['summary', 'status', 'focus', 'schedule'];
 
   int? _hoverSchedTargetId;
   String? _hoverSchedZone;
@@ -358,9 +391,10 @@ class _TodayPageState extends State<TodayPage> {
         _foldSummary = map['foldSummary'] == true;
         _foldStatusSection = map['foldStatusSection'] == true;
         _foldSchedSection = map['foldSchedSection'] == true;
+        _foldFocusSection = map['foldFocusSection'] == true;
         if (map['sectionOrder'] is List) {
           final loadedOrder = (map['sectionOrder'] as List).map((e) => '$e').toList();
-          for (final k in ['summary', 'status', 'schedule']) {
+          for (final k in ['summary', 'status', 'focus', 'schedule']) {
             if (!loadedOrder.contains(k)) loadedOrder.add(k);
           }
           _sectionOrder = loadedOrder;
@@ -382,6 +416,7 @@ class _TodayPageState extends State<TodayPage> {
       'foldSummary': _foldSummary,
       'foldStatusSection': _foldStatusSection,
       'foldSchedSection': _foldSchedSection,
+      'foldFocusSection': _foldFocusSection,
       'sectionOrder': _sectionOrder,
       'collapsedStatusIds': _collapsedStatusIds.toList(),
       'collapsedSchedParents': _collapsedSchedParents.toList(),
@@ -443,7 +478,40 @@ class _TodayPageState extends State<TodayPage> {
       final r = await db.query('schedule_records', where: 'item_id = ? AND date = ?', whereArgs: [sid, _date]);
       doneMap[sid] = r.isNotEmpty && (r.first['done'] as int) == 1;
     }
-    return {'items': items, 'disp': disp, 'scheds': scheds, 'done': doneMap};
+    // 未完成的核心聚焦顺延到今天：复制今日副本，历史原记录保留并标记已顺延，
+    // 这样查看前一天仍能看到并修改，且不会每天重复复制。
+    if (_date == _today) {
+      final pending = await db.query('focus_items',
+          where: 'date < ? AND done = 0 AND rolled = 0', whereArgs: [_date],
+          orderBy: 'date ASC, sort_order ASC, id ASC');
+      for (final r in pending) {
+        final same = await db.query('focus_items',
+            where: 'date = ? AND title = ?', whereArgs: [_date, r['title']]);
+        if (same.isNotEmpty) continue;
+        final cnt = await db.query('focus_items', where: 'date = ?', whereArgs: [_date]);
+        await db.insert('focus_items', {
+          'date': _date,
+          'title': r['title'],
+          'next_step': r['next_step'],
+          'done_criteria': r['done_criteria'],
+          'multiplier': r['multiplier'],
+          'done': 0,
+          'note': '',
+          'rolled': 0,
+          'sort_order': cnt.length,
+          'created_at': DateTime.now().toIso8601String(),
+        });
+      }
+      for (final r in pending) {
+        await db.update('focus_items', {'rolled': 1},
+            where: 'id = ?', whereArgs: [r['id'] as int]);
+      }
+    }
+    final focusRows = List.from(await db.query('focus_items',
+        where: 'date = ?', whereArgs: [_date], orderBy: 'sort_order ASC, id ASC'));
+    final focusSignal = await AppDatabase.refreshFocusSignals(db, _date);
+    return {'items': items, 'disp': disp, 'scheds': scheds, 'done': doneMap,
+            'focus': focusRows, 'signal': focusSignal};
   }
 
   List _splitColumns(String raw) {
@@ -1390,6 +1458,10 @@ class _TodayPageState extends State<TodayPage> {
           final disp = dataMap['disp'] as Map;
           final scheds = dataMap['scheds'] as List;
           final doneMap = dataMap['done'] as Map;
+          final focusRows = dataMap['focus'] as List;
+          final focusSignal = dataMap['signal'] as Map;
+          final focusDoneCount =
+              focusRows.where((f) => ((f as Map)['done'] as int?) == 1).length;
 
           for (final rawS in scheds) {
             final s = rawS as Map;
@@ -1472,6 +1544,26 @@ class _TodayPageState extends State<TodayPage> {
                           ),
                   ),
                 );
+              } else if (secKey == 'focus') {
+                return Container(
+                  key: const ValueKey('sec_focus'),
+                  margin: const EdgeInsets.only(bottom: 14),
+                  child: _buildMajorSectionCard(
+                    dragIndex: secIdx,
+                    accentColor: const Color(0xFFBE185D),
+                    headerBgColor: const Color(0xFFFDF2F8),
+                    icon: '🎯',
+                    title: '核心聚焦 ($focusDoneCount/${focusRows.length})',
+                    isFolded: _foldFocusSection,
+                    onToggleFold: () {
+                      setState(() => _foldFocusSection = !_foldFocusSection);
+                      _saveTodayUiState();
+                    },
+                    actionLabel: '新聚焦',
+                    onAction: () { _addOrEditFocusDialog(null); },
+                    child: _buildFocusBody(focusRows, focusSignal),
+                  ),
+                );
               } else {
                 return Container(
                   key: const ValueKey('sec_schedule'),
@@ -1518,6 +1610,284 @@ class _TodayPageState extends State<TodayPage> {
         },
       ),
     );
+  }
+
+  Widget _buildFocusBody(List rows, Map signal) {
+    final double dayMul = (signal['day'] as num?)?.toDouble() ?? 1.0;
+    final double totalMul = (signal['total'] as num?)?.toDouble() ?? 1.0;
+    final int doneCount = (signal['count'] as int?) ?? 0;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 8, 8, 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(9),
+            margin: const EdgeInsets.only(bottom: 9),
+            decoration: BoxDecoration(
+              color: const Color(0xFFFCE7F3),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xFFF9A8D4), width: 1),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '今日 ×${dayMul.toStringAsFixed(3)}　累计 ×${totalMul.toStringAsFixed(3)}　已完成 $doneCount/${rows.length}',
+                  style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold, color: Color(0xFF9D174D)),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  '帝国模块读取键：focus_multiplier_<日期> / focus_multiplier_total / focus_done_ids_<日期>',
+                  style: TextStyle(fontSize: 10, color: Color(0xFFBE185D)),
+                ),
+                const SizedBox(height: 2),
+                const Text(
+                  '完成后当天仍保留，可再点掉对勾撤销并退回乘数；次日已完成项不再出现，查看历史日期仍可修改。',
+                  style: TextStyle(fontSize: 10, color: Color(0xFF831843)),
+                ),
+              ],
+            ),
+          ),
+          if (rows.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 18),
+              child: Center(
+                child: Text('暂无核心聚焦，点击右上角「+ 新聚焦」添加',
+                    style: TextStyle(color: Colors.grey, fontSize: 13)),
+              ),
+            ),
+          ...rows.map((raw) => _buildFocusRow(raw as Map)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFocusRow(Map f) {
+    final bool done = ((f['done'] as int?) ?? 0) == 1;
+    final double mul = (f['multiplier'] as num?)?.toDouble() ?? 1.0;
+    final bool isToday = _date == _today;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      decoration: BoxDecoration(
+        color: done ? const Color(0xFFFDF2F8) : Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: done ? const Color(0xFFF9A8D4) : const Color(0xFFFBCFE8),
+          width: 1.1,
+        ),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(8, 6, 8, 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                SizedBox(
+                  width: 34,
+                  height: 34,
+                  child: Checkbox(
+                    value: done,
+                    activeColor: const Color(0xFFBE185D),
+                    onChanged: (_) { _toggleFocusDone(f); },
+                  ),
+                ),
+                Expanded(
+                  child: Text(
+                    '${f['title'] ?? ''}',
+                    style: TextStyle(
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.bold,
+                      color: done ? const Color(0xFF9D174D) : const Color(0xFF0F172A),
+                      decoration: done ? TextDecoration.lineThrough : null,
+                    ),
+                  ),
+                ),
+                if (done)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFBCFE8),
+                      borderRadius: BorderRadius.circular(5),
+                    ),
+                    child: const Text('已完成 · 可撤销',
+                        style: TextStyle(fontSize: 9.5, fontWeight: FontWeight.bold, color: Color(0xFF831843))),
+                  ),
+                IconButton(
+                  icon: const Icon(Icons.edit_outlined, size: 17, color: Color(0xFFBE185D)),
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+                  onPressed: () { _addOrEditFocusDialog(f); },
+                ),
+                IconButton(
+                  icon: const Icon(Icons.delete_outline, size: 17, color: Color(0xFF94A3B8)),
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+                  onPressed: () { _deleteFocus(f); },
+                ),
+              ],
+            ),
+            _focusField('下一步', '${f['next_step'] ?? ''}', Icons.arrow_forward),
+            _focusField('完成标准', '${f['done_criteria'] ?? ''}', Icons.rule),
+            _focusField('乘数效应', '×${mul.toStringAsFixed(3)}', Icons.trending_up),
+            if (!isToday)
+              const Padding(
+                padding: EdgeInsets.only(left: 6, top: 3),
+                child: Text('历史日期视图 · 仍可勾选/取消，帝国累计信号会同步重算',
+                    style: TextStyle(fontSize: 10, color: Color(0xFFBE185D))),
+              ),
+            const SizedBox(height: 6),
+            TextField(
+              controller: TextEditingController(text: '${f['note'] ?? ''}'),
+              minLines: 1,
+              maxLines: 3,
+              style: const TextStyle(fontSize: 12),
+              decoration: const InputDecoration(
+                labelText: '今日文本记录',
+                hintText: '记录推进过程、卡点或复盘…',
+                border: OutlineInputBorder(),
+                isDense: true,
+                contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+              ),
+              onChanged: (v) { _saveFocusNote(f, v); },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _focusField(String label, String value, IconData icon) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 6, top: 3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 13, color: const Color(0xFFBE185D)),
+          const SizedBox(width: 5),
+          Text('$label：',
+              style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: Color(0xFF9D174D))),
+          Expanded(
+            child: Text(value.trim().isEmpty ? '—' : value,
+                style: const TextStyle(fontSize: 11.5, color: Color(0xFF475569))),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future _toggleFocusDone(Map row) async {
+    final db = await AppDatabase.instance.database;
+    final int cur = (row['done'] as int?) ?? 0;
+    await db.update('focus_items', {'done': cur == 1 ? 0 : 1},
+        where: 'id = ?', whereArgs: [row['id'] as int]);
+    await AppDatabase.refreshFocusSignals(db, _date);
+    if (mounted) setState(() {});
+    return null;
+  }
+
+  Future _saveFocusNote(Map row, String text) async {
+    final db = await AppDatabase.instance.database;
+    await db.update('focus_items', {'note': text},
+        where: 'id = ?', whereArgs: [row['id'] as int]);
+    return null;
+  }
+
+  Future _deleteFocus(Map row) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: const Text('删除核心聚焦？'),
+        content: Text('「${row['title'] ?? ''}」将被删除，其乘数效应也会从帝国信号中退回。'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dctx, false), child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.pop(dctx, true), child: const Text('删除')),
+        ],
+      ),
+    );
+    if (ok != true) return null;
+    final db = await AppDatabase.instance.database;
+    await db.delete('focus_items', where: 'id = ?', whereArgs: [row['id'] as int]);
+    await AppDatabase.refreshFocusSignals(db, _date);
+    if (mounted) setState(() {});
+    return null;
+  }
+
+  Future _addOrEditFocusDialog([Map? existing]) async {
+    final titleCtrl = TextEditingController(text: existing == null ? '' : '${existing['title'] ?? ''}');
+    final nextCtrl = TextEditingController(text: existing == null ? '' : '${existing['next_step'] ?? ''}');
+    final critCtrl = TextEditingController(text: existing == null ? '' : '${existing['done_criteria'] ?? ''}');
+    final mulCtrl = TextEditingController(
+        text: existing == null ? '1.05' : '${existing['multiplier'] ?? 1.05}');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: Text(existing == null ? '新增核心聚焦' : '编辑核心聚焦'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(controller: titleCtrl, decoration: const InputDecoration(labelText: '聚焦 / 科技名称')),
+              const SizedBox(height: 6),
+              TextField(controller: nextCtrl, decoration: const InputDecoration(labelText: '下一步'), maxLines: 2, minLines: 1),
+              const SizedBox(height: 6),
+              TextField(controller: critCtrl, decoration: const InputDecoration(labelText: '完成标准'), maxLines: 2, minLines: 1),
+              const SizedBox(height: 6),
+              TextField(
+                controller: mulCtrl,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                decoration: const InputDecoration(
+                    labelText: '乘数效应（如 1.05，完成后连乘进帝国模块）'),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dctx, false), child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.pop(dctx, true), child: const Text('保存')),
+        ],
+      ),
+    );
+    if (ok != true) return null;
+    final title = titleCtrl.text.trim();
+    if (title.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('请填写聚焦名称')),
+        );
+      }
+      return null;
+    }
+    final parsed = double.tryParse(mulCtrl.text.trim()) ?? 1.0;
+    final double mul = parsed > 0 ? parsed : 1.0;
+    final db = await AppDatabase.instance.database;
+    if (existing == null) {
+      final cnt = await db.query('focus_items', where: 'date = ?', whereArgs: [_date]);
+      await db.insert('focus_items', {
+        'date': _date,
+        'title': title,
+        'next_step': nextCtrl.text.trim(),
+        'done_criteria': critCtrl.text.trim(),
+        'multiplier': mul,
+        'done': 0,
+        'note': '',
+        'rolled': 0,
+        'sort_order': cnt.length,
+        'created_at': DateTime.now().toIso8601String(),
+      });
+    } else {
+      await db.update('focus_items', {
+        'title': title,
+        'next_step': nextCtrl.text.trim(),
+        'done_criteria': critCtrl.text.trim(),
+        'multiplier': mul,
+      }, where: 'id = ?', whereArgs: [existing['id'] as int]);
+    }
+    await AppDatabase.refreshFocusSignals(db, _date);
+    if (mounted) setState(() {});
+    return null;
   }
 
   Widget _buildMajorSectionCard({
