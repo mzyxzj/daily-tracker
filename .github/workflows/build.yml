@@ -42,8 +42,15 @@ jobs:
           python3 /tmp/add_permission.py
           head -6 android/app/src/main/AndroidManifest.xml
 
-      - name: Verify DeepSeek service file survived flutter create
-        run: test -f lib/deepseek_service.dart && echo "deepseek_service.dart OK"
+      - name: Verify core files survived flutter create
+        run: |
+          test -f lib/deepseek_service.dart && echo "deepseek_service.dart OK"
+          test -f lib/deepseek_sheet.dart && echo "deepseek_sheet.dart OK"
+          test -f lib/empire_page.dart && echo "empire_page.dart OK"
+          test -f lib/empire_data.dart && echo "empire_data.dart OK"
+          test -f assets/images/realm_l07.png && echo "realm_l07.png OK"
+          test -f assets/data/empire_demo.json && echo "empire_demo.json OK"
+          grep -q "assets/images/realm_l07.png" pubspec.yaml && echo "assets declared OK"
 
       - name: Get dependencies
         run: flutter pub get
