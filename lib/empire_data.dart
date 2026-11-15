@@ -13,6 +13,57 @@ import 'empire_assets.dart';
 const double kEmpireBase = 500.0;
 const int kEmpireHorizon = 3650;
 
+// ============ 繁荣度规则常量（与《帝国规则》一致） ============
+/// 战争：当天全部打卡 **或** 按时复盘 → +50
+const int kWarGain = 50;
+
+/// 战争加成：打卡与复盘同时完成 → 额外 +100
+const int kBothBonus = 100;
+
+/// 科技突破：完成一条战略聚焦 → +500
+const int kTechGain = 500;
+
+/// 内政混乱：当天一卡没打 **且** 一条每日状态都没记录 → -100
+const int kChaosLoss = 100;
+
+/// 修养生息：两者仅发生其一 → 建设度 -10
+const int kRestLoss = 10;
+
+/// 系统修补上限
+const int kRepairMax = 5;
+
+/// 一天的原始信号（全部来自「今日」四个模块的真实记录）
+///
+/// 今日模块 → 帝国模块 的映射：
+///   日程打卡 schedule_records → 军队执行力（战争、内政混乱、修养生息）
+///   每日状态 status_records   → 秩序（内政混乱、修养生息、按时复盘）
+///   战略聚焦 focus_items      → 科技复利（科技突破 + 全局乘数）
+class EmpireDay {
+  final String date; // yyyy-MM-dd
+  final int schedTotal; // 当日日程总数
+  final int schedDone; // 当日已打卡数
+  final int statusCount; // 当日有效状态记录条数
+  final bool reviewDone; // 当日是否复盘
+  final int focusCount; // 当日完成的战略聚焦条数
+  final double focusMult; // 当日突破的科技乘数连乘
+  const EmpireDay({
+    required this.date,
+    required this.schedTotal,
+    required this.schedDone,
+    required this.statusCount,
+    required this.reviewDone,
+    required this.focusCount,
+    required this.focusMult,
+  });
+
+  /// 当天全部打卡
+  bool get allChecked => schedTotal > 0 && schedDone >= schedTotal;
+
+  bool get anyCheck => schedDone > 0;
+
+  bool get anyStatus => statusCount > 0;
+}
+
 /// 九级领地：门槛按 ×5 递增（与十年推演同一套尺子）
 const List<List<dynamic>> kEmpireLevels = [
   [1, '破败营地', 1000.0],
@@ -119,6 +170,23 @@ class EmpireState {
   final bool demo;
   final String startDate;
 
+  // ---- 真实数据联动统计（来自「今日」四个模块）----
+  final int daysTracked; // 已统计天数
+  final int warDays; // 战争（全部打卡 或 按时复盘）天数
+  final int chaosDays; // 内政混乱天数
+  final int restDays; // 修养生息天数
+  final int checkinDays; // 有打卡的天数
+  final int statusDays; // 有状态记录的天数
+  final int gainTotal; // 累计获取繁荣度
+  final int lossTotal; // 累计扣除繁荣度
+  final int warGain; // 战争累计获取
+  final int techGain; // 科技突破累计获取
+  final int chaosLoss; // 内政混乱累计扣除
+  final int restLoss; // 修养生息累计扣除
+  final int repairUsed; // 系统修补次数 0..5
+  final double techMult; // 当前科技复利连乘
+  final int focusDone; // 已完成战略聚焦总数
+
   const EmpireState({
     required this.levels,
     required this.dims,
@@ -131,7 +199,28 @@ class EmpireState {
     required this.dailyGain,
     required this.demo,
     required this.startDate,
+    this.daysTracked = 0,
+    this.warDays = 0,
+    this.chaosDays = 0,
+    this.restDays = 0,
+    this.checkinDays = 0,
+    this.statusDays = 0,
+    this.gainTotal = 0,
+    this.lossTotal = 0,
+    this.warGain = 0,
+    this.techGain = 0,
+    this.chaosLoss = 0,
+    this.restLoss = 0,
+    this.repairUsed = 0,
+    this.techMult = 1.0,
+    this.focusDone = 0,
   });
+
+  /// 打卡率
+  double get checkinRate => daysTracked > 0 ? checkinDays / daysTracked : 0;
+
+  /// 状态记录率
+  double get statusRate => daysTracked > 0 ? statusDays / daysTracked : 0;
 
   static List<EmpireLevel> _levels() =>
       kEmpireLevels.map((e) => EmpireLevel(e[0] as int, e[1] as String, e[2] as double)).toList();
@@ -168,17 +257,30 @@ class EmpireState {
     return copy.take(3).toList();
   }
 
-  /// 真实数据：由 focus_items 推演
-  static EmpireState build(List<EmpireFocus> rows, DateTime today) {
-    final List<EmpireFocus> done = rows.where((r) => r.done).toList()
+  /// 真实数据推演：繁荣度完全由「今日」四个模块的历史记录累加而成。
+  ///
+  /// 每日结算：
+  ///   · 战争      全部打卡 或 按时复盘            +50 × 科技复利
+  ///              打卡与复盘同时完成               +100 × 科技复利
+  ///   · 科技突破  完成一条战略聚焦                +500 × 科技复利
+  ///   · 内政混乱  一卡没打 且 一条状态都没记录     -100 × 科技复利
+  ///   · 修养生息  两者仅发生其一                  -10  × 科技复利
+  ///   · 繁荣度下限 0
+  /// 科技复利按「突破当日生效」逐日连乘，且只乘不加。
+  static EmpireState buildReal(
+      List<EmpireDay> dayInputs, List<EmpireFocus> focuses, DateTime today) {
+    final List<EmpireDay> days = List<EmpireDay>.from(dayInputs);
+    if (days.isEmpty) return const EmpireState.empty();
+    days.sort((a, b) => a.date.compareTo(b.date));
+
+    final DateTime start = _parseDate(days.first.date) ?? today;
+    final List<EmpireFocus> done = focuses.where((r) => r.done).toList()
       ..sort((a, b) {
         final c = a.date.compareTo(b.date);
         return c != 0 ? c : a.id.compareTo(b.id);
       });
 
-    if (done.isEmpty) return const EmpireState.empty();
-
-    final DateTime start = _parseDate(done.first.date) ?? today;
+    // 每条突破落在第几天（供维度/纪事用）
     final List<int> itemDay = [];
     for (final f in done) {
       final DateTime? d = _parseDate(f.date);
@@ -191,14 +293,76 @@ class EmpireState {
     final List<double> daily = List<double>.filled(kEmpireHorizon, 0);
     double wealth = 0;
     double mult = 1.0;
-    int cursor = 0;
-    for (int day = 1; day <= kEmpireHorizon; day++) {
-      while (cursor < done.length && itemDay[cursor] <= day) {
-        mult *= done[cursor].mult > 0 ? done[cursor].mult : 1.0;
-        cursor++;
+    int warDays = 0, chaosDays = 0, restDays = 0;
+    int checkinDays = 0, statusDays = 0;
+    int gainTotal = 0, lossTotal = 0;
+    int warTotalGain = 0, techTotalGain = 0;
+    int chaosTotalLoss = 0, restTotalLoss = 0;
+    int lastIdx = 0;
+    final List<EmpireEvent> events = [];
+
+    for (final d in days) {
+      final DateTime? dd = _parseDate(d.date);
+      int idx = dd == null ? lastIdx : dd.difference(start).inDays;
+      if (idx < 0) idx = 0;
+      if (idx >= kEmpireHorizon) idx = kEmpireHorizon - 1;
+      // 缺口填平（理论上日期连续，这里防御）
+      for (int k = lastIdx + 1; k < idx; k++) {
+        daily[k] = wealth;
       }
-      wealth += kEmpireBase * mult;
-      daily[day - 1] = wealth;
+
+      // 科技复利：突破当日生效
+      if (d.focusCount > 0 && d.focusMult > 1.0) mult *= d.focusMult;
+
+      final bool allChecked = d.allChecked;
+      final bool review = d.reviewDone;
+      final bool anyCheck = d.anyCheck;
+      final bool anyStatus = d.anyStatus;
+
+      double g = 0;
+      if (allChecked || review) {
+        final int v = (kWarGain * mult).round();
+        g += v;
+        warTotalGain += v;
+        warDays++;
+      }
+      if (allChecked && review) {
+        final int v = (kBothBonus * mult).round();
+        g += v;
+        warTotalGain += v;
+      }
+      if (d.focusCount > 0) {
+        final int v = (kTechGain * d.focusCount * mult).round();
+        g += v;
+        techTotalGain += v;
+      }
+
+      if (!anyCheck && !anyStatus) {
+        final int v = (kChaosLoss * mult).round();
+        g -= v;
+        chaosTotalLoss += v;
+        chaosDays++;
+      } else if (!anyCheck || !anyStatus) {
+        final int v = (kRestLoss * mult).round();
+        g -= v;
+        restTotalLoss += v;
+        restDays++;
+      }
+      if (anyCheck) checkinDays++;
+      if (anyStatus) statusDays++;
+
+      final int gi = g.round();
+      if (gi >= 0) {
+        gainTotal += gi;
+      } else {
+        lossTotal += -gi;
+      }
+      wealth = math.max(0.0, wealth + gi);
+      daily[idx] = wealth;
+      lastIdx = idx;
+    }
+    for (int i = lastIdx + 1; i < kEmpireHorizon; i++) {
+      daily[i] = wealth;
     }
 
     int dayNow = today.difference(start).inDays + 1;
@@ -206,7 +370,10 @@ class EmpireState {
     if (dayNow > kEmpireHorizon) dayNow = kEmpireHorizon;
 
     final List<EmpireLevel> levels = _levels();
+
+    // 晋阶（黄线）判定 —— 同时驱动「系统修补次数」
     final List<EmpireMilestone> miles = [];
+    int repairUsed = 0;
     for (final l in levels) {
       int hit = 0;
       for (int i = 0; i < daily.length; i++) {
@@ -216,9 +383,11 @@ class EmpireState {
         }
       }
       miles.add(EmpireMilestone(l.index, hit));
+      if (hit > 0) repairUsed++;
     }
+    if (repairUsed > kRepairMax) repairUsed = kRepairMax;
 
-    // 维度聚合
+    // 维度聚合（科技复利来源）
     final Map<String, List<EmpireFocus>> groups = {};
     for (final f in done) {
       groups.putIfAbsent(f.dim, () => []).add(f);
@@ -249,7 +418,8 @@ class EmpireState {
       composite *= cum;
       doneCount += items.length;
       final EmpireFocus last = items.last;
-      final int lastDay = itemDay[done.indexOf(last)] >= 1 ? itemDay[done.indexOf(last)] : 1;
+      final int lastDay =
+          itemDay[done.indexOf(last)] >= 1 ? itemDay[done.indexOf(last)] : 1;
       dims.add(EmpireDim(
         name: entry.key,
         count: items.length,
@@ -266,15 +436,24 @@ class EmpireState {
     dims.sort((a, b) => b.cum.compareTo(a.cum));
 
     // 纪事
-    final List<EmpireEvent> events = [];
     for (int i = 0; i < done.length; i++) {
-      events.add(EmpireEvent(itemDay[i], 'tech', done[i].step, '×${done[i].mult.toStringAsFixed(3)}'));
+      events.add(EmpireEvent(itemDay[i], 'tech', done[i].step,
+          '×${done[i].mult.toStringAsFixed(3)}'));
     }
     for (final m in miles) {
       if (m.day > 0) {
-        final l = levels[m.day == 0 ? 0 : m.level - 1];
+        final l = levels[m.level - 1];
         events.add(EmpireEvent(m.day, 'level', '晋入 L${m.level} · ${l.name}', 'L${m.level}'));
       }
+    }
+    if (chaosDays > 0) {
+      events.add(EmpireEvent(dayNow, 'chaos', '内政混乱 $chaosDays 日', '-${fmtInt(lossTotal)}'));
+    }
+    if (restDays > 0) {
+      events.add(EmpireEvent(dayNow, 'rest', '修养生息 $restDays 日', '-${fmtInt(restTotalLoss)}'));
+    }
+    if (warDays > 0) {
+      events.add(EmpireEvent(dayNow, 'war', '战争 $warDays 日', '+${fmtInt(warTotalGain)}'));
     }
     events.sort((a, b) => b.day.compareTo(a.day));
 
@@ -291,6 +470,21 @@ class EmpireState {
       dailyGain: gain,
       demo: false,
       startDate: '${start.year}-${_two(start.month)}-${_two(start.day)}',
+      daysTracked: days.length,
+      warDays: warDays,
+      chaosDays: chaosDays,
+      restDays: restDays,
+      checkinDays: checkinDays,
+      statusDays: statusDays,
+      gainTotal: gainTotal,
+      lossTotal: lossTotal,
+      warGain: warTotalGain,
+      techGain: techTotalGain,
+      chaosLoss: chaosTotalLoss,
+      restLoss: restTotalLoss,
+      repairUsed: repairUsed,
+      techMult: mult,
+      focusDone: done.length,
     );
   }
 
@@ -305,7 +499,22 @@ class EmpireState {
         dayNow = 1,
         dailyGain = 0,
         demo = false,
-        startDate = '';
+        startDate = '',
+        daysTracked = 0,
+        warDays = 0,
+        chaosDays = 0,
+        restDays = 0,
+        checkinDays = 0,
+        statusDays = 0,
+        gainTotal = 0,
+        lossTotal = 0,
+        warGain = 0,
+        techGain = 0,
+        chaosLoss = 0,
+        restLoss = 0,
+        repairUsed = 0,
+        techMult = 1,
+        focusDone = 0;
 
   /// 示例数据（本地库还没有「已突破」的下一步时用来撑起界面）
   ///
