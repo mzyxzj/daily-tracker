@@ -98,10 +98,7 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
   Future<void> _load() async {
     EmpireState s;
     try {
-      final List<Map> rows = List<Map>.from(await widget.db.query('focus_items'));
-      final List<EmpireFocus> items = rows.map((r) => EmpireFocus.fromRow(r)).toList();
-      s = EmpireState.build(items, DateTime.now());
-      if (s.doneCount == 0) s = await EmpireState.loadDemo();
+      s = await _buildFromToday();
     } catch (_) {
       s = await EmpireState.loadDemo();
     }
@@ -111,6 +108,108 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
         _loading = false;
       });
     }
+  }
+
+  /// 把「今日」四个模块的历史记录汇总成帝国每日信号。
+  ///
+  ///   schedule_records → 打卡 / 战争 / 内政混乱 / 修养生息
+  ///   status_records   → 每日状态 / 按时复盘
+  ///   focus_items      → 科技突破 / 科技复利乘数
+  Future<EmpireState> _buildFromToday() async {
+    final Database db = widget.db;
+
+    // 1) 日程打卡：按日汇总
+    final Map<String, int> schedTotal = {};
+    final Map<String, int> schedDone = {};
+    final schedRows = await db.rawQuery(
+        'SELECT date, COUNT(*) AS total, SUM(CASE WHEN done = 1 THEN 1 ELSE 0 END) AS dn '
+        'FROM schedule_records GROUP BY date');
+    for (final r in schedRows) {
+      final String d = '${r['date']}';
+      schedTotal[d] = (r['total'] as num?)?.toInt() ?? 0;
+      schedDone[d] = (r['dn'] as num?)?.toInt() ?? 0;
+    }
+
+    // 2) 每日状态：按日汇总有效记录条数
+    final Map<String, int> statusCount = {};
+    final statRows = await db.rawQuery(
+        "SELECT date, COUNT(*) AS c FROM status_records "
+        "WHERE value IS NOT NULL AND value != '' GROUP BY date");
+    for (final r in statRows) {
+      statusCount['${r['date']}'] = (r['c'] as num?)?.toInt() ?? 0;
+    }
+
+    // 3) 按时复盘：优先匹配「复盘 / 总结 / 反思」类状态项
+    final List<Map> items = List<Map>.from(await db.query('status_items'));
+    final List<int> reviewIds = [];
+    for (final it in items) {
+      if ('${it['type']}' == 'image') continue;
+      final String nm = '${it['name'] ?? ''}';
+      if (nm.contains('复盘') || nm.contains('总结') || nm.contains('反思')) {
+        reviewIds.add((it['id'] as num).toInt());
+      }
+    }
+    final Set<String> reviewDates = {};
+    if (reviewIds.isNotEmpty) {
+      final String ph = List.filled(reviewIds.length, '?').join(',');
+      final rr = await db.rawQuery(
+          "SELECT date, COUNT(*) AS c FROM status_records "
+          "WHERE value IS NOT NULL AND value != '' AND item_id IN ($ph) GROUP BY date",
+          reviewIds);
+      for (final r in rr) {
+        reviewDates.add('${r['date']}');
+      }
+    }
+
+    // 4) 战略聚焦：科技突破 + 科技复利
+    final List<Map> fRows = List<Map>.from(await db.query('focus_items'));
+    final List<EmpireFocus> focuses =
+        fRows.map((r) => EmpireFocus.fromRow(r)).toList();
+    final Map<String, int> focusCount = {};
+    final Map<String, double> focusMult = {};
+    for (final f in focuses) {
+      if (!f.done) continue;
+      focusCount[f.date] = (focusCount[f.date] ?? 0) + 1;
+      focusMult[f.date] = (focusMult[f.date] ?? 1.0) * (f.mult > 0 ? f.mult : 1.0);
+    }
+
+    // 5) 时间轴：从最早记录日到今天，逐日结算
+    final Set<String> allDates = {}
+      ..addAll(schedTotal.keys)
+      ..addAll(statusCount.keys)
+      ..addAll(focusCount.keys);
+    if (allDates.isEmpty) return EmpireState.loadDemo();
+
+    final List<String> sorted = allDates.toList()..sort();
+    DateTime start = DateTime.parse(sorted.first);
+    final DateTime today = DateTime.now();
+    final DateTime end = DateTime(today.year, today.month, today.day);
+    if (start.isAfter(end)) start = end;
+
+    final List<EmpireDay> days = [];
+    final bool hasReviewItem = reviewIds.isNotEmpty;
+    for (DateTime d = start;
+        !d.isAfter(end);
+        d = d.add(const Duration(days: 1))) {
+      final String key = '${d.year.toString().padLeft(4, '0')}-'
+          '${d.month.toString().padLeft(2, '0')}-'
+          '${d.day.toString().padLeft(2, '0')}';
+      final int st = schedTotal[key] ?? 0;
+      final int sd = schedDone[key] ?? 0;
+      final int sc = statusCount[key] ?? 0;
+      days.add(EmpireDay(
+        date: key,
+        schedTotal: st,
+        schedDone: sd,
+        statusCount: sc,
+        // 有复盘项就按复盘项算；没定义复盘项时，当天有状态记录即视为完成复盘
+        reviewDone: hasReviewItem ? reviewDates.contains(key) : sc > 0,
+        focusCount: focusCount[key] ?? 0,
+        focusMult: focusMult[key] ?? 1.0,
+      ));
+    }
+
+    return EmpireState.buildReal(days, focuses, today);
   }
 
   @override
@@ -141,6 +240,7 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
                             _stage(s),
                             const SizedBox(height: 2),
                             _params(s),
+                            _linkCard(s),
                             _chronicle(s),
                           ],
                         ),
@@ -166,7 +266,7 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
             children: [
               Text('D ${fmtInt(s.dayNow)}', style: mono(10, color: kInk2, w: FontWeight.w600, ls: 1.2)),
               const SizedBox(height: 3),
-              Text(s.demo ? '示例推演' : '十年推演', style: mono(9, color: kMute, ls: 1.1)),
+              Text(s.demo ? '示例推演' : '真实联动', style: mono(9, color: kMute, ls: 1.1)),
             ],
           ),
         ],
@@ -396,6 +496,84 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
     );
   }
 
+  /// 今日四模块 → 帝国的实时联动看板
+  Widget _linkCard(EmpireState s) {
+    const Color cGain = Color(0xFF2F5D62);
+    const Color cLoss = Color(0xFFA9523C);
+
+    Widget cell(String k, String v, Color c) => Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(k, style: mono(8.5, color: kMute, ls: 0.8)),
+              const SizedBox(height: 3),
+              FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: Alignment.centerLeft,
+                child: Text(v, style: mono(12, color: c, w: FontWeight.w600, ls: 0.2)),
+              ),
+            ],
+          ),
+        );
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+      decoration: BoxDecoration(
+        color: kCard,
+        borderRadius: BorderRadius.circular(17),
+        border: Border.all(color: kLine),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('今日联动', style: mono(9.5, color: kSub, w: FontWeight.w600, ls: 1.3)),
+              const Spacer(),
+              Text('${s.daysTracked} 日结算 · 修补 ${s.repairUsed}/$kRepairMax',
+                  style: mono(8.5, color: kMute, ls: 0.4)),
+            ],
+          ),
+          const SizedBox(height: 11),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              cell('日程打卡',
+                  '${s.checkinDays}/${s.daysTracked} 日 · ${(s.checkinRate * 100).toStringAsFixed(0)}%', kInk),
+              cell('每日状态',
+                  '${s.statusDays} 日 · ${(s.statusRate * 100).toStringAsFixed(0)}%', kInk),
+            ],
+          ),
+          const SizedBox(height: 11),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              cell('战略聚焦', '${s.focusDone} 项 · ×${s.techMult.toStringAsFixed(3)}', kInk),
+              cell('战争', '${s.warDays} 日 · +${fmtInt(s.warGain)}', cGain),
+            ],
+          ),
+          const SizedBox(height: 11),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              cell('内政混乱', '${s.chaosDays} 日 · -${fmtInt(s.chaosLoss)}', cLoss),
+              cell('修养生息', '${s.restDays} 日 · -${fmtInt(s.restLoss)}', cLoss),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Container(height: 1, color: kLine2),
+          const SizedBox(height: 9),
+          Text(
+            '繁荣度 = 战争(50/150) + 科技突破(500×复利) − 混乱(100) − 修养(10)，'
+            '逐日取自「今日」的日程、状态与战略聚焦，改一项这里立刻跟着变。',
+            style: mono(8, color: kMute, ls: 0.2),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _cardShell({required Widget child, required VoidCallback onTap}) {
     return GestureDetector(
       onTap: onTap,
@@ -441,10 +619,8 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
               crossAxisAlignment: CrossAxisAlignment.baseline,
               textBaseline: TextBaseline.alphabetic,
               children: [
-                Text(fmtWan(s.wealth),
+                Text(fmtMoney(s.wealth),
                     style: sans(28, w: FontWeight.w600, ls: -1.1, h: 1.0)),
-                const SizedBox(width: 2),
-                Text('万', style: sans(11, color: kSub, w: FontWeight.w600)),
               ],
             ),
           ),
@@ -781,11 +957,9 @@ class _ProsperityPageState extends State<ProsperityPage> {
             crossAxisAlignment: CrossAxisAlignment.baseline,
             textBaseline: TextBaseline.alphabetic,
             children: [
-              Text(fmtWan(s.wealth), style: sans(40, w: FontWeight.w600, ls: -1.8, h: 0.95)),
-              const SizedBox(width: 3),
-              Text('万', style: sans(14, color: kInk2, w: FontWeight.w600)),
+              Text(fmtMoney(s.wealth), style: sans(40, w: FontWeight.w600, ls: -1.8, h: 0.95)),
               const SizedBox(width: 6),
-              Text('十年终局', style: mono(9, color: kMute, ls: 1.1)),
+              Text('当前疆域', style: mono(9, color: kMute, ls: 1.1)),
             ],
           ),
           const SizedBox(height: 11),
