@@ -21,3 +21,6 @@ dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/images/realm_l07.png
+    - assets/data/empire_demo.json
