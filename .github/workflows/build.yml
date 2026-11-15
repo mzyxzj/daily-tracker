@@ -23,6 +23,28 @@ jobs:
           mv pubspec.yaml.bak pubspec.yaml
           mv main.dart.bak lib/main.dart
 
+      # DeepSeek 反思分析改为 App 内直接调用 HTTPS API，
+      # release 包的 main AndroidManifest 默认不带 INTERNET 权限，需在此注入。
+      - name: Grant INTERNET permission for DeepSeek API
+        run: |
+          cat > /tmp/add_permission.py <<'PY'
+          import re
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          if 'android.permission.INTERNET' not in s:
+              perm = '    <uses-permission android:name="android.permission.INTERNET"/>'
+              s = re.sub(r'(<manifest[^>]*>)', lambda m: m.group(1) + '\n' + perm, s, count=1)
+              open(p, 'w', encoding='utf-8').write(s)
+              print('INTERNET permission added')
+          else:
+              print('INTERNET permission already present')
+          PY
+          python3 /tmp/add_permission.py
+          head -6 android/app/src/main/AndroidManifest.xml
+
+      - name: Verify DeepSeek service file survived flutter create
+        run: test -f lib/deepseek_service.dart && echo "deepseek_service.dart OK"
+
       - name: Get dependencies
         run: flutter pub get
 
