@@ -16,12 +16,14 @@ jobs:
       - name: Generate Android shell in temp dir
         run: |
           set -e
-          cd "$RUNNER_TEMP"
-          rm -rf shell
-          flutter create --project-name daily_tracker --platforms android shell > /dev/null
+          SHELL_DIR="$RUNNER_TEMP/shell"
+          rm -rf "$SHELL_DIR"
+          flutter create --project-name daily_tracker --platforms android "$SHELL_DIR" > /dev/null
+          test -d "$SHELL_DIR/android"
           rm -rf "$GITHUB_WORKSPACE/android"
-          cp -r shell/android "$GITHUB_WORKSPACE/android"
-          test -f android/app/build.gradle.kts || test -f android/app/build.gradle
+          cp -r "$SHELL_DIR/android" "$GITHUB_WORKSPACE/android"
+          test -f "$GITHUB_WORKSPACE/android/app/build.gradle.kts" \
+            || test -f "$GITHUB_WORKSPACE/android/app/build.gradle"
           echo "android/ generated from template"
 
       # 防御：资源已改为 Dart 常量，不再需要 asset bundle。
