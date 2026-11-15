@@ -368,20 +368,26 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
                   child: ShaderMask(
                     blendMode: BlendMode.dstIn,
                     shaderCallback: (Rect r) => RadialGradient(
-                      radius: 0.52,
-                      stops: const [0.60, 0.78, 0.92],
+                      radius: 0.80,
+                      stops: const [0.84, 0.94, 1.0],
                       colors: [
                         Colors.black,
-                        Colors.black.withOpacity(0.55),
+                        Colors.black.withOpacity(0.62),
                         Colors.black.withOpacity(0),
                       ],
                     ).createShader(r),
-                    child: Image.memory(
-                      realmL07Bytes,
-                      width: 340 * (0.90 + 0.014 * lv.index),
-                      fit: BoxFit.contain,
-                      gaplessPlayback: true,
-                      filterQuality: FilterQuality.high,
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 520),
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      child: Image.memory(
+                        realmBytes(lv.index),
+                        key: ValueKey<int>(lv.index),
+                        width: 340 * (0.90 + 0.014 * lv.index),
+                        fit: BoxFit.contain,
+                        gaplessPlayback: true,
+                        filterQuality: FilterQuality.high,
+                      ),
                     ),
                   ),
                 ),
