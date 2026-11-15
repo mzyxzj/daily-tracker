@@ -13,6 +13,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:sqflite/sqflite.dart';
 import 'pages_extra.dart';
+import 'deepseek_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -604,136 +605,280 @@ class _TodayPageState extends State<TodayPage> {
     if (mounted) setState(() {});
     return null;
   }
-  Future _openGeminiAnalyzerSheet(String summaryText) async {
-    final rawCfg = await AppDatabase.getUiState(widget.db, 'gemini_ai_config');
+  Future _openDeepSeekAnalyzerSheet(String summaryText) async {
+    final rawCfg = await AppDatabase.getUiState(widget.db, 'deepseek_ai_config');
     final Map cfg = {
-      'model': 'gemini-3.1-pro',
-      'mode': 'gem',
+      'model': 'deepseek-flash',
+      'effort': 'high',
+      'jsonMode': false,
       'gemName': '每日状态系统分析师',
       'gemPrompt': '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条格式如“标题：具体分析”。',
       'targetField': 'AI 深度异状分析',
     };
-    if (rawCfg != null && (rawCfg as String).isNotEmpty) {
+    if (rawCfg != null && rawCfg.toString().isNotEmpty) {
       try {
         cfg.addAll(jsonDecode(rawCfg) as Map);
       } catch (_) {}
+    } else {
+      // 首次使用时，把旧版 Gemini 面板里保存过的角色 / 指令 / 导出条目迁移过来
+      final rawOld = await AppDatabase.getUiState(widget.db, 'gemini_ai_config');
+      if (rawOld != null && rawOld.toString().isNotEmpty) {
+        try {
+          final Map old = jsonDecode(rawOld) as Map;
+          if (old['gemName'] != null) cfg['gemName'] = old['gemName'];
+          if (old['gemPrompt'] != null) cfg['gemPrompt'] = old['gemPrompt'];
+          if (old['targetField'] != null) cfg['targetField'] = old['targetField'];
+        } catch (_) {}
+      }
     }
 
     if (!mounted) return null;
-    final gemNameCtrl = TextEditingController(text: '${cfg['gemName']}');
-    final gemPromptCtrl = TextEditingController(text: '${cfg['gemPrompt']}');
-    final targetFieldCtrl = TextEditingController(text: '${cfg['targetField']}');
+    // 密钥独立存放，不写进 ui_states，避免被自带的备份功能打包外传
+    String savedKey = await DeepSeekKeyStore.read();
+    if (savedKey.isEmpty && cfg['apiKey'] != null && cfg['apiKey'].toString().isNotEmpty) {
+      savedKey = cfg['apiKey'].toString();
+      await DeepSeekKeyStore.write(savedKey);
+    }
+    final apiKeyCtrl = TextEditingController(text: savedKey);
+    final gemNameCtrl = TextEditingController(text: (cfg['gemName'] ?? '').toString());
+    final gemPromptCtrl = TextEditingController(text: (cfg['gemPrompt'] ?? '').toString());
+    final targetFieldCtrl = TextEditingController(text: (cfg['targetField'] ?? '').toString());
     final resultCtrl = TextEditingController();
-    String selectedModel = '${cfg['model']}';
-    String selectedMode = '${cfg['mode']}';
+    String selectedModel = DeepSeekConfig.models.contains('${cfg['model']}')
+        ? '${cfg['model']}'
+        : 'deepseek-flash';
+    String selectedEffort = DeepSeekConfig.efforts.contains('${cfg['effort']}')
+        ? '${cfg['effort']}'
+        : 'high';
+    bool jsonMode = cfg['jsonMode'] == true || cfg['jsonMode'] == 'true';
+    bool showKey = false;
+    bool isRunning = false;
+    String reasoningText = '';
+    String statusText = '';
+    String usageText = '';
+    DeepSeekCall? currentCall;
 
     Future saveCurrentConfig() async {
       final newCfg = {
         'model': selectedModel,
-        'mode': selectedMode,
+        'effort': selectedEffort,
+        'jsonMode': jsonMode,
         'gemName': gemNameCtrl.text.trim(),
         'gemPrompt': gemPromptCtrl.text.trim(),
-        'targetField': targetFieldCtrl.text.trim().isEmpty ? 'AI 深度异状分析' : targetFieldCtrl.text.trim(),
+        'targetField': targetFieldCtrl.text.trim().isEmpty
+            ? 'AI 深度异状分析'
+            : targetFieldCtrl.text.trim(),
       };
-      await AppDatabase.setUiState(widget.db, 'gemini_ai_config', jsonEncode(newCfg));
+      await DeepSeekKeyStore.write(apiKeyCtrl.text.trim());
+      await AppDatabase.setUiState(widget.db, 'deepseek_ai_config', jsonEncode(newCfg));
       return null;
     }
 
-    String buildFullPrompt() {
-      final header = selectedMode == 'gem'
-          ? '【当前启用 Gem：${gemNameCtrl.text.trim()} | 模型：$selectedModel】\n${gemPromptCtrl.text.trim()}\n\n'
-          : '【模型：$selectedModel】\n请客观分析以下今日状态并给出分条建议：\n\n';
-      return '$header$summaryText';
+    String buildSystemPrompt() {
+      final role = gemNameCtrl.text.trim();
+      final instr = gemPromptCtrl.text.trim();
+      final base = role.isEmpty ? instr : '你是「$role」。$instr';
+      if (!jsonMode) return base;
+      return '$base\n\n【输出格式要求】必须输出严格的 json，形如：'
+          '{"items":[{"title":"生理与能量机制复盘","analysis":"具体分析"}]}。'
+          '只输出 json 对象，不要 Markdown 代码块，不要额外说明。';
     }
 
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setS) => DraggableScrollableSheet(
-          expand: false,
-          initialChildSize: 0.88,
-          maxChildSize: 0.96,
-          builder: (_, sc) => Padding(
-            padding: EdgeInsets.fromLTRB(16, 14, 16, MediaQuery.of(ctx).viewInsets.bottom + 14),
-            child: ListView(
-              controller: sc,
-              children: [
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(6),
-                      decoration: BoxDecoration(
-                        gradient: const LinearGradient(colors: [Color(0xFF4F46E5), Color(0xFF9333EA)]),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: const Icon(Icons.auto_awesome, color: Colors.white, size: 18),
-                    ),
-                    const SizedBox(width: 8),
-                    const Expanded(
-                      child: Text('Gemini 今日状态智能分析', style: TextStyle(fontSize: 16.5, fontWeight: FontWeight.bold)),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.close, size: 20),
-                      onPressed: () => Navigator.pop(ctx),
-                    ),
-                  ],
+        builder: (ctx, setS) {
+          Future runAnalysis() async {
+            if (isRunning) return null;
+            await saveCurrentConfig();
+            setS(() {
+              isRunning = true;
+              resultCtrl.text = '';
+              reasoningText = '';
+              usageText = '';
+              statusText = '正在连接 DeepSeek…';
+            });
+            final call = DeepSeekCall();
+            currentCall = call;
+            try {
+              final res = await call.run(
+                config: DeepSeekConfig(
+                  apiKey: apiKeyCtrl.text.trim(),
+                  model: selectedModel,
+                  effort: selectedEffort,
+                  jsonMode: jsonMode,
                 ),
-                const SizedBox(height: 4),
-                const Text('💡 自动记忆上次选用的模型、对话模式与 Gem 设定，支持一键复制今日状态并拉起外部 Gemini', style: TextStyle(fontSize: 11.5, color: Colors.grey)),
-                const Divider(height: 16),
-                Row(
-                  children: [
-                    Expanded(
-                      flex: 5,
-                      child: DropdownButtonFormField(
-                        value: ['gemini-3.1-pro', 'gemini-2.5-pro', 'gemini-2.5-flash'].contains(selectedModel)
-                            ? selectedModel
-                            : 'gemini-3.1-pro',
-                        isExpanded: true,
-                        decoration: const InputDecoration(
-                          labelText: '选择模型 (Model)',
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                          contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                systemPrompt: buildSystemPrompt(),
+                userPrompt: '以下是我今日的状态记录，请据此进行反思分析：\n\n$summaryText',
+                stream: true,
+                onDelta: (c, r) {
+                  if (!ctx.mounted || call.cancelled) return;
+                  setS(() {
+                    reasoningText = r;
+                    resultCtrl.text = c;
+                    statusText = 'DeepSeek 正在生成反思分析…';
+                  });
+                },
+              );
+              if (call.cancelled || !ctx.mounted) return null;
+              String finalText = res.content.trim();
+              if (jsonMode && finalText.isNotEmpty) {
+                final lines = DeepSeekCall.structuredToLines(finalText);
+                if (lines != null) finalText = lines;
+              }
+              final u = res.usage;
+              final usage = u == null
+                  ? ''
+                  : '　输入 ${u['prompt_tokens'] ?? '-'} / 输出 ${u['completion_tokens'] ?? '-'} tokens';
+              setS(() {
+                resultCtrl.text = finalText.isEmpty
+                    ? '⚠️ 模型未返回有效内容，请重试或改用非结构化输出。'
+                    : finalText;
+                reasoningText = res.reasoning;
+                usageText = usage;
+                statusText = finalText.isEmpty ? '未获得有效结果' : '分析完成 · 可导出到每日状态';
+              });
+            } on DeepSeekException catch (e) {
+              if (call.cancelled || !ctx.mounted) return null;
+              setS(() {
+                resultCtrl.text = '⚠️ ${e.message}';
+                statusText = '调用失败';
+              });
+            } catch (e) {
+              if (call.cancelled || !ctx.mounted) return null;
+              setS(() {
+                resultCtrl.text = '⚠️ 调用失败：$e';
+                statusText = '调用失败';
+              });
+            } finally {
+              currentCall = null;
+              if (ctx.mounted) setS(() => isRunning = false);
+            }
+            return null;
+          }
+
+          return DraggableScrollableSheet(
+            expand: false,
+            initialChildSize: 0.9,
+            maxChildSize: 0.97,
+            builder: (_, sc) => Padding(
+              padding: EdgeInsets.fromLTRB(16, 14, 16, MediaQuery.of(ctx).viewInsets.bottom + 14),
+              child: ListView(
+                controller: sc,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1D4ED8),
+                          borderRadius: BorderRadius.circular(8),
                         ),
-                        items: const [
-                          DropdownMenuItem(value: 'gemini-3.1-pro', child: Text('Gemini 3.1 Pro', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold))),
-                          DropdownMenuItem(value: 'gemini-2.5-pro', child: Text('Gemini 2.5 Pro', style: TextStyle(fontSize: 13))),
-                          DropdownMenuItem(value: 'gemini-2.5-flash', child: Text('Gemini 2.5 Flash', style: TextStyle(fontSize: 13))),
-                        ],
-                        onChanged: (v) {
-                          setS(() => selectedModel = '$v');
-                          saveCurrentConfig();
-                        },
+                        child: const Icon(Icons.psychology, color: Colors.white, size: 18),
+                      ),
+                      const SizedBox(width: 8),
+                      const Expanded(
+                        child: Text('DeepSeek 今日状态反思分析',
+                            style: TextStyle(fontSize: 16.5, fontWeight: FontWeight.bold)),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.close, size: 20),
+                        onPressed: () => Navigator.pop(ctx),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                      'App 内直接调用 DeepSeek API，无需跳转；支持深度思考、结构化输出与流式生成。API Key 仅存于本机独立文件，不随备份导出。',
+                      style: TextStyle(fontSize: 11.5, color: Colors.grey)),
+                  const Divider(height: 16),
+                  TextField(
+                    controller: apiKeyCtrl,
+                    obscureText: !showKey,
+                    style: const TextStyle(fontSize: 13),
+                    decoration: InputDecoration(
+                      labelText: 'DeepSeek API Key（sk-…）',
+                      border: const OutlineInputBorder(),
+                      isDense: true,
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                      suffixIcon: IconButton(
+                        icon: Icon(showKey ? Icons.visibility_off : Icons.visibility, size: 18),
+                        onPressed: () => setS(() => showKey = !showKey),
                       ),
                     ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      flex: 4,
-                      child: DropdownButtonFormField(
-                        value: selectedMode == 'chat' ? 'chat' : 'gem',
-                        isExpanded: true,
-                        decoration: const InputDecoration(
-                          labelText: '会话类型',
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                          contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    onChanged: (_) => saveCurrentConfig(),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        flex: 5,
+                        child: DropdownButtonFormField(
+                          value: selectedModel,
+                          isExpanded: true,
+                          decoration: const InputDecoration(
+                            labelText: '模型 (Model)',
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                            contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                          ),
+                          items: const [
+                            DropdownMenuItem(
+                                value: 'deepseek-flash',
+                                child: Text('deepseek-flash · 快速',
+                                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold))),
+                            DropdownMenuItem(
+                                value: 'deepseek-v4-pro',
+                                child: Text('deepseek-v4-pro · 深度',
+                                    style: TextStyle(fontSize: 12))),
+                          ],
+                          onChanged: (v) {
+                            setS(() => selectedModel = '$v');
+                            saveCurrentConfig();
+                          },
                         ),
-                        items: const [
-                          DropdownMenuItem(value: 'gem', child: Text('💎 专属 Gem', style: TextStyle(fontSize: 13))),
-                          DropdownMenuItem(value: 'chat', child: Text('💬 普通对话', style: TextStyle(fontSize: 13))),
-                        ],
-                        onChanged: (v) {
-                          setS(() => selectedMode = '$v');
-                          saveCurrentConfig();
-                        },
                       ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                if (selectedMode == 'gem') ...[
+                      const SizedBox(width: 8),
+                      Expanded(
+                        flex: 4,
+                        child: DropdownButtonFormField(
+                          value: selectedEffort,
+                          isExpanded: true,
+                          decoration: const InputDecoration(
+                            labelText: '反思深度 / 思考模式',
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                            contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                          ),
+                          items: const [
+                            DropdownMenuItem(value: 'disabled', child: Text('关闭思考（最快）', style: TextStyle(fontSize: 12))),
+                            DropdownMenuItem(value: 'low', child: Text('low · 简要', style: TextStyle(fontSize: 12))),
+                            DropdownMenuItem(value: 'high', child: Text('high · 标准（默认）', style: TextStyle(fontSize: 12))),
+                            DropdownMenuItem(value: 'max', child: Text('max · 最深', style: TextStyle(fontSize: 12))),
+                          ],
+                          onChanged: (v) {
+                            setS(() => selectedEffort = '$v');
+                            saveCurrentConfig();
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    title: const Text('结构化 JSON 输出', style: TextStyle(fontSize: 12.5)),
+                    subtitle: const Text('开启后自动整理为「标题：分析」多栏，便于导出',
+                        style: TextStyle(fontSize: 10.5, color: Colors.grey)),
+                    value: jsonMode,
+                    onChanged: (v) {
+                      setS(() => jsonMode = v);
+                      saveCurrentConfig();
+                    },
+                  ),
+                  const Divider(height: 12),
                   Row(
                     children: [
                       Expanded(
@@ -741,7 +886,7 @@ class _TodayPageState extends State<TodayPage> {
                           controller: gemNameCtrl,
                           style: const TextStyle(fontSize: 13),
                           decoration: const InputDecoration(
-                            labelText: 'Gem 名称 / 预设角色',
+                            labelText: '分析角色 / 预设名称',
                             border: OutlineInputBorder(),
                             isDense: true,
                             contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -751,7 +896,7 @@ class _TodayPageState extends State<TodayPage> {
                       ),
                       const SizedBox(width: 6),
                       PopupMenuButton(
-                        tooltip: '快速切换常用 Gem 预设',
+                        tooltip: '快速切换常用分析预设',
                         child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                           decoration: BoxDecoration(
@@ -764,7 +909,7 @@ class _TodayPageState extends State<TodayPage> {
                             children: [
                               Icon(Icons.bookmarks_outlined, size: 15, color: Color(0xFF4F46E5)),
                               SizedBox(width: 4),
-                              Text('预设Gem', style: TextStyle(fontSize: 12, color: Color(0xFF4F46E5), fontWeight: FontWeight.bold)),
+                              Text('分析预设', style: TextStyle(fontSize: 12, color: Color(0xFF4F46E5), fontWeight: FontWeight.bold)),
                             ],
                           ),
                         ),
@@ -782,21 +927,21 @@ class _TodayPageState extends State<TodayPage> {
                               'name': '客观理性系统分析师',
                               'prompt': '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条格式如“标题：具体分析”。',
                             },
-                            child: Text('💎 客观理性系统分析师'),
+                            child: Text('客观理性系统分析师'),
                           ),
                           const PopupMenuItem(
                             value: {
                               'name': '代谢与营养精算师',
                               'prompt': '请聚焦我今日的饮食结构（碳水/蛋白质/钠摄入）与体重变化、体能训练表现，分析水肿或热量缺口情况，并给出明日三餐调整方案。每条格式如“标题：具体分析”。',
                             },
-                            child: Text('🥗 代谢与营养精算师'),
+                            child: Text('代谢与营养精算师'),
                           ),
                           const PopupMenuItem(
                             value: {
                               'name': '精力与日程效能教练',
                               'prompt': '请结合我今日的已完成/未完成日程与核心目标，分析精力分配与决策疲劳点，给出明日单线程减法行动建议。每条格式如“标题：具体分析”。',
                             },
-                            child: Text('⚡ 精力与日程效能教练'),
+                            child: Text('精力与日程效能教练'),
                           ),
                         ],
                       ),
@@ -809,132 +954,189 @@ class _TodayPageState extends State<TodayPage> {
                     maxLines: 4,
                     style: const TextStyle(fontSize: 12.5, height: 1.35),
                     decoration: const InputDecoration(
-                      labelText: 'Gem 专属分析指令',
+                      labelText: '反思分析指令（System Prompt）',
                       border: OutlineInputBorder(),
                       contentPadding: EdgeInsets.all(8),
                     ),
                     onChanged: (_) => saveCurrentConfig(),
                   ),
                   const SizedBox(height: 10),
-                ],
-                TextField(
-                  controller: targetFieldCtrl,
-                  style: const TextStyle(fontSize: 13),
-                  decoration: const InputDecoration(
-                    labelText: '导出到每日状态的条目名称',
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                    contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                  ),
-                  onChanged: (_) => saveCurrentConfig(),
-                ),
-                const SizedBox(height: 12),
-                SizedBox(
-                  width: double.infinity,
-                  child: FilledButton.icon(
-                    style: FilledButton.styleFrom(
-                      backgroundColor: const Color(0xFF4F46E5),
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  TextField(
+                    controller: targetFieldCtrl,
+                    style: const TextStyle(fontSize: 13),
+                    decoration: const InputDecoration(
+                      labelText: '导出到每日状态的条目名称',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                      contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                     ),
-                    onPressed: () async {
-                      await saveCurrentConfig();
-                      final fullPrompt = buildFullPrompt();
-                      await Clipboard.setData(ClipboardData(text: fullPrompt));
-                      if (ctx.mounted) {
-                        ScaffoldMessenger.of(ctx).showSnackBar(
-                          const SnackBar(content: Text('✅ 已复制今日状态完整指令到剪贴板！')),
-                        );
-                      }
-                      await Share.share(fullPrompt, subject: '今日状态 Gemini 分析');
-                    },
-                    icon: const Icon(Icons.open_in_new, size: 18),
-                    label: const Text('复制并拉起外部 Gemini', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                    onChanged: (_) => saveCurrentConfig(),
                   ),
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text('📥 AI 分析建议：', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
-                    TextButton.icon(
-                      style: TextButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                        minimumSize: Size.zero,
-                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: const Color(0xFF1D4ED8),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
+                      onPressed: isRunning ? null : () { runAnalysis(); },
+                      icon: Icon(isRunning ? Icons.autorenew : Icons.psychology, size: 18),
+                      label: Text(isRunning ? 'DeepSeek 正在反思中…' : '开始 DeepSeek 反思分析',
+                          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                    ),
+                  ),
+                  if (isRunning)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Row(
+                        children: [
+                          const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+                          const SizedBox(width: 8),
+                          Expanded(child: Text(statusText, style: const TextStyle(fontSize: 11, color: Colors.grey))),
+                          TextButton(
+                            onPressed: () {
+                              currentCall?.cancel();
+                              setS(() {
+                                isRunning = false;
+                                statusText = '已停止生成';
+                              });
+                            },
+                            child: const Text('停止', style: TextStyle(fontSize: 11)),
+                          ),
+                        ],
+                      ),
+                    )
+                  else if (statusText.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text('$statusText$usageText',
+                          style: const TextStyle(fontSize: 11, color: Color(0xFF059669))),
+                    ),
+                  if (reasoningText.trim().isNotEmpty)
+                    ExpansionTile(
+                      tilePadding: EdgeInsets.zero,
+                      title: const Text('查看反思过程（思维链）', style: TextStyle(fontSize: 12)),
+                      children: [
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFF5F7FA),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Text(reasoningText.trim(),
+                              style: const TextStyle(fontSize: 11.5, height: 1.5, color: Color(0xFF475569))),
+                        ),
+                      ],
+                    ),
+                  const SizedBox(height: 8),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('反思分析结果：', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
+                      Row(
+                        children: [
+                          TextButton.icon(
+                            style: TextButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                              minimumSize: Size.zero,
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                            onPressed: () async {
+                              final clip = await Clipboard.getData(Clipboard.kTextPlain);
+                              if (clip?.text != null && clip!.text!.trim().isNotEmpty) {
+                                setS(() => resultCtrl.text = clip.text!.trim());
+                              }
+                            },
+                            icon: const Icon(Icons.content_paste, size: 14),
+                            label: const Text('粘贴剪贴板', style: TextStyle(fontSize: 12)),
+                          ),
+                          TextButton.icon(
+                            style: TextButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                              minimumSize: Size.zero,
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                            onPressed: () async {
+                              if (resultCtrl.text.trim().isEmpty) return;
+                              await Clipboard.setData(ClipboardData(text: resultCtrl.text.trim()));
+                              if (ctx.mounted) {
+                                ScaffoldMessenger.of(ctx).showSnackBar(
+                                  const SnackBar(content: Text('已复制分析结果')),
+                                );
+                              }
+                            },
+                            icon: const Icon(Icons.copy_all, size: 14),
+                            label: const Text('复制结果', style: TextStyle(fontSize: 12)),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  TextField(
+                    controller: resultCtrl,
+                    minLines: 6,
+                    maxLines: 12,
+                    style: const TextStyle(fontSize: 13.5, height: 1.45),
+                    decoration: const InputDecoration(
+                      hintText: '点击上方按钮后，DeepSeek 的反思分析会实时出现在这里；也可手动粘贴内容…',
+                      border: OutlineInputBorder(),
+                      contentPadding: EdgeInsets.all(10),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: const Color(0xFF10B981),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                       ),
                       onPressed: () async {
-                        final clip = await Clipboard.getData(Clipboard.kTextPlain);
-                        if (clip?.text != null && clip!.text!.trim().isNotEmpty) {
-                          setS(() => resultCtrl.text = clip.text!.trim());
+                        final rawAi = resultCtrl.text.trim();
+                        if (rawAi.isEmpty || rawAi.startsWith('⚠️')) {
+                          setS(() => resultCtrl.text = '⚠️ 请先获得有效的 AI 分析内容后再点击导出！');
+                          return;
+                        }
+                        await saveCurrentConfig();
+                        final db = await AppDatabase.instance.database;
+                        final targetName = targetFieldCtrl.text.trim().isEmpty ? 'AI 深度异状分析' : targetFieldCtrl.text.trim();
+                        final cleanedLines = rawAi
+                            .split('\n')
+                            .map((line) => line.replaceAll('**', '').replaceFirst(RegExp(r'^[\-\*\•\d]+[\.、\s]\s*'), '').trim())
+                            .where((line) => line.isNotEmpty)
+                            .toList();
+
+                        final itemId = await _ensureStatusItem(targetName, 'text');
+                        await db.update('status_items', {'allow_inherit': 0}, where: 'id = ?', whereArgs: [itemId]);
+                        await db.insert(
+                          'status_records',
+                          {'item_id': itemId, 'date': _date, 'value': cleanedLines.join('\n')},
+                          conflictAlgorithm: ConflictAlgorithm.replace,
+                        );
+                        if (mounted) {
+                          Navigator.pop(ctx);
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text('🎉 已将 AI 分析建议导入至今日「$targetName」（共 ${cleanedLines.length} 栏）！')),
+                          );
+                          setState(() {});
                         }
                       },
-                      icon: const Icon(Icons.content_paste, size: 14),
-                      label: const Text('一键粘贴剪贴板', style: TextStyle(fontSize: 12)),
+                      icon: const Icon(Icons.download_done, size: 18),
+                      label: const Text('导出 AI 分析建议至「每日状态」', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
                     ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                TextField(
-                  controller: resultCtrl,
-                  minLines: 6,
-                  maxLines: 12,
-                  style: const TextStyle(fontSize: 13.5, height: 1.45),
-                  decoration: const InputDecoration(
-                    hintText: '将外部 Gemini 的回复粘贴到此处，点击下方按钮即可自动分列导入到今日状态中...',
-                    border: OutlineInputBorder(),
-                    contentPadding: EdgeInsets.all(10),
                   ),
-                ),
-                const SizedBox(height: 12),
-                SizedBox(
-                  width: double.infinity,
-                  child: FilledButton.icon(
-                    style: FilledButton.styleFrom(
-                      backgroundColor: const Color(0xFF10B981),
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    ),
-                    onPressed: () async {
-                      final rawAi = resultCtrl.text.trim();
-                      if (rawAi.isEmpty || rawAi.startsWith('⚠️')) {
-                        setS(() => resultCtrl.text = '⚠️ 请先粘贴有效的 AI 分析内容后再点击导出！');
-                        return;
-                      }
-                      await saveCurrentConfig();
-                      final db = await AppDatabase.instance.database;
-                      final targetName = targetFieldCtrl.text.trim().isEmpty ? 'AI 深度异状分析' : targetFieldCtrl.text.trim();
-                      final cleanedLines = rawAi
-                          .split('\n')
-                          .map((line) => line.replaceAll('**', '').replaceFirst(RegExp(r'^[\-\*\•\d]+[\.、\s]\s*'), '').trim())
-                          .where((line) => line.isNotEmpty)
-                          .toList();
-
-                      final itemId = await _ensureStatusItem(targetName, 'text');
-                      await db.update('status_items', {'allow_inherit': 0}, where: 'id = ?', whereArgs: [itemId]);
-                      await db.insert(
-                        'status_records',
-                        {'item_id': itemId, 'date': _date, 'value': cleanedLines.join('\n')},
-                        conflictAlgorithm: ConflictAlgorithm.replace,
-                      );
-                      if (mounted) {
-                        Navigator.pop(ctx);
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text('🎉 已将 AI 分析建议导入至今日「$targetName」（共 ${cleanedLines.length} 栏）！')),
-                        );
-                        setState(() {});
-                      }
-                    },
-                    icon: const Icon(Icons.download_done, size: 18),
-                    label: const Text('导出 AI 分析建议至「每日状态」', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                  ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-        ),
+          );
+        },
       ),
-    );
+    ).whenComplete(() => currentCall?.cancel());
   }
 
   Future _importDailyDocx() async {
@@ -1597,9 +1799,9 @@ class _TodayPageState extends State<TodayPage> {
                       padding: const EdgeInsets.symmetric(horizontal: 10),
                       minimumSize: Size.zero,
                     ),
-                    onPressed: () => _openGeminiAnalyzerSheet(copyText),
+                    onPressed: () => _openDeepSeekAnalyzerSheet(copyText),
                     icon: const Icon(Icons.auto_awesome, size: 13),
-                    label: const Text('Gemini分析', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                    label: const Text('DeepSeek反思', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
                   ),
                 ),
                 const SizedBox(width: 4),
