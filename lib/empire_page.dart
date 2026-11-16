@@ -70,16 +70,33 @@ class EmpirePage extends StatefulWidget {
   State<EmpirePage> createState() => _EmpirePageState();
 }
 
-class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateMixin {
+class _EmpirePageState extends State<EmpirePage> with TickerProviderStateMixin {
   EmpireState? _s;
   bool _loading = true;
   late final AnimationController _float;
+
+  /// 转台：value.dx = 偏航（左右），value.dy = 俯仰（上下），单位弧度
+  final ValueNotifier<Offset> _tilt = ValueNotifier<Offset>(Offset.zero);
+
+  /// 松手回正
+  late final AnimationController _settle;
+
+  /// 合并监听，避免每帧重建时反复挂/摘 listener
+  late final Listenable _tiltSignal = Listenable.merge(<Listenable>[_tilt, _settle]);
+  late final Listenable _stageSignal = Listenable.merge(<Listenable>[_float, _tilt, _settle]);
 
   @override
   void initState() {
     super.initState();
     _float = AnimationController(vsync: this, duration: const Duration(milliseconds: 8000))
       ..repeat(reverse: true);
+    _settle = AnimationController(vsync: this, duration: const Duration(milliseconds: 340));
+    _settle.addStatusListener((AnimationStatus st) {
+      if (st == AnimationStatus.completed) {
+        _tilt.value = Offset.zero;
+        _settle.value = 0;
+      }
+    });
     _load();
   }
 
@@ -92,8 +109,32 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
   @override
   void dispose() {
     _float.dispose();
+    _settle.dispose();
+    _tilt.dispose();
     super.dispose();
   }
+
+  /// 拖拽转台：只接管横向，纵向留给页面滚动
+  void _onTiltDrag(DragUpdateDetails d) {
+    if (_settle.isAnimating) {
+      _settle.stop();
+      _settle.value = 0;
+      _tilt.value = Offset.zero;
+    }
+    final double yaw =
+        (_tilt.value.dx + d.delta.dx * 0.0052).clamp(-0.46, 0.46).toDouble();
+    // 转的同时带一点俯仰，像真的放在转台上，而不是纸片横移
+    _tilt.value = Offset(yaw, yaw * 0.22);
+  }
+
+  /// 松手 / 双击 → 回到正视角
+  void _settleBack() {
+    if (_tilt.value == Offset.zero || _settle.isAnimating) return;
+    _settle.forward(from: 0);
+  }
+
+  /// 回正进度：1 = 保持拖动姿态，0 = 完全回正
+  double get _hold => 1.0 - Curves.easeOutCubic.transform(_settle.value);
 
   Future<void> _load() async {
     EmpireState s;
@@ -336,12 +377,18 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
               ),
             ),
           ),
-          // 落地投影
+          // 落地投影：跟着转台位移，转动时重心才不像贴在纸上
           Positioned(
             left: 0,
             right: 0,
             bottom: 58,
-            child: Center(
+            child: AnimatedBuilder(
+              animation: _tiltSignal,
+              builder: (ctx, child) => Transform.translate(
+                offset: Offset(-_tilt.value.dx * _hold * 96, 0),
+                child: child,
+              ),
+              child: Center(
               child: Container(
                 width: 190,
                 height: 20,
@@ -353,13 +400,28 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
                 ),
               ),
             ),
+            ),
           ),
           Positioned.fill(
-            child: AnimatedBuilder(
-              animation: _float,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onHorizontalDragUpdate: _onTiltDrag,
+              onHorizontalDragEnd: (_) => _settleBack(),
+              onHorizontalDragCancel: _settleBack,
+              onDoubleTap: _settleBack,
+              child: AnimatedBuilder(
+              animation: _stageSignal,
               builder: (ctx, child) {
                 final double t = Curves.easeInOut.transform(_float.value);
-                return Transform.translate(offset: Offset(0, -6 * t), child: child);
+                final double h = _hold;
+                final Matrix4 m = Matrix4.identity()
+                  ..setEntry(3, 2, 0.0013)
+                  ..rotateX(_tilt.value.dy * h)
+                  ..rotateY(_tilt.value.dx * h);
+                return Transform.translate(
+                  offset: Offset(0, -6 * t),
+                  child: Transform(alignment: Alignment.center, transform: m, child: child),
+                );
               },
               child: Center(
                 child: ColorFiltered(
@@ -391,6 +453,7 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
                   ),
                 ),
               ),
+            ),
             ),
           ),
           // 等级
@@ -448,6 +511,18 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
               ],
             ),
           ),
+          // 转动提示
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 2,
+            child: IgnorePointer(
+              child: Center(
+                child: Text('左右拖拽转动 · 双击回正',
+                    style: mono(8.5, color: kMute.withOpacity(0.75), ls: 0.6)),
+              ),
+            ),
+          ),
           // 进度
           Positioned(
             left: 20,
@@ -496,84 +571,6 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
           Expanded(child: _prosCard(s)),
           const SizedBox(width: 9),
           Expanded(child: _mulCard(s)),
-        ],
-      ),
-    );
-  }
-
-  /// 今日四模块 → 帝国的实时联动看板
-  Widget _linkCard(EmpireState s) {
-    const Color cGain = Color(0xFF2F5D62);
-    const Color cLoss = Color(0xFFA9523C);
-
-    Widget cell(String k, String v, Color c) => Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(k, style: mono(8.5, color: kMute, ls: 0.8)),
-              const SizedBox(height: 3),
-              FittedBox(
-                fit: BoxFit.scaleDown,
-                alignment: Alignment.centerLeft,
-                child: Text(v, style: mono(12, color: c, w: FontWeight.w600, ls: 0.2)),
-              ),
-            ],
-          ),
-        );
-
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
-      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-      decoration: BoxDecoration(
-        color: kCard,
-        borderRadius: BorderRadius.circular(17),
-        border: Border.all(color: kLine),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Text('今日联动', style: mono(9.5, color: kSub, w: FontWeight.w600, ls: 1.3)),
-              const Spacer(),
-              Text('${s.daysTracked} 日结算 · 修补 ${s.repairUsed}/$kRepairMax',
-                  style: mono(8.5, color: kMute, ls: 0.4)),
-            ],
-          ),
-          const SizedBox(height: 11),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              cell('日程打卡',
-                  '${s.checkinDays}/${s.daysTracked} 日 · ${(s.checkinRate * 100).toStringAsFixed(0)}%', kInk),
-              cell('每日状态',
-                  '${s.statusDays} 日 · ${(s.statusRate * 100).toStringAsFixed(0)}%', kInk),
-            ],
-          ),
-          const SizedBox(height: 11),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              cell('战略聚焦', '${s.focusDone} 项 · ×${s.techMult.toStringAsFixed(3)}', kInk),
-              cell('战争', '${s.warDays} 日 · +${fmtInt(s.warGain)}', cGain),
-            ],
-          ),
-          const SizedBox(height: 11),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              cell('内政混乱', '${s.chaosDays} 日 · -${fmtInt(s.chaosLoss)}', cLoss),
-              cell('修养生息', '${s.restDays} 日 · -${fmtInt(s.restLoss)}', cLoss),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Container(height: 1, color: kLine2),
-          const SizedBox(height: 9),
-          Text(
-            '繁荣度 = 战争(50/150) + 科技突破(500×复利) − 混乱(100) − 修养(10)，'
-            '逐日取自「今日」的日程、状态与战略聚焦，改一项这里立刻跟着变。',
-            style: mono(8, color: kMute, ls: 0.2),
-          ),
         ],
       ),
     );
