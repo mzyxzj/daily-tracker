@@ -240,7 +240,6 @@ class _EmpirePageState extends State<EmpirePage> with SingleTickerProviderStateM
                             _stage(s),
                             const SizedBox(height: 2),
                             _params(s),
-                            _linkCard(s),
                             _chronicle(s),
                           ],
                         ),
