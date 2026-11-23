@@ -273,7 +273,25 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
           }
         }
       }
+      // V1.2 的内置模板是只读的，没进过库。升级时并进来一次，打个标记；
+      // 之后以库为准 —— 用户删掉的模板不会在下次启动又冒出来。
+      final seeded = await _getState('deepseek_presets_seeded');
+      if (seeded != '1') {
+        for (final b in kBuiltinPresets) {
+          if (_presets.any((p) => p.name == b.name)) continue;
+          _presets.add(b);
+        }
+        await _putState('deepseek_presets_seeded', '1');
+        await _savePresets();
+      }
     } catch (_) {}
+    if (_presets.isEmpty) {
+      _presets.addAll(kBuiltinPresets);
+      try {
+        await _savePresets();
+        await _putState('deepseek_presets_seeded', '1');
+      } catch (_) {}
+    }
 
     final target = (cfg['targetField'] ?? '').toString().trim();
     _targetCtrl.text = (target.isEmpty ||
@@ -324,11 +342,11 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
     } catch (_) {}
   }
 
-  /// 当前角色 + 指令命中的预设名（内置或自定义），没有则 null。
+  /// 当前角色 + 指令命中的模板名，没有则 null。
   String? _currentPresetName() {
     final role = _roleCtrl.text.trim();
     final prompt = _promptCtrl.text.trim();
-    for (final p in [...kBuiltinPresets, ..._presets]) {
+    for (final p in _presets) {
       if (p.role == role && p.prompt == prompt) return p.name;
     }
     return null;
@@ -341,6 +359,42 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
     });
     _save();
     if (mounted) setState(() => _status = '已套用「${p.name}」');
+  }
+
+  Future<bool> _confirmDeletePreset(String name) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: const Text('删除预设', style: TextStyle(fontSize: 15)),
+        content: Text(
+          '删除「$name」？内置模板删掉后，可以在管理页底部点「恢复内置」找回。',
+          style: const TextStyle(fontSize: 12.5, height: 1.6),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dctx, false),
+              child: const Text('取消')),
+          FilledButton(
+            style:
+                FilledButton.styleFrom(backgroundColor: const Color(0xFFDC2626)),
+            onPressed: () => Navigator.pop(dctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    return ok == true;
+  }
+
+  /// 把被删掉的内置模板补回来，返回补了几条。
+  Future<int> _restoreBuiltinPresets() async {
+    final missing = kBuiltinPresets
+        .where((b) => !_presets.any((p) => p.name == b.name))
+        .toList();
+    if (missing.isEmpty) return 0;
+    setState(() => _presets.addAll(missing));
+    await _savePresets();
+    return missing.length;
   }
 
   // ---------------- 上下文拼装 ----------------
@@ -952,8 +1006,7 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
           _managePresets();
           return;
         }
-        final list = [...kBuiltinPresets, ..._presets];
-        if (v >= 0 && v < list.length) _applyPreset(list[v]);
+        if (v >= 0 && v < _presets.length) _applyPreset(_presets[v]);
       },
       itemBuilder: (_) => _presetItems(),
       child: Container(
@@ -978,17 +1031,14 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
     );
   }
 
-  /// 菜单顺序必须与 onSelected 里的 index 计算一致：内置 → 自定义 → 操作项。
+  /// 菜单顺序必须与 onSelected 里的 index 计算一致：模板 → 操作项。
+  /// 内置模板已并入 _presets，和自定义模板一样可改名、可删。
   List<PopupMenuEntry<int>> _presetItems() {
     final items = <PopupMenuEntry<int>>[];
-    items.add(_presetHeader('内置模板'));
-    for (int i = 0; i < kBuiltinPresets.length; i++) {
-      items.add(_presetItem(i, kBuiltinPresets[i]));
-    }
     if (_presets.isNotEmpty) {
-      items.add(_presetHeader('我的预设'));
+      items.add(_presetHeader('模板 · 可编辑'));
       for (int i = 0; i < _presets.length; i++) {
-        items.add(_presetItem(kBuiltinPresets.length + i, _presets[i]));
+        items.add(_presetItem(i, _presets[i]));
       }
     }
     items.add(const PopupMenuDivider(height: 12));
@@ -1004,20 +1054,17 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
         ],
       ),
     ));
-    if (_presets.isNotEmpty) {
-      items.add(const PopupMenuItem<int>(
-        value: -2,
-        height: 40,
-        child: Row(
-          children: [
-            Icon(Icons.tune, size: 15, color: _sub),
-            SizedBox(width: 6),
-            Text('管理我的预设…',
-                style: TextStyle(fontSize: 12.5, color: _ink)),
-          ],
-        ),
-      ));
-    }
+    items.add(const PopupMenuItem<int>(
+      value: -2,
+      height: 40,
+      child: Row(
+        children: [
+          Icon(Icons.tune, size: 15, color: _sub),
+          SizedBox(width: 6),
+          Text('管理预设…', style: TextStyle(fontSize: 12.5, color: _ink)),
+        ],
+      ),
+    ));
     return items;
   }
 
@@ -1135,11 +1182,11 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 14, 8, 8),
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
                   child: Row(
                     children: [
                       const Expanded(
-                        child: Text('我的预设',
+                        child: Text('预设模板',
                             style: TextStyle(
                                 fontSize: 15,
                                 fontWeight: FontWeight.w700,
@@ -1153,12 +1200,20 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
                     ],
                   ),
                 ),
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  child: Text(
+                    '点一行直接套用；铅笔改名字/角色/指令，垃圾桶删除。内置模板一样能改能删，'
+                    '删错了用底部「恢复内置模板」找回。',
+                    style: TextStyle(fontSize: 10.5, height: 1.5, color: _sub),
+                  ),
+                ),
                 if (_presets.isEmpty)
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
                     child: Text(
-                      '还没有自定义预设。先把角色和指令调到满意，再点下面的按钮存一条；'
-                      '以后在这里可以改、可以删，也可以一键套用。',
+                      '现在一条模板都没有。可以点底部按钮把当前角色和指令存成模板，'
+                      '或恢复内置模板再按需改。',
                       style: const TextStyle(
                           fontSize: 11.5, height: 1.6, color: _sub),
                     ),
@@ -1215,6 +1270,8 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
                                     size: 17, color: Color(0xFFDC2626)),
                                 onPressed: () async {
                                   final name = p.name;
+                                  final ok = await _confirmDeletePreset(name);
+                                  if (!ok) return;
                                   setState(() => _presets.removeAt(i));
                                   await _savePresets();
                                   if (mounted) {
@@ -1233,24 +1290,56 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
                   top: false,
                   child: Padding(
                     padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
-                    child: SizedBox(
-                      width: double.infinity,
-                      child: FilledButton.icon(
-                        style: FilledButton.styleFrom(
-                          backgroundColor: _accent,
-                          padding: const EdgeInsets.symmetric(vertical: 11),
-                          shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(10)),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          flex: 3,
+                          child: FilledButton.icon(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: _accent,
+                              padding: const EdgeInsets.symmetric(vertical: 11),
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10)),
+                            ),
+                            onPressed: () async {
+                              await _savePresetDialog();
+                              if (mounted) setSheet(() {});
+                            },
+                            icon: const Icon(Icons.add, size: 17),
+                            label: const Text('新建预设',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                    fontSize: 12.5,
+                                    fontWeight: FontWeight.w700)),
+                          ),
                         ),
-                        onPressed: () async {
-                          await _savePresetDialog();
-                          if (mounted) setSheet(() {});
-                        },
-                        icon: const Icon(Icons.add, size: 17),
-                        label: const Text('用当前角色与指令新建预设',
-                            style: TextStyle(
-                                fontSize: 12.5, fontWeight: FontWeight.w700)),
-                      ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          flex: 2,
+                          child: OutlinedButton.icon(
+                            style: OutlinedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(vertical: 11),
+                              side: const BorderSide(color: _line),
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10)),
+                            ),
+                            onPressed: () async {
+                              final n = await _restoreBuiltinPresets();
+                              if (!mounted) return;
+                              setSheet(() {});
+                              setState(() => _status = n == 0
+                                  ? '内置模板都在'
+                                  : '已恢复 $n 个内置模板');
+                            },
+                            icon: const Icon(Icons.restore, size: 16),
+                            label: const Text('恢复内置',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(fontSize: 12)),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),

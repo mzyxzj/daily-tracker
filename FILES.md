@@ -1,28 +1,28 @@
-# Empire-V1.2 覆盖清单（2.5.3）
+# Empire-V1.3 覆盖清单（2.5.4）
 
 整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml`。
 
-> 本版只动反思面板（`lib/deepseek_sheet.dart`）：
-> 1. **首轮正文不再带临时指令**。「将发送给 DeepSeek 的内容」现在只有【日期】/
->    【今日记录】/【战略聚焦】，末尾那段「请据此做今日反思：先给 3 条核心判断…」整段删掉。
-> 2. **分析方式搬进「分析角色 + 反思指令」**。默认角色「第一性原理复盘官」，默认指令
->    固定 3 条核心判断 + 四个板块（精力与执行的错配 / 战略聚焦的推进实况 / 系统性风险 /
->    明日最小动作），每个板块都写了口径。两处都在设置里可改，改完即存。
-> 3. **预设可编辑、可保存**。4 个内置模板只读；「保存当前为预设…」写进
->    `ui_states.deepseek_presets`；「管理我的预设…」可改名、改角色、改指令、删除、一键套用。
-> 4. 老配置自动升级：V1.1 存过内置指令的，识别后替换为新默认，不会把旧指令锁死。
+> 本版两件事：
+> 1. **战略聚焦不再重复**。旧版 `FutureBuilder(future: _load())` 每次 build 都新起一次加载，
+>    几条并发同时判断「昨天这条还没顺延」就各插一条。现在：同日期加载复用同一个 Future；
+>    顺延去重键改为「维度 + 下一步」（原来只看标题，同维度多条会被误吞）；插入用
+>    `ConflictAlgorithm.ignore`；库升到 v10，升级时自动合并历史重复并建唯一索引
+>    `idx_focus_unique(date, title, next_step)`；手动新增重复项改为合并并提示。
+> 2. **模板全部可编辑**。内置 4 条并入 `ui_states.deepseek_presets`，和自定义模板一样
+>    可改名、改角色、改指令、删除（删除有二次确认）；管理页新增「恢复内置」，删错了能找回；
+>    升级时只并入一次（`deepseek_presets_seeded` 标记），删掉的不会再自己冒出来。
 >
-> 覆盖文件：`lib/deepseek_sheet.dart`、`pubspec.yaml`、`README.md`、`FILES.md`。
+> 覆盖文件：`lib/main.dart`、`lib/deepseek_sheet.dart`、`pubspec.yaml`、`README.md`、`FILES.md`。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
-| `pubspec.yaml` | 398 | `adfed19d78f6113d5ac51c88f82b6e3b` |
-| `README.md` | 5,307 | `adc8adacbe0f8c6b27994f979fac9476` |
+| `pubspec.yaml` | 398 | `09535960a3e6cabbb10b9b5a2d03da5c` |
+| `README.md` | 7,017 | `0cc185c1e313d113394da95fde54ae82` |
 | `.github/workflows/build.yml` | 5,522 | `1b9488bba4d632454cbb8db0023738c6` |
-| `lib/main.dart` | 127,122 | `1f75104bc607e3a49efe889f264def79` |
+| `lib/main.dart` | 131,662 | `4da64f770e1497b48345abd1d48b0722` |
 | `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
-| `lib/deepseek_sheet.dart` | 68,749 | `161281642cb42e1c98055a34704a5fc6` |
+| `lib/deepseek_sheet.dart` | 72,621 | `ccd3d91379d101cfbbc0ada026a813e3` |
 | `lib/empire_page.dart` | 71,718 | `9bab00fac714fa2db5694fe15d00041d` |
 | `lib/empire_data.dart` | 19,564 | `aaca4183f71cc53fce9777e9181e76c2` |
 | `lib/empire_assets.dart` | 897,977 | `61e06d9173a85e0dc101524597d8acc6` |

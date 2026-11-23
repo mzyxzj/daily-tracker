@@ -61,7 +61,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
-      version: 9,
+      version: 10,
       onCreate: (db, v) async {
         await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, allow_inherit INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE status_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, value TEXT DEFAULT "", UNIQUE(item_id, date))');
@@ -74,6 +74,7 @@ class AppDatabase {
         await db.execute('CREATE TABLE mindmaps (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, root_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)');
         await db.execute('CREATE TABLE ui_states (state_key TEXT PRIMARY KEY, state_val TEXT NOT NULL)');
         await db.execute("CREATE TABLE focus_items (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, title TEXT NOT NULL, next_step TEXT DEFAULT '', done_criteria TEXT DEFAULT '', multiplier REAL DEFAULT 1.0, done INTEGER DEFAULT 0, note TEXT DEFAULT '', rolled INTEGER DEFAULT 0, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)");
+        await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_focus_unique ON focus_items(date, title, next_step)');
       },
       onUpgrade: (db, oldV, newV) async {
         if (oldV.compareTo(2) == -1) {
@@ -102,6 +103,12 @@ class AppDatabase {
         if (oldV.compareTo(9) == -1) {
           try { await db.execute("CREATE TABLE IF NOT EXISTS focus_items (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, title TEXT NOT NULL, next_step TEXT DEFAULT '', done_criteria TEXT DEFAULT '', multiplier REAL DEFAULT 1.0, done INTEGER DEFAULT 0, note TEXT DEFAULT '', rolled INTEGER DEFAULT 0, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)"); } catch (_) {}
         }
+        if (oldV.compareTo(10) == -1) {
+          // 老库里可能已经有重复的聚焦条目（旧版每次重建 FutureBuilder 都会并发跑一次
+          // 「顺延」，几条并发同时判断「不存在」就各插一条）。这里先按
+          // (日期, 维度, 下一步) 去重，再加唯一索引，从库层面堵死重复。
+          try { await dedupeFocusItems(db); } catch (_) {}
+        }
       },
     );
   }
@@ -121,6 +128,45 @@ class AppDatabase {
       await activeDb.insert('ui_states', {'state_key': key, 'state_val': val}, conflictAlgorithm: ConflictAlgorithm.replace);
     } catch (_) {}
     return null;
+  }
+
+  /// 合并同一天里「维度 + 下一步」完全相同的聚焦条目，并给表加唯一索引。
+  /// 旧版并发顺延会插出多条一样的；升级时跑一次，也供以后手动清理用。
+  /// 返回被删掉的重复条数。
+  static Future<int> dedupeFocusItems(Database db) async {
+    await db.execute("UPDATE focus_items SET next_step = '' WHERE next_step IS NULL");
+    final rows = await db.query('focus_items',
+        orderBy: 'date ASC, title ASC, next_step ASC, done DESC, id ASC');
+    final Map<String, int> kept = <String, int>{};
+    int removed = 0;
+    for (final r in rows) {
+      final key = '${r['date']}\u0001${r['title']}\u0001${r['next_step'] ?? ''}';
+      final int id = r['id'] as int;
+      final int? keptId = kept[key];
+      if (keptId == null) {
+        kept[key] = id;
+        continue;
+      }
+      // 合并：重复行里更长的备注、已勾选状态，带到保留行上
+      final String dupNote = (r['note'] ?? '').toString().trim();
+      if (dupNote.isNotEmpty) {
+        final cur =
+            await db.query('focus_items', where: 'id = ?', whereArgs: [keptId]);
+        final String curNote =
+            cur.isEmpty ? '' : (cur.first['note'] ?? '').toString().trim();
+        if (dupNote.length > curNote.length) {
+          await db.update('focus_items', {'note': dupNote, 'done': r['done'] ?? 0},
+              where: 'id = ?', whereArgs: [keptId]);
+        }
+      }
+      await db.delete('focus_items', where: 'id = ?', whereArgs: [id]);
+      removed++;
+    }
+    try {
+      await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_focus_unique '
+          'ON focus_items(date, title, next_step)');
+    } catch (_) {}
+    return removed;
   }
 
   /// 战略聚焦：把勾选完成信号聚合成帝国模块可直接读取的键，写入 ui_states。
@@ -380,6 +426,8 @@ class _TodayPageState extends State<TodayPage> {
   bool _foldSchedSection = false;
   bool _foldFocusSection = false;
   bool _uiLoaded = false;
+  Future? _loadingFuture;
+  String? _loadingDate;
   List _sectionOrder = ['summary', 'status', 'focus', 'schedule'];
 
   int? _hoverSchedTargetId;
@@ -435,7 +483,28 @@ class _TodayPageState extends State<TodayPage> {
     return null;
   }
 
-  Future _load() async {
+  /// FutureBuilder 每次 build 都会调一次 _load；以前是各跑各的，几条并发同时
+  /// 判断「昨天这条还没顺延」就各插一条，于是同一条聚焦会重复出现。
+  /// 同一日期的加载在飞时复用同一个 Future，顺延逻辑再也不会并发执行。
+  Future _load() {
+    final cached = _loadingFuture;
+    if (cached != null && _loadingDate == _date) return cached;
+    late Future f;
+    void clear() {
+      if (identical(_loadingFuture, f)) {
+        _loadingFuture = null;
+        _loadingDate = null;
+      }
+    }
+
+    f = _loadInner();
+    _loadingFuture = f;
+    _loadingDate = _date;
+    f.then((_) => clear(), onError: (Object e, StackTrace s) => clear());
+    return f;
+  }
+
+  Future _loadInner() async {
     if (!_uiLoaded) await _restoreTodayUiState();
     final Database db = await AppDatabase.instance.database;
     final items = List.from(
@@ -495,26 +564,37 @@ class _TodayPageState extends State<TodayPage> {
           where: 'date < ? AND done = 0 AND rolled = 0', whereArgs: [_date],
           orderBy: 'date ASC, sort_order ASC, id ASC');
       for (final r in pending) {
+        final int id = r['id'] as int;
+        final String title = '${r['title'] ?? ''}';
+        final String step = '${r['next_step'] ?? ''}';
+        // 去重键改成「维度 + 下一步」：同一维度下可能有多个不同下一步，旧逻辑只看
+        // 标题会把它们误判成同一条而丢掉。同时插入用 ignore，配合唯一索引，
+        // 多路 _load 并发时最多只会落一条。
         final same = await db.query('focus_items',
-            where: 'date = ? AND title = ?', whereArgs: [_date, r['title']]);
-        if (same.isNotEmpty) continue;
-        final cnt = await db.query('focus_items', where: 'date = ?', whereArgs: [_date]);
-        await db.insert('focus_items', {
-          'date': _date,
-          'title': r['title'],
-          'next_step': r['next_step'],
-          'done_criteria': r['done_criteria'],
-          'multiplier': r['multiplier'],
-          'done': 0,
-          'note': '',
-          'rolled': 0,
-          'sort_order': cnt.length,
-          'created_at': DateTime.now().toIso8601String(),
-        });
-      }
-      for (final r in pending) {
+            where: 'date = ? AND title = ? AND next_step = ?',
+            whereArgs: [_date, title, step]);
+        if (same.isEmpty) {
+          final cnt = await db.query('focus_items', where: 'date = ?', whereArgs: [_date]);
+          await db.insert(
+            'focus_items',
+            {
+              'date': _date,
+              'title': title,
+              'next_step': step,
+              'done_criteria': r['done_criteria'],
+              'multiplier': r['multiplier'],
+              'done': 0,
+              'note': '',
+              'rolled': 0,
+              'sort_order': cnt.length,
+              'created_at': DateTime.now().toIso8601String(),
+            },
+            conflictAlgorithm: ConflictAlgorithm.ignore,
+          );
+        }
+        // 处理完一条立刻标记，缩小并发窗口
         await db.update('focus_items', {'rolled': 1},
-            where: 'id = ?', whereArgs: [r['id'] as int]);
+            where: 'id = ?', whereArgs: [id]);
       }
     }
     final focusRows = List.from(await db.query('focus_items',
@@ -1494,19 +1574,43 @@ class _TodayPageState extends State<TodayPage> {
     final String title = dim.isEmpty ? '未分类' : dim;
     final db = await AppDatabase.instance.database;
     if (existing == null) {
-      final cnt = await db.query('focus_items', where: 'date = ?', whereArgs: [_date]);
-      await db.insert('focus_items', {
-        'date': _date,
-        'title': title,
-        'next_step': step,
-        'done_criteria': critCtrl.text.trim(),
-        'multiplier': mul,
-        'done': 0,
-        'note': '',
-        'rolled': 0,
-        'sort_order': cnt.length,
-        'created_at': DateTime.now().toIso8601String(),
-      });
+      final same = await db.query('focus_items',
+          where: 'date = ? AND title = ? AND next_step = ?',
+          whereArgs: [_date, title, step]);
+      if (same.isNotEmpty) {
+        // 同一天、同维度、同一步已经存在：合并到原条目，不再落第二条
+        await db.update(
+            'focus_items',
+            {
+              'done_criteria': critCtrl.text.trim(),
+              'multiplier': mul,
+            },
+            where: 'id = ?',
+            whereArgs: [same.first['id'] as int]);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('这条「下一步」已经存在，已合并为一条')),
+          );
+        }
+      } else {
+        final cnt = await db.query('focus_items', where: 'date = ?', whereArgs: [_date]);
+        await db.insert(
+          'focus_items',
+          {
+            'date': _date,
+            'title': title,
+            'next_step': step,
+            'done_criteria': critCtrl.text.trim(),
+            'multiplier': mul,
+            'done': 0,
+            'note': '',
+            'rolled': 0,
+            'sort_order': cnt.length,
+            'created_at': DateTime.now().toIso8601String(),
+          },
+          conflictAlgorithm: ConflictAlgorithm.ignore,
+        );
+      }
     } else {
       await db.update('focus_items', {
         'title': title,
