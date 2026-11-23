@@ -15,6 +15,7 @@ import 'package:sqflite/sqflite.dart';
 import 'pages_extra.dart';
 import 'deepseek_sheet.dart';
 import 'empire_page.dart';
+import 'culture_page.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -61,7 +62,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
-      version: 10,
+      version: 11,
       onCreate: (db, v) async {
         await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, allow_inherit INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE status_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, value TEXT DEFAULT "", UNIQUE(item_id, date))');
@@ -75,6 +76,7 @@ class AppDatabase {
         await db.execute('CREATE TABLE ui_states (state_key TEXT PRIMARY KEY, state_val TEXT NOT NULL)');
         await db.execute("CREATE TABLE focus_items (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, title TEXT NOT NULL, next_step TEXT DEFAULT '', done_criteria TEXT DEFAULT '', multiplier REAL DEFAULT 1.0, done INTEGER DEFAULT 0, note TEXT DEFAULT '', rolled INTEGER DEFAULT 0, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)");
         await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_focus_unique ON focus_items(date, title, next_step)');
+        await CultureDb.ensureTables(db);
       },
       onUpgrade: (db, oldV, newV) async {
         if (oldV.compareTo(2) == -1) {
@@ -102,6 +104,9 @@ class AppDatabase {
         }
         if (oldV.compareTo(9) == -1) {
           try { await db.execute("CREATE TABLE IF NOT EXISTS focus_items (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, title TEXT NOT NULL, next_step TEXT DEFAULT '', done_criteria TEXT DEFAULT '', multiplier REAL DEFAULT 1.0, done INTEGER DEFAULT 0, note TEXT DEFAULT '', rolled INTEGER DEFAULT 0, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL)"); } catch (_) {}
+        }
+        if (oldV.compareTo(11) == -1) {
+          try { await CultureDb.ensureTables(db); } catch (_) {}
         }
         if (oldV.compareTo(10) == -1) {
           // 老库里可能已经有重复的聚焦条目（旧版每次重建 FutureBuilder 都会并发跑一次
@@ -382,6 +387,7 @@ class _MainShellState extends State<MainShell> {
           TodayPage(db: activeDb),
           EmpirePage(db: activeDb, reloadToken: _empireTick),
           PlanPage(db: activeDb),
+          CulturePage(db: activeDb),
         ];
         return Scaffold(
           body: pages[_idx],
@@ -401,6 +407,10 @@ class _MainShellState extends State<MainShell> {
                   selectedIcon: Icon(Icons.account_balance),
                   label: '帝国'),
               NavigationDestination(icon: Icon(Icons.account_tree_outlined), label: '规划'),
+              NavigationDestination(
+                  icon: Icon(Icons.video_library_outlined),
+                  selectedIcon: Icon(Icons.video_library),
+                  label: '文化'),
             ],
           ),
         );
