@@ -6,6 +6,8 @@
 //      可复制 Markdown、可分享，形成能直接用的东西。
 //   3. 流量算法：维护优质源（UP 主 / 站点）并按权重排序，
 //      给「今日 3 条」直达入口，内置 WebView 让内容在 App 内看完。
+//   4. 分级：同一件事在满血和见底时性质不同——按电量分档，写清每档
+//      能做什么、别碰什么，并高亮当前所在档位。
 //
 // 设计约束：不引入图片缓存/网络请求层，封面用 URL 直连 + 渐变兜底；
 // 所有写操作走 sqflite，页面只做展示与轻状态。
@@ -41,6 +43,54 @@ const List<Map<String, String>> kCultureBuiltinLibs = [
 ];
 
 const List<String> kCultureKinds = ['视频', '文章', '课程', '工具', '文档'];
+/// 内置分级：四档电量对应的允许 / 禁止娱乐。只在表为空时落一次。
+const List<Map<String, dynamic>> kCultureBuiltinGrades = [
+  {
+    'tier': 1,
+    'name': '绿灯区',
+    'min_b': 60,
+    'max_b': 100,
+    'allow': '长视频 / 游戏 / 深度学习 / 正经社交',
+    'forbid': '别熬过 12 点（这条永远生效）',
+    'note': '血条够，难的事放这一档做',
+  },
+  {
+    'tier': 2,
+    'name': '黄灯区',
+    'min_b': 30,
+    'max_b': 59,
+    'allow': '短内容 / 轻运动 / 整理桌面',
+    'forbid': '开新坑 / 做重大决定 / 吵架',
+    'note': '还能推，但别加负载',
+  },
+  {
+    'tier': 3,
+    'name': '橙灯区',
+    'min_b': 15,
+    'max_b': 29,
+    'allow': '音乐 / 散步 / 洗澡 / 发呆',
+    'forbid': '短视频 / 游戏 / 学习 / 刷购物',
+    'note': '省电模式，只维持秩序',
+  },
+  {
+    'tier': 4,
+    'name': '红灯区',
+    'min_b': 0,
+    'max_b': 14,
+    'allow': '躺下 / 闭眼 / 喝水 / 洗漱',
+    'forbid': '一切屏幕 / 任何提议 / 任何决策',
+    'note': '只执行最低限度日程',
+  },
+];
+
+/// 档位颜色：按上界取色，和医疗页血条保持一致。
+Color cultureGradeColor(int maxB) {
+  if (maxB >= 60) return const Color(0xFF15803D);
+  if (maxB >= 30) return const Color(0xFFCA8A04);
+  if (maxB >= 15) return const Color(0xFFEA580C);
+  return const Color(0xFFDC2626);
+}
+
 
 /// 从链接推断平台。只做域名匹配，不联网。
 String cultureDetectPlatform(String url) {
@@ -299,6 +349,114 @@ class CultureDb {
         'CREATE INDEX IF NOT EXISTS idx_culture_items_lib ON culture_items(lib_id)');
     await db.execute(
         'CREATE INDEX IF NOT EXISTS idx_culture_kits_lib ON culture_kits(lib_id)');
+    await db.execute('CREATE TABLE IF NOT EXISTS culture_grades ('
+        'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+        'tier INTEGER DEFAULT 0, '
+        "name TEXT NOT NULL, "
+        'min_b INTEGER DEFAULT 0, '
+        'max_b INTEGER DEFAULT 100, '
+        "allow TEXT DEFAULT '', "
+        "forbid TEXT DEFAULT '', "
+        "note TEXT DEFAULT '', "
+        'sort_order INTEGER DEFAULT 0)');
+
+    await _seedGrades(db);
+  }
+
+  /// 分级种子的三条路：已种过 → 不动；医疗旧表有数据 → 原样迁过来（保留用户改过的内容）；
+  /// 都没有 → 落内置四档。
+  static Future<void> _seedGrades(Database db) async {
+    final seeded = await _getState(db, 'culture_grades_seeded');
+    if (seeded == '1') return;
+    var count = Sqflite.firstIntValue(
+            await db.rawQuery('SELECT COUNT(*) FROM culture_grades')) ??
+        0;
+    if (count == 0) {
+      try {
+        final old = await db.query('medical_grades',
+            orderBy: 'sort_order ASC, tier ASC');
+        for (var i = 0; i < old.length; i++) {
+          final g = old[i];
+          await db.insert('culture_grades', {
+            'tier': g['tier'] ?? i + 1,
+            'name': g['name'] ?? '第 ${i + 1} 档',
+            'min_b': g['min_b'] ?? 0,
+            'max_b': g['max_b'] ?? 100,
+            'allow': g['allow'] ?? '',
+            'forbid': g['forbid'] ?? '',
+            'note': g['note'] ?? '',
+            'sort_order': g['sort_order'] ?? i,
+          });
+          count++;
+        }
+      } catch (_) {}
+    }
+    if (count == 0) {
+      for (var i = 0; i < kCultureBuiltinGrades.length; i++) {
+        final g = kCultureBuiltinGrades[i];
+        await db.insert('culture_grades', {
+          'tier': g['tier'],
+          'name': g['name'],
+          'min_b': g['min_b'],
+          'max_b': g['max_b'],
+          'allow': g['allow'],
+          'forbid': g['forbid'],
+          'note': g['note'],
+          'sort_order': i,
+        });
+      }
+    }
+    await _setState(db, 'culture_grades_seeded', '1');
+  }
+
+  /// 新增或更新一档。返回 id。
+  static Future<int> saveGrade(Database db, Map<String, dynamic> data,
+      {int? id}) async {
+    final row = {
+      'tier': data['tier'] ?? 0,
+      'name': data['name'] ?? '',
+      'min_b': data['min_b'] ?? 0,
+      'max_b': data['max_b'] ?? 100,
+      'allow': data['allow'] ?? '',
+      'forbid': data['forbid'] ?? '',
+      'note': data['note'] ?? '',
+      'sort_order': data['sort_order'] ?? 0,
+    };
+    if (id == null) return db.insert('culture_grades', row);
+    await db.update('culture_grades', row, where: 'id = ?', whereArgs: [id]);
+    return id;
+  }
+
+  /// 删除一档；至少保留一档，避免整页空掉。
+  static Future<bool> deleteGrade(Database db, int id) async {
+    final rows = await db.query('culture_grades');
+    if (rows.length <= 1) return false;
+    await db.delete('culture_grades', where: 'id = ?', whereArgs: [id]);
+    return true;
+  }
+
+  /// 恢复内置四档：按名字补回缺的，不动已存在的、也不动用户自己加的。
+  static Future<int> restoreGrades(Database db) async {
+    final existing = await db.query('culture_grades');
+    final names = existing.map((e) => '${e['name']}').toSet();
+    var added = 0;
+    var order = existing.length;
+    for (var i = 0; i < kCultureBuiltinGrades.length; i++) {
+      final g = kCultureBuiltinGrades[i];
+      if (names.contains('${g['name']}')) continue;
+      await saveGrade(db, {
+        'tier': g['tier'],
+        'name': g['name'],
+        'min_b': g['min_b'],
+        'max_b': g['max_b'],
+        'allow': g['allow'],
+        'forbid': g['forbid'],
+        'note': g['note'],
+        'sort_order': order++,
+      });
+      added++;
+    }
+    return added;
   }
 
   /// 首次进入：把内置库落库；之后从「战略聚焦」里出现过的维度补库。
@@ -483,7 +641,7 @@ class CulturePage extends StatefulWidget {
 }
 
 class _CulturePageState extends State<CulturePage> {
-  int _tab = 0; // 0 内容引进 1 再创作 2 流量算法
+  int _tab = 0; // 0 内容引进 1 再创作 2 流量算法 3 分级
   int _view = 0; // 0 卡片流 1 竖版流 2 紧凑列表
   int? _libId;
   String _kw = '';
@@ -494,6 +652,8 @@ class _CulturePageState extends State<CulturePage> {
   List _items = [];
   List _kits = [];
   List _sources = [];
+  List _grades = [];
+  int? _battery; // 从医疗页写的 ui_states 读，用来高亮当前档位
   bool _loading = true;
 
   final TextEditingController _searchCtrl = TextEditingController();
@@ -538,13 +698,22 @@ class _CulturePageState extends State<CulturePage> {
   Future _reload({bool syncLibs = false}) async {
     try {
       final db = widget.db;
-      if (syncLibs) await CultureDb.syncLibrariesFromFocus(db);
+      if (syncLibs) {
+        // 聚焦表缺失或异常不应该让整页空白：库联动失败就跳过，页面照常加载。
+        try {
+          await CultureDb.syncLibrariesFromFocus(db);
+        } catch (_) {}
+      }
       final libs = await db.query('culture_libraries',
           orderBy: 'sort_order ASC, id ASC');
       final items = await db.query('culture_items', orderBy: 'id DESC');
       final kits = await db.query('culture_kits', orderBy: 'updated_at DESC');
       final sources =
           await db.query('culture_sources', orderBy: 'weight DESC, id ASC');
+      final grades = await db.query('culture_grades',
+          orderBy: 'sort_order ASC, tier ASC, id ASC');
+      final batteryRaw =
+          await CultureDb._getState(db, 'medical_battery_now');
       await CultureDb.refreshSignals(db);
       if (!mounted) return;
       setState(() {
@@ -552,6 +721,8 @@ class _CulturePageState extends State<CulturePage> {
         _items = items;
         _kits = kits;
         _sources = sources;
+        _grades = grades;
+        _battery = int.tryParse('${batteryRaw ?? ''}'.trim());
         _loading = false;
         if (_libId != null && !_libs.any((l) => l['id'] == _libId)) {
           _libId = null;
@@ -958,11 +1129,13 @@ class _CulturePageState extends State<CulturePage> {
             onSelected: (v) {
               if (v == 'lib') _newLib();
               if (v == 'source') _addSource();
+              if (v == 'grades') _restoreGrades();
               if (v == 'help') _showHelp();
             },
             itemBuilder: (_) => const [
               PopupMenuItem(value: 'lib', child: Text('新建资源库', style: TextStyle(fontSize: 13))),
               PopupMenuItem(value: 'source', child: Text('添加优质源', style: TextStyle(fontSize: 13))),
+              PopupMenuItem(value: 'grades', child: Text('恢复内置分级', style: TextStyle(fontSize: 13))),
               PopupMenuItem(value: 'help', child: Text('这一页怎么用', style: TextStyle(fontSize: 13))),
             ],
           ),
@@ -978,29 +1151,43 @@ class _CulturePageState extends State<CulturePage> {
                     ? _inflowBody()
                     : _tab == 1
                         ? _kitsBody()
-                        : _algoBody(),
+                        : _tab == 2
+                            ? _algoBody()
+                            : _gradeBody(),
               ),
             ]),
-      floatingActionButton: _tab == 2
-          ? FloatingActionButton.extended(
-              backgroundColor: kCultureAccent,
-              onPressed: () => _addSource(),
-              icon: const Icon(Icons.add_link, size: 18),
-              label: const Text('优质源', style: TextStyle(fontSize: 12.5)),
-            )
-          : FloatingActionButton.extended(
-              backgroundColor: kCultureAccent,
-              onPressed: _tab == 0 ? () => _addItem() : _newKit,
-              icon: const Icon(Icons.add, size: 18),
-              label: Text(_tab == 0 ? '存一条' : '新建工具包',
-                  style: const TextStyle(fontSize: 12.5)),
-            ),
+      floatingActionButton: FloatingActionButton.extended(
+        backgroundColor: kCultureAccent,
+        onPressed: _tab == 0
+            ? () => _addItem()
+            : _tab == 1
+                ? _newKit
+                : _tab == 2
+                    ? () => _addSource()
+                    : () => _editGrade(),
+        icon: Icon(_tab == 2 ? Icons.add_link : Icons.add, size: 18),
+        label: Text(
+          _tab == 0
+              ? '存一条'
+              : _tab == 1
+                  ? '新建工具包'
+                  : _tab == 2
+                      ? '优质源'
+                      : '新增一档',
+          style: const TextStyle(fontSize: 12.5),
+        ),
+      ),
     );
   }
 
   Widget _tabBar() {
-    const labels = ['内容引进', '再创作', '流量算法'];
-    const icons = [Icons.video_library_outlined, Icons.build_outlined, Icons.alt_route];
+    const labels = ['内容引进', '再创作', '流量算法', '分级'];
+    const icons = [
+      Icons.video_library_outlined,
+      Icons.build_outlined,
+      Icons.alt_route,
+      Icons.signal_cellular_alt,
+    ];
     return Container(
       color: Colors.white,
       padding: const EdgeInsets.fromLTRB(12, 6, 12, 8),
@@ -1015,7 +1202,7 @@ class _CulturePageState extends State<CulturePage> {
               },
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 160),
-                margin: EdgeInsets.only(right: i == 2 ? 0 : 6),
+                margin: EdgeInsets.only(right: i == labels.length - 1 ? 0 : 5),
                 padding: const EdgeInsets.symmetric(vertical: 9),
                 decoration: BoxDecoration(
                   color: on ? kCultureAccent : const Color(0xFFF1F5F9),
@@ -1025,11 +1212,11 @@ class _CulturePageState extends State<CulturePage> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Icon(icons[i],
-                        size: 15, color: on ? Colors.white : kCultureSub),
-                    const SizedBox(width: 4),
+                        size: 14, color: on ? Colors.white : kCultureSub),
+                    const SizedBox(width: 3),
                     Text(labels[i],
                         style: TextStyle(
-                          fontSize: 12,
+                          fontSize: 11.5,
                           fontWeight: FontWeight.w700,
                           color: on ? Colors.white : kCultureSub,
                         )),
@@ -1620,6 +1807,14 @@ class _CulturePageState extends State<CulturePage> {
               if (lib != null)
                 Text('${lib['icon'] ?? ''} ${lib['name']}',
                     style: const TextStyle(fontSize: 10.5, color: kCultureSub)),
+              IconButton(
+                tooltip: '编辑 / 删除',
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+                icon: const Icon(Icons.more_horiz, size: 18, color: kCultureSub),
+                onPressed: () => _kitMenu(kit),
+              ),
             ]),
             if ('${kit['goal'] ?? ''}'.trim().isNotEmpty) ...[
               const SizedBox(height: 7),
@@ -1652,6 +1847,30 @@ class _CulturePageState extends State<CulturePage> {
         ),
       ),
     );
+  }
+
+  Future _kitMenu(Map kit) async {
+    final act = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _sheetShell(
+        title: '${kit['title'] ?? ''}',
+        children: [
+          _sheetAction(Icons.open_in_new, '打开（编辑内容 / 步骤）', 'open'),
+          _sheetAction(Icons.delete_outline, '删除这个工具包', 'delete', danger: true),
+        ],
+      ),
+    );
+    if (act == 'open') _openKit(kit);
+    if (act == 'delete') {
+      final ok = await _confirm(
+          '删除这个工具包？', '「${kit['title'] ?? ''}」会消失，不能撤销。');
+      if (!ok) return;
+      await widget.db
+          .delete('culture_kits', where: 'id = ?', whereArgs: [kit['id']]);
+      await _reload();
+      if (mounted) _toast('已删除');
+    }
   }
 
   // ---------- 流量算法 ----------
@@ -1895,6 +2114,371 @@ class _CulturePageState extends State<CulturePage> {
     );
   }
 
+
+  // ---------- 分级 ----------
+
+  Widget _gradeBody() {
+    final b = _battery;
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 90),
+      children: [
+        Container(
+          padding: const EdgeInsets.fromLTRB(14, 13, 14, 13),
+          decoration: BoxDecoration(
+            gradient: const LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [Color(0xFF0E7490), Color(0xFF155E75)],
+            ),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Row(children: [
+              Icon(Icons.signal_cellular_alt, size: 17, color: Colors.white),
+              SizedBox(width: 6),
+              Text('不是所有娱乐都适合所有电量',
+                  style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white)),
+            ]),
+            const SizedBox(height: 7),
+            Text(
+              b == null
+                  ? '同一件事，满血时是放松，见底时是透支。先去「医疗」记一次电量，这里会高亮你所在的档位。'
+                  : '同一件事，满血时是放松，见底时是透支。当前 $b%，下面高亮的就是你现在这一档。',
+              style: const TextStyle(
+                  fontSize: 11.5, height: 1.65, color: Color(0xFFCFFAFE)),
+            ),
+          ]),
+        ),
+        const SizedBox(height: 12),
+        if (_grades.isEmpty)
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: kCultureLine),
+            ),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('还没有分级',
+                  style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: kCultureInk)),
+              const SizedBox(height: 6),
+              const Text(
+                '按电量分几档，每档写清能做什么、别碰什么。'
+                '删空了可以点右上角菜单「恢复内置分级」。',
+                style: TextStyle(fontSize: 11.5, height: 1.6, color: kCultureSub),
+              ),
+              const SizedBox(height: 10),
+              FilledButton.icon(
+                style: FilledButton.styleFrom(backgroundColor: kCultureAccent),
+                onPressed: () => _restoreGrades(),
+                icon: const Icon(Icons.restore, size: 17),
+                label: const Text('恢复内置四档'),
+              ),
+            ]),
+          )
+        else
+          for (final g in _grades)
+            _gradeCard(
+              Map<String, dynamic>.from(g as Map),
+              isCurrent: b != null &&
+                  b >= ((g['min_b'] as num?)?.toInt() ?? 0) &&
+                  b <= ((g['max_b'] as num?)?.toInt() ?? 100),
+            ),
+      ],
+    );
+  }
+
+  Widget _gradeCard(Map<String, dynamic> g, {required bool isCurrent}) {
+    final color = cultureGradeColor(((g['max_b'] as num?)?.toInt() ?? 100));
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: BoxDecoration(
+        color: isCurrent ? color.withOpacity(0.05) : Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+            color: isCurrent ? color.withOpacity(0.5) : kCultureLine,
+            width: isCurrent ? 1.4 : 1),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(13, 8, 4, 2),
+          child: Row(children: [
+            Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+            const SizedBox(width: 7),
+            Text('${g['name']}',
+                style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: kCultureInk)),
+            const SizedBox(width: 6),
+            Text('${g['min_b']}–${g['max_b']}%',
+                style: const TextStyle(fontSize: 11, color: kCultureSub)),
+            if (isCurrent) ...[
+              const SizedBox(width: 6),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+                decoration: BoxDecoration(
+                    color: color, borderRadius: BorderRadius.circular(4)),
+                child: const Text('你在这里',
+                    style: TextStyle(
+                        fontSize: 9,
+                        color: Colors.white,
+                        fontWeight: FontWeight.w700)),
+              ),
+            ],
+            const Spacer(),
+            IconButton(
+              tooltip: '编辑 / 删除',
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.more_horiz, size: 18, color: kCultureSub),
+              onPressed: () => _gradeMenu(g),
+            ),
+          ]),
+        ),
+        if ('${g['note'] ?? ''}'.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(28, 0, 13, 4),
+            child: Text('${g['note']}',
+                style: const TextStyle(fontSize: 10.5, color: kCultureSub)),
+          ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(13, 4, 13, 4),
+          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Icon(Icons.check_circle_outline,
+                size: 14, color: Color(0xFF15803D)),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text('可以：${'${g['allow'] ?? ''}'.isEmpty ? '—' : g['allow']}',
+                  style: const TextStyle(
+                      fontSize: 11.5, height: 1.55, color: kCultureInk)),
+            ),
+          ]),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(13, 0, 13, 11),
+          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Icon(Icons.block, size: 14, color: Color(0xFFDC2626)),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text('别碰：${'${g['forbid'] ?? ''}'.isEmpty ? '—' : g['forbid']}',
+                  style: const TextStyle(
+                      fontSize: 11.5, height: 1.55, color: kCultureInk)),
+            ),
+          ]),
+        ),
+      ]),
+    );
+  }
+
+  Future _gradeMenu(Map g) async {
+    final act = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _sheetShell(
+        title: '${g['name']} · ${g['min_b']}–${g['max_b']}%',
+        children: [
+          _sheetAction(Icons.edit_outlined, '编辑这一档', 'edit'),
+          _sheetAction(Icons.delete_outline, '删除这一档', 'delete', danger: true),
+        ],
+      ),
+    );
+    if (act == 'edit') _editGrade(g);
+    if (act == 'delete') _deleteGrade(g);
+  }
+
+  Future _editGrade([Map? g]) async {
+    final nameCtrl = TextEditingController(text: '${g?['name'] ?? ''}');
+    final minCtrl =
+        TextEditingController(text: '${(g?['min_b'] as num?)?.toInt() ?? 0}');
+    final maxCtrl =
+        TextEditingController(text: '${(g?['max_b'] as num?)?.toInt() ?? 100}');
+    final allowCtrl = TextEditingController(text: '${g?['allow'] ?? ''}');
+    final forbidCtrl = TextEditingController(text: '${g?['forbid'] ?? ''}');
+    final noteCtrl = TextEditingController(text: '${g?['note'] ?? ''}');
+    String? err;
+
+    final ok = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => Container(
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+          ),
+          padding: EdgeInsets.fromLTRB(
+              16, 14, 16, 16 + MediaQuery.of(ctx).viewInsets.bottom),
+          child: SingleChildScrollView(
+            child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(g == null ? '新增一档' : '编辑分级',
+                      style: const TextStyle(
+                          fontSize: 15, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: nameCtrl,
+                    autofocus: true,
+                    style: const TextStyle(fontSize: 13),
+                    decoration: const InputDecoration(
+                        labelText: '档位名（例：绿灯区）',
+                        isDense: true,
+                        border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(children: [
+                    Expanded(
+                      child: TextField(
+                        controller: minCtrl,
+                        keyboardType: TextInputType.number,
+                        style: const TextStyle(fontSize: 13),
+                        decoration: const InputDecoration(
+                            labelText: '电量下限 %',
+                            isDense: true,
+                            border: OutlineInputBorder()),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: TextField(
+                        controller: maxCtrl,
+                        keyboardType: TextInputType.number,
+                        style: const TextStyle(fontSize: 13),
+                        decoration: const InputDecoration(
+                            labelText: '电量上限 %',
+                            isDense: true,
+                            border: OutlineInputBorder()),
+                      ),
+                    ),
+                  ]),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: allowCtrl,
+                    minLines: 1,
+                    maxLines: 3,
+                    style: const TextStyle(fontSize: 12.5),
+                    decoration: const InputDecoration(
+                        labelText: '这一档可以做什么',
+                        isDense: true,
+                        border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: forbidCtrl,
+                    minLines: 1,
+                    maxLines: 3,
+                    style: const TextStyle(fontSize: 12.5),
+                    decoration: const InputDecoration(
+                        labelText: '这一档别碰什么',
+                        isDense: true,
+                        border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: noteCtrl,
+                    style: const TextStyle(fontSize: 12.5),
+                    decoration: const InputDecoration(
+                        labelText: '备注（一句话）',
+                        isDense: true,
+                        border: OutlineInputBorder()),
+                  ),
+                  if (err != null) ...[
+                    const SizedBox(height: 8),
+                    Text(err!,
+                        style: const TextStyle(
+                            fontSize: 11.5, color: Color(0xFFDC2626))),
+                  ],
+                  const SizedBox(height: 14),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton(
+                      style: FilledButton.styleFrom(
+                          backgroundColor: kCultureAccent,
+                          padding: const EdgeInsets.symmetric(vertical: 12)),
+                      onPressed: () {
+                        final minB = int.tryParse(minCtrl.text.trim());
+                        final maxB = int.tryParse(maxCtrl.text.trim());
+                        if (nameCtrl.text.trim().isEmpty) {
+                          setD(() => err = '档位名不能为空');
+                          return;
+                        }
+                        if (minB == null || maxB == null) {
+                          setD(() => err = '电量区间要填数字');
+                          return;
+                        }
+                        if (minB < 0 || maxB > 100 || minB > maxB) {
+                          setD(() => err = '区间要在 0–100 之间，且下限不大于上限');
+                          return;
+                        }
+                        Navigator.pop(ctx, true);
+                      },
+                      child: const Text('保存',
+                          style: TextStyle(
+                              fontSize: 13.5, fontWeight: FontWeight.w700)),
+                    ),
+                  ),
+                ]),
+          ),
+        ),
+      ),
+    );
+    if (ok != true) return;
+    final tier = g == null
+        ? (_grades
+                    .map((e) => (e['tier'] as num?)?.toInt() ?? 0)
+                    .fold<int>(0, math.max) +
+                1)
+        : (g['tier'] as num?)?.toInt() ?? 0;
+    await CultureDb.saveGrade(
+      widget.db,
+      {
+        'tier': tier,
+        'name': nameCtrl.text.trim(),
+        'min_b': int.parse(minCtrl.text.trim()),
+        'max_b': int.parse(maxCtrl.text.trim()),
+        'allow': allowCtrl.text.trim(),
+        'forbid': forbidCtrl.text.trim(),
+        'note': noteCtrl.text.trim(),
+        'sort_order': g == null ? _grades.length : (g['sort_order'] ?? 0),
+      },
+      id: (g?['id'] as num?)?.toInt(),
+    );
+    await _reload();
+    if (mounted) _toast(g == null ? '已新增一档' : '已保存');
+  }
+
+  Future _deleteGrade(Map g) async {
+    final ok = await _confirm(
+        '删除「${g['name']}」？', '这一档的允许 / 禁止内容会一起消失，不能撤销。');
+    if (!ok) return;
+    final done = await CultureDb.deleteGrade(widget.db, g['id'] as int);
+    if (!done) {
+      if (mounted) _toast('至少保留一档，不能全删');
+      return;
+    }
+    await _reload();
+    if (mounted) _toast('已删除');
+  }
+
+  Future _restoreGrades() async {
+    final n = await CultureDb.restoreGrades(widget.db);
+    await _reload();
+    if (!mounted) return;
+    _toast(n == 0 ? '内置四档都在，不用恢复' : '已补回 $n 档');
+  }
+
   Future _openExternalOrEmbed(String url, String title) async {
     final db = widget.db;
     final canEmbed = Platform.isAndroid || Platform.isIOS;
@@ -1983,8 +2567,9 @@ class _CulturePageState extends State<CulturePage> {
             _HelpLine('内容引进', '别再从推荐流里碰运气。按聚焦维度建库，一条内容 = 链接 + 一句话，找的时候搜关键词，10 秒拿到。'),
             _HelpLine('再创作', '看完不等于留下。把内容转成工具包：目标、步骤、模板正文，勾着做完，能复制能分享。'),
             _HelpLine('流量算法', '把真正好的源钉住并排权重，每天只从里面取 3 条，用内置浏览器看完就走，不跳去别的 App。'),
+            _HelpLine('分级', '同一件事在满血和见底时性质不同。四档写清能做什么、别碰什么；医疗页记一次电量，这里会高亮你在哪一档。'),
             SizedBox(height: 6),
-            Text('长按库名可以改名 / 删除；长按内容可以收藏、标记看完、转工具包。',
+            Text('库、内容、工具包、优质源、分级都可以编辑和删除：点条目右上角「⋯」或在详情页里改，改完即存。',
                 style: TextStyle(fontSize: 11.5, height: 1.6, color: kCultureSub)),
           ]),
         ),

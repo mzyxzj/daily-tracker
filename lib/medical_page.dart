@@ -79,16 +79,6 @@ List<Map> medicalSortTreats(List plans, int battery) {
   return list;
 }
 
-/// 当前电量落在哪一档，用来在分级表里标「你在这里」。
-Map? medicalCurrentGrade(List grades, int battery) {
-  for (final g in grades) {
-    final lo = (g['min_b'] as num?)?.toInt() ?? 0;
-    final hi = (g['max_b'] as num?)?.toInt() ?? 100;
-    if (battery >= lo && battery <= hi) return Map<String, dynamic>.from(g as Map);
-  }
-  return null;
-}
-
 /// 一行一条：把多行文本拆成步骤，空行丢掉。
 List<String> medicalSplitLines(String raw) => raw
     .split(RegExp(r'\r?\n'))
@@ -157,45 +147,6 @@ const List<Map<String, dynamic>> kMedicalBuiltinPlans = [
   {'kind': 'treat', 'title': '23:00 前上床', 'trigger': '', 'steps': [], 'minutes': 30, 'gain': 30, 'tier': 0},
   {'kind': 'treat', 'title': '和人聊 15 分钟（不谈工作）', 'trigger': '', 'steps': [], 'minutes': 15, 'gain': 15, 'tier': 0},
   {'kind': 'treat', 'title': '断网 30 分钟', 'trigger': '', 'steps': [], 'minutes': 30, 'gain': 15, 'tier': 0},
-];
-
-const List<Map<String, dynamic>> kMedicalBuiltinGrades = [
-  {
-    'tier': 1,
-    'name': '绿灯区',
-    'min_b': 60,
-    'max_b': 100,
-    'allow': '长视频 / 游戏 / 深度学习 / 正经社交',
-    'forbid': '别熬过 12 点（这条永远生效）',
-    'note': '血条够，难的事放这一档做',
-  },
-  {
-    'tier': 2,
-    'name': '黄灯区',
-    'min_b': 30,
-    'max_b': 59,
-    'allow': '短内容 / 轻运动 / 整理桌面',
-    'forbid': '开新坑 / 做重大决定 / 吵架',
-    'note': '还能推，但别加负载',
-  },
-  {
-    'tier': 3,
-    'name': '橙灯区',
-    'min_b': 15,
-    'max_b': 29,
-    'allow': '音乐 / 散步 / 洗澡 / 发呆',
-    'forbid': '短视频 / 游戏 / 学习 / 刷购物',
-    'note': '省电模式，只维持秩序',
-  },
-  {
-    'tier': 4,
-    'name': '红灯区',
-    'min_b': 0,
-    'max_b': 14,
-    'allow': '躺下 / 闭眼 / 喝水 / 洗漱',
-    'forbid': '一切屏幕 / 任何提议 / 任何决策',
-    'note': '只执行最低限度日程',
-  },
 ];
 
 // ==================== 数据访问 ====================
@@ -285,19 +236,6 @@ class MedicalDb {
         'created_at': now,
       });
     }
-    for (var i = 0; i < kMedicalBuiltinGrades.length; i++) {
-      final g = kMedicalBuiltinGrades[i];
-      await db.insert('medical_grades', {
-        'tier': g['tier'],
-        'name': g['name'],
-        'min_b': g['min_b'],
-        'max_b': g['max_b'],
-        'allow': g['allow'],
-        'forbid': g['forbid'],
-        'note': g['note'],
-        'sort_order': i,
-      });
-    }
     await _setState(db, 'medical_seeded', '1');
   }
 
@@ -325,23 +263,6 @@ class MedicalDb {
         'created_at': now,
       });
       added++;
-    }
-    final gradeCount = (await db.query('medical_grades')).length;
-    if (gradeCount == 0) {
-      for (var i = 0; i < kMedicalBuiltinGrades.length; i++) {
-        final g = kMedicalBuiltinGrades[i];
-        await db.insert('medical_grades', {
-          'tier': g['tier'],
-          'name': g['name'],
-          'min_b': g['min_b'],
-          'max_b': g['max_b'],
-          'allow': g['allow'],
-          'forbid': g['forbid'],
-          'note': g['note'],
-          'sort_order': i,
-        });
-        added++;
-      }
     }
     return added;
   }
@@ -446,9 +367,8 @@ class MedicalPage extends StatefulWidget {
 }
 
 class _MedicalPageState extends State<MedicalPage> {
-  int _tab = 0; // 0 预防 1 急救 2 治疗 3 分级
+  int _tab = 0; // 0 预防 1 急救 2 治疗（分级已移到「文化」）
   List _plans = [];
-  List _grades = [];
   List _weekly = [];
   Map<String, dynamic> _stats = {};
   bool _loading = true;
@@ -467,15 +387,12 @@ class _MedicalPageState extends State<MedicalPage> {
       await MedicalDb.seedBuiltins(db);
       final plans = await db.query('medical_plans',
           where: 'active = 1', orderBy: 'sort_order ASC, id ASC');
-      final grades =
-          await db.query('medical_grades', orderBy: 'sort_order ASC, tier ASC');
       final weekly = await MedicalDb.weeklyMin(db);
       final stats = await MedicalDb.todayStats(db);
       await MedicalDb.refreshSignals(db);
       if (!mounted) return;
       setState(() {
         _plans = plans;
-        _grades = grades;
         _weekly = weekly;
         _stats = stats;
         _loading = false;
@@ -883,76 +800,6 @@ class _MedicalPageState extends State<MedicalPage> {
     _load();
   }
 
-  Future _editGrade(Map g) async {
-    final allowCtrl = TextEditingController(text: '${g['allow'] ?? ''}');
-    final forbidCtrl = TextEditingController(text: '${g['forbid'] ?? ''}');
-    final noteCtrl = TextEditingController(text: '${g['note'] ?? ''}');
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('${g['name']} · ${g['min_b']}–${g['max_b']}%',
-            style: const TextStyle(fontSize: 15)),
-        content: SingleChildScrollView(
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            TextField(
-              controller: allowCtrl,
-              minLines: 2,
-              maxLines: 4,
-              style: const TextStyle(fontSize: 12.5),
-              decoration: const InputDecoration(
-                  labelText: '允许做什么（顿号或换行分隔）',
-                  isDense: true,
-                  border: OutlineInputBorder()),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: forbidCtrl,
-              minLines: 2,
-              maxLines: 4,
-              style: const TextStyle(fontSize: 12.5),
-              decoration: const InputDecoration(
-                  labelText: '禁止做什么',
-                  isDense: true,
-                  border: OutlineInputBorder()),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: noteCtrl,
-              style: const TextStyle(fontSize: 12.5),
-              decoration: const InputDecoration(
-                  labelText: '一句话说明', isDense: true, border: OutlineInputBorder()),
-            ),
-          ]),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
-          FilledButton(
-              style: FilledButton.styleFrom(backgroundColor: kMedAccent),
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('保存')),
-        ],
-      ),
-    );
-    if (ok == true) {
-      await widget.db.update(
-        'medical_grades',
-        {
-          'allow': allowCtrl.text.trim(),
-          'forbid': forbidCtrl.text.trim(),
-          'note': noteCtrl.text.trim(),
-        },
-        where: 'id = ?',
-        whereArgs: [g['id']],
-      );
-      _load();
-    }
-    allowCtrl.dispose();
-    forbidCtrl.dispose();
-    noteCtrl.dispose();
-  }
-
-  // ---------- 界面 ----------
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -989,7 +836,7 @@ class _MedicalPageState extends State<MedicalPage> {
           ),
           PopupMenuButton<String>(
             onSelected: (v) async {
-              if (v == 'plan') _editPlan(kind: _tab == 3 ? 'prevent' : _byKindName(_tab));
+              if (v == 'plan') _editPlan(kind: _byKindName(_tab));
               if (v == 'restore') {
                 final n = await MedicalDb.restoreBuiltins(widget.db);
                 _load();
@@ -1015,9 +862,7 @@ class _MedicalPageState extends State<MedicalPage> {
               _tabBar(),
               Expanded(child: _body()),
             ]),
-      floatingActionButton: _tab == 3
-          ? null
-          : FloatingActionButton.extended(
+      floatingActionButton: FloatingActionButton.extended(
               backgroundColor: kMedAccent,
               onPressed: () {
                 if (_tab == 1) {
@@ -1206,8 +1051,8 @@ class _MedicalPageState extends State<MedicalPage> {
   }
 
   Widget _tabBar() {
-    const labels = ['预防', '急救', '治疗', '分级'];
-    const icons = [Icons.shield_outlined, Icons.emergency_outlined, Icons.healing_outlined, Icons.signal_cellular_alt];
+    const labels = ['预防', '急救', '治疗'];
+    const icons = [Icons.shield_outlined, Icons.emergency_outlined, Icons.healing_outlined];
     return Container(
       color: Colors.white,
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
@@ -1220,7 +1065,7 @@ class _MedicalPageState extends State<MedicalPage> {
             onTap: () => setState(() => _tab = i),
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 150),
-              margin: EdgeInsets.only(right: i == 3 ? 0 : 6),
+              margin: EdgeInsets.only(right: i == 2 ? 0 : 6),
               padding: const EdgeInsets.symmetric(vertical: 9),
               decoration: BoxDecoration(
                 color: on ? activeColor : const Color(0xFFF1F5F9),
@@ -1248,10 +1093,8 @@ class _MedicalPageState extends State<MedicalPage> {
         return _preventBody();
       case 1:
         return _emergencyBody();
-      case 2:
-        return _treatBody();
       default:
-        return _gradeBody();
+        return _treatBody();
     }
   }
 
@@ -1469,107 +1312,18 @@ class _MedicalPageState extends State<MedicalPage> {
         TextButton(
           style: TextButton.styleFrom(
             foregroundColor: kMedAccent,
-            padding: const EdgeInsets.symmetric(horizontal: 10),
+            padding: const EdgeInsets.symmetric(horizontal: 8),
             minimumSize: const Size(0, 32),
             tapTargetSize: MaterialTapTargetSize.shrinkWrap,
           ),
           onPressed: () => _useTreat(plan),
           child: const Text('用了', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
         ),
-      ]),
-    );
-  }
-
-  // ---------- 分级 ----------
-
-  Widget _gradeBody() {
-    final current = medicalCurrentGrade(_grades, _battery);
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 90),
-      children: [
-        _tipCard(
-          Icons.signal_cellular_alt,
-          '不是所有娱乐都适合所有电量',
-          '同一件事，满血时是放松，见底时是透支。先看自己在哪一档，再看这一档允许什么。',
-        ),
-        const SizedBox(height: 10),
-        for (final g in _grades)
-          _gradeCard(Map<String, dynamic>.from(g as Map),
-              isCurrent: current != null && current['id'] == g['id']),
-      ],
-    );
-  }
-
-  Widget _gradeCard(Map<String, dynamic> g, {required bool isCurrent}) {
-    final color = medicalBatteryColor(((g['max_b'] as num?)?.toInt() ?? 100));
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      decoration: BoxDecoration(
-        color: isCurrent ? color.withOpacity(0.05) : Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-            color: isCurrent ? color.withOpacity(0.5) : kMedLine,
-            width: isCurrent ? 1.4 : 1),
-      ),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(13, 10, 6, 2),
-          child: Row(children: [
-            Container(width: 8, height: 8,
-                decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
-            const SizedBox(width: 7),
-            Text('${g['name']}',
-                style: const TextStyle(
-                    fontSize: 13, fontWeight: FontWeight.w700, color: kMedInk)),
-            const SizedBox(width: 6),
-            Text('${g['min_b']}–${g['max_b']}%',
-                style: const TextStyle(fontSize: 11, color: kMedSub)),
-            if (isCurrent) ...[
-              const SizedBox(width: 6),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
-                decoration: BoxDecoration(
-                    color: color, borderRadius: BorderRadius.circular(4)),
-                child: const Text('你在这里',
-                    style: TextStyle(
-                        fontSize: 9, color: Colors.white, fontWeight: FontWeight.w700)),
-              ),
-            ],
-            const Spacer(),
-            IconButton(
-              visualDensity: VisualDensity.compact,
-              icon: const Icon(Icons.edit_outlined, size: 16, color: kMedSub),
-              onPressed: () => _editGrade(g),
-            ),
-          ]),
-        ),
-        if ('${g['note'] ?? ''}'.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(28, 0, 13, 4),
-            child: Text('${g['note']}',
-                style: const TextStyle(fontSize: 10.5, color: kMedSub)),
-          ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(13, 4, 13, 4),
-          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Icon(Icons.check_circle_outline, size: 14, color: Color(0xFF15803D)),
-            const SizedBox(width: 6),
-            Expanded(
-              child: Text('可以：${g['allow'] ?? '—'}',
-                  style: const TextStyle(fontSize: 11.5, height: 1.55, color: kMedInk)),
-            ),
-          ]),
-        ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(13, 0, 13, 11),
-          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Icon(Icons.block, size: 14, color: Color(0xFFDC2626)),
-            const SizedBox(width: 6),
-            Expanded(
-              child: Text('别碰：${g['forbid'] ?? '—'}',
-                  style: const TextStyle(fontSize: 11.5, height: 1.55, color: kMedInk)),
-            ),
-          ]),
+        IconButton(
+          tooltip: '编辑 / 删除',
+          visualDensity: VisualDensity.compact,
+          icon: const Icon(Icons.more_horiz, size: 18, color: kMedSub),
+          onPressed: () => _planMenu(plan, 'treat'),
         ),
       ]),
     );
@@ -1820,9 +1574,9 @@ class _MedicalPageState extends State<MedicalPage> {
               _MedHelpLine('预防', '在电量掉下去之前拦一道。每条都有触发信号，信号出现就执行，不靠意志力。'),
               _MedHelpLine('急救', '已经崩了就别分析。全屏一步一步走，一次只看一条，不用做选择。'),
               _MedHelpLine('治疗', '把电量补回来。按当前电量推荐，记录实际恢复量，慢慢形成你自己的排序。'),
-              _MedHelpLine('分级', '不同电量档位，哪些娱乐允许、哪些禁止。先看自己在哪一档。'),
               SizedBox(height: 4),
-              Text('顶部血条可以随时记录；低于 15% 会变红并直接给急救入口。',
+              Text('顶部血条可以随时记录；低于 15% 会变红并直接给急救入口。'
+                  '\n「电量分级」已移到「文化 · 分级」，和娱乐选择放在一起。',
                   style: TextStyle(fontSize: 11.5, height: 1.6, color: kMedSub)),
             ]),
           ),

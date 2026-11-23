@@ -63,7 +63,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
-      version: 12,
+      version: 13,
       onCreate: (db, v) async {
         await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, allow_inherit INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE status_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, value TEXT DEFAULT "", UNIQUE(item_id, date))');
@@ -81,6 +81,11 @@ class AppDatabase {
         await MedicalDb.ensureTables(db);
       },
       onUpgrade: (db, oldV, newV) async {
+        if (oldV.compareTo(13) == -1) {
+          // 分级从医疗搬到文化：ensureTables 会把旧 medical_grades 原样迁到 culture_grades，
+          // 用户之前改过的档位文案不会丢。
+          try { await CultureDb.ensureTables(db); } catch (_) {}
+        }
         if (oldV.compareTo(2) == -1) {
           try { await db.execute("ALTER TABLE schedule_items ADD COLUMN plan_info TEXT DEFAULT ''"); } catch (_) {}
         }

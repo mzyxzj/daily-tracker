@@ -1,37 +1,33 @@
-# Empire-V2.1 覆盖清单（2.7.0）
+# Empire-V2.1 覆盖清单（2.8.0）
 
 整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml`。
 
-> 本版在文化模块基础上加了「医疗」，和「规划 / 文化」同级（底部第 7 个 tab）。
-> 新增 `lib/medical_page.dart`（约 1,500 行）。
+> 本版两件事：
+> 1. **「分级」从医疗搬到文化**，成为文化的第四个板块（内容引进 / 再创作 / 流量算法 / 分级）。
+>    医疗只剩预防 / 急救 / 治疗。旧 `medical_grades` 的数据会在升级时原样迁到
+>    `culture_grades`，用户改过的档位文案不丢。
+> 2. **文化 / 医疗的全部条目都能编辑、删除、保存**：资源库、内容、工具包、优质源、分级、
+>    预防预案、急救预案、恢复手段。列表右上角「⋯」或详情页均可改，改完立刻落库刷新。
 >
-> 1. **血条**：顶部常驻前额叶电量，最近值 / 今日最低 / 急救次数 / 治疗次数 / 7 日最低柱图；
->    <15% 变红并给急救入口。
-> 2. **预防**：防电量过低 / 防暴食 / 防恐慌式学习，每条「触发信号 + 3 动作」，当天可打卡。
-> 3. **急救**：<15% 四步（放空 / 停高耗能 / 不提提议 / 只做最低日程）+ 暴食止损 +
->    恐慌熬夜止损；全屏急救模式一次一步，决策次数为 0。
-> 4. **治疗**：8 种恢复手段，按「恢复 ÷ 耗时」和当前电量排序，记录实际恢复量。
-> 5. **分级**：四档电量对应的允许 / 禁止娱乐，可编辑，当前档位高亮。
+> 数据库 12 → **13**（新增 `culture_grades`）；无新增依赖；治疗卡片补了「⋯」菜单。
 >
-> 数据库 11 → **12**，新增 4 张表；医疗信号写入 `ui_states`。
-> 无新增依赖。
->
-> 覆盖文件：`lib/medical_page.dart`、`lib/main.dart`、`pubspec.yaml`、`README.md`、`FILES.md`。
+> 覆盖文件：`lib/culture_page.dart`、`lib/medical_page.dart`、`lib/main.dart`、
+> `pubspec.yaml`、`README.md`、`FILES.md`。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
-| `pubspec.yaml` | 448 | `4f573b30babea68566eb8951dc7a77ec` |
-| `README.md` | 13,270 | `7a95a40e94b2925b998d7715f9ebfeb0` |
+| `pubspec.yaml` | 448 | `44883371e9a31526e3b3246fea15050c` |
+| `README.md` | 16,131 | `b12544185e0cbdfc3a20ed71e8dfacdc` |
 | `.github/workflows/build.yml` | 5,522 | `1b9488bba4d632454cbb8db0023738c6` |
-| `lib/main.dart` | 132,496 | `a51d261082107f65476f3b6c6aaf3fb8` |
+| `lib/main.dart` | 132,782 | `95be7ed1ce3f3b0ed8f19fa35f8dbacf` |
 | `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
 | `lib/deepseek_sheet.dart` | 72,621 | `ccd3d91379d101cfbbc0ada026a813e3` |
 | `lib/empire_page.dart` | 71,718 | `9bab00fac714fa2db5694fe15d00041d` |
 | `lib/empire_data.dart` | 19,564 | `aaca4183f71cc53fce9777e9181e76c2` |
 | `lib/empire_assets.dart` | 897,977 | `61e06d9173a85e0dc101524597d8acc6` |
-| `lib/culture_page.dart` | 107,012 | `70fe8d8f236120b11b58fc6a782263a6` |
-| `lib/medical_page.dart` | 75,361 | `8fc3fecf1cf221a470dba620b5e619f5` |
+| `lib/culture_page.dart` | 129,681 | `411ff1861576e045359a07d5730da862` |
+| `lib/medical_page.dart` | 66,637 | `cac60111718de4e5939b357a29719d6c` |
 
 ## 领地渲染图（L01→L09）
 
