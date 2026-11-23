@@ -1,29 +1,29 @@
-# Empire-V2.1 覆盖清单（2.6.0）
+# Empire-V2.1 覆盖清单（2.7.0）
 
 整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml`。
 
-> 本版把「文化建设」做成和「规划」同级的模块：底部导航第 6 个 tab「文化」，
-> 新增 `lib/culture_page.dart`（约 2,900 行）。
+> 本版在文化模块基础上加了「医疗」，和「规划 / 文化」同级（底部第 7 个 tab）。
+> 新增 `lib/medical_page.dart`（约 1,500 行）。
 >
-> 1. **内容引进**：按「战略聚焦」维度自动建库（首次落 6 个内置库，删掉的进黑名单
->    不复活）；条目至少能存链接、能打开；横版卡 / 竖版流 / 紧凑列表三种呈现；
->    搜索 + 未看/收藏/看过筛选 + 收藏与最近打开排序，库内 10 秒定位。
-> 2. **再创作**：内容一键转工具包（目标 + 可勾选步骤 + 模板正文），可复制 Markdown、
->    可分享，进度可追踪。
-> 3. **流量算法**：优质源权重排序 + 一键直达；「今日 3 条」按权重/收藏/未读、各库轮流取；
->    WebView 应用内浏览，被拦时回退系统浏览器。
+> 1. **血条**：顶部常驻前额叶电量，最近值 / 今日最低 / 急救次数 / 治疗次数 / 7 日最低柱图；
+>    <15% 变红并给急救入口。
+> 2. **预防**：防电量过低 / 防暴食 / 防恐慌式学习，每条「触发信号 + 3 动作」，当天可打卡。
+> 3. **急救**：<15% 四步（放空 / 停高耗能 / 不提提议 / 只做最低日程）+ 暴食止损 +
+>    恐慌熬夜止损；全屏急救模式一次一步，决策次数为 0。
+> 4. **治疗**：8 种恢复手段，按「恢复 ÷ 耗时」和当前电量排序，记录实际恢复量。
+> 5. **分级**：四档电量对应的允许 / 禁止娱乐，可编辑，当前档位高亮。
 >
-> 数据库 10 → **11**，新增 4 张表（库 / 条目 / 工具包 / 优质源），老库自动补齐。
-> 新依赖：`url_launcher ^6.3.0`、`webview_flutter ^4.10.0`。
+> 数据库 11 → **12**，新增 4 张表；医疗信号写入 `ui_states`。
+> 无新增依赖。
 >
-> 覆盖文件：`lib/culture_page.dart`、`lib/main.dart`、`pubspec.yaml`、`README.md`、`FILES.md`。
+> 覆盖文件：`lib/medical_page.dart`、`lib/main.dart`、`pubspec.yaml`、`README.md`、`FILES.md`。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
-| `pubspec.yaml` | 448 | `61f3a6088bd988d6b2e156a65bc7f8df` |
-| `README.md` | 10,140 | `4ea1084b0064a9dcdd7019fe291ed4c5` |
+| `pubspec.yaml` | 448 | `4f573b30babea68566eb8951dc7a77ec` |
+| `README.md` | 13,270 | `7a95a40e94b2925b998d7715f9ebfeb0` |
 | `.github/workflows/build.yml` | 5,522 | `1b9488bba4d632454cbb8db0023738c6` |
-| `lib/main.dart` | 132,076 | `5df7944c838536b215182c63011ec037` |
+| `lib/main.dart` | 132,496 | `a51d261082107f65476f3b6c6aaf3fb8` |
 | `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
 | `lib/deepseek_sheet.dart` | 72,621 | `ccd3d91379d101cfbbc0ada026a813e3` |
@@ -31,6 +31,7 @@
 | `lib/empire_data.dart` | 19,564 | `aaca4183f71cc53fce9777e9181e76c2` |
 | `lib/empire_assets.dart` | 897,977 | `61e06d9173a85e0dc101524597d8acc6` |
 | `lib/culture_page.dart` | 107,012 | `70fe8d8f236120b11b58fc6a782263a6` |
+| `lib/medical_page.dart` | 75,361 | `8fc3fecf1cf221a470dba620b5e619f5` |
 
 ## 领地渲染图（L01→L09）
 

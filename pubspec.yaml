@@ -1,7 +1,7 @@
 name: daily_tracker
 description: 纯本地个人信息管理工具
 publish_to: 'none'
-version: 2.6.0+6
+version: 2.7.0+7
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
