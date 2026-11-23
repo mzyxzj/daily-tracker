@@ -1,26 +1,28 @@
-# 2.5.2 覆盖清单
+# Empire-V1.2 覆盖清单（2.5.3）
 
 整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml`。
 
-> 本版两件事：
-> 1. **移除「今日联动」看板**（帝国页只留 三维舞台 / 关键参数 / 纪事）。该看板把「战争」
->    与「内政混乱／修养生息」按两个不同维度计数，同一天会被算两次（12+18+14=44 > 42 天），
->    数字差两天容易被当成 bug，所以整块拿掉。
-> 2. **领地舞台可拖拽转动**（2.5D 转台，不是真模型）。左右拖拽给画面加透视偏航，
->    同时带一点俯仰，落地投影跟着位移；松手或双击回正。手势只接管横向，
->    纵向仍可滚动页面。只用 `Transform` + 矩阵，不引入 WebView / 3D 依赖，APK 体积不变。
+> 本版只动反思面板（`lib/deepseek_sheet.dart`）：
+> 1. **首轮正文不再带临时指令**。「将发送给 DeepSeek 的内容」现在只有【日期】/
+>    【今日记录】/【战略聚焦】，末尾那段「请据此做今日反思：先给 3 条核心判断…」整段删掉。
+> 2. **分析方式搬进「分析角色 + 反思指令」**。默认角色「第一性原理复盘官」，默认指令
+>    固定 3 条核心判断 + 四个板块（精力与执行的错配 / 战略聚焦的推进实况 / 系统性风险 /
+>    明日最小动作），每个板块都写了口径。两处都在设置里可改，改完即存。
+> 3. **预设可编辑、可保存**。4 个内置模板只读；「保存当前为预设…」写进
+>    `ui_states.deepseek_presets`；「管理我的预设…」可改名、改角色、改指令、删除、一键套用。
+> 4. 老配置自动升级：V1.1 存过内置指令的，识别后替换为新默认，不会把旧指令锁死。
 >
-> 覆盖文件：`lib/empire_page.dart`、`pubspec.yaml`（+ `FILES.md` 本身）。
+> 覆盖文件：`lib/deepseek_sheet.dart`、`pubspec.yaml`、`README.md`、`FILES.md`。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
-| `pubspec.yaml` | 398 | `86fff89ea41736d1c2c0dfe924807d81` |
-| `README.md` | 3,573 | `7b11c7ac84cfd02334a547fb173757aa` |
+| `pubspec.yaml` | 398 | `adfed19d78f6113d5ac51c88f82b6e3b` |
+| `README.md` | 5,307 | `adc8adacbe0f8c6b27994f979fac9476` |
 | `.github/workflows/build.yml` | 5,522 | `1b9488bba4d632454cbb8db0023738c6` |
 | `lib/main.dart` | 127,122 | `1f75104bc607e3a49efe889f264def79` |
 | `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
-| `lib/deepseek_sheet.dart` | 49,888 | `1eb1c3165082764049ec951d98803031` |
+| `lib/deepseek_sheet.dart` | 68,749 | `161281642cb42e1c98055a34704a5fc6` |
 | `lib/empire_page.dart` | 71,718 | `9bab00fac714fa2db5694fe15d00041d` |
 | `lib/empire_data.dart` | 19,564 | `aaca4183f71cc53fce9777e9181e76c2` |
 | `lib/empire_assets.dart` | 897,977 | `61e06d9173a85e0dc101524597d8acc6` |

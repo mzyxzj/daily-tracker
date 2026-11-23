@@ -1,9 +1,12 @@
-// DeepSeek 反思面板（重构版）
+// DeepSeek 反思面板（V1.2）
 // 设计要点：
 //   1. 气泡式对话：首轮给结论，之后可就任意关注点继续追问（带上下文）
 //   2. 「生成最终结论」把整段对话压成：关注点详答 + 其余维度简答，作为导出正文
 //   3. 设置区整体折叠成一行摘要，展开后才是 Key / 模型 / 提示词 —— 不再堆一整屏
 //   4. 结果按 Markdown 渲染成小标题 + 要点，不再是一大坨纯文本
+//   5. V1.2 起：首轮正文只发「今日记录 + 战略聚焦」，不再追加一段临时指令；
+//      分析方式（3 条判断 + 四个板块）全部收进「分析角色 + 反思指令」，
+//      两处都可编辑、可存成命名预设，下次一键调用。
 
 import 'dart:convert';
 
@@ -19,17 +22,29 @@ const Color _line = Color(0xFFE2E8F0);
 const Color _accent = Color(0xFF4F46E5);
 const Color _green = Color(0xFF10B981);
 
-const String kDefaultRole = '每日状态系统分析师';
+const String kDefaultRole = '第一性原理复盘官';
 
 const String kLegacyPrompt =
     '请从最客观、最理性的第一性原理角度分析我今日的状态记录（饮食、体重波动、运动与情绪精力关联），无需单纯情感安慰，请分条给出：1. 生理与能量机制复盘；2. 系统秩序与潜在风险预警；3. 明日具体可执行改进建议。每条格式如“标题：具体分析”。';
 
-const String kDefaultPrompt =
+/// V1.1 的内置提示词，仅用于老配置自动升级，不再作为默认值。
+const String kV11Prompt =
     '用第一性原理分析我今日的记录，不做情绪安慰。\n'
     '先给 3 条「核心判断」，每行一句、不超过 40 字；\n'
     '再用 ### 小标题分 3—5 个板块，每板块 2—4 句短句；\n'
     '涉及数字要给具体值与方向（升/降、超/欠）；\n'
     '不要复述我的原文，不要总结对话。';
+
+/// 反思指令：分析方式全部写在这里（不再由首轮正文临时下发）。
+const String kDefaultPrompt =
+    '只读今日记录与战略聚焦，只找机制，不做情绪安慰，不复述原文。\n'
+    '① 先给 3 条「核心判断」：每行一句、不超过 30 字，必须是明天能被验证的事实判断（不是评价）。\n'
+    '② 再用 ### 按固定顺序写 4 个板块：\n'
+    '### 精力与执行的错配 —— 精力峰谷落在哪个时段、最难的任务排在哪里、为此付出什么代价（给时段或数字），最后一句纠偏。\n'
+    '### 战略聚焦的推进实况 —— 逐项写「推进到哪一步 / 是否达到完成标准 / 卡在能力还是时间」；没到标准就不算突破。\n'
+    '### 系统性风险 —— 只挑「连续三天会崩」的结构性隐患（睡眠债、日程无缓冲、单点依赖、只输入不产出），每条写清触发条件。\n'
+    '### 明日最小动作 —— 恰好 3 条，每条 ≤30 分钟、写明时间点与完成判据，宁少不多。\n'
+    '③ 涉及数字给具体值与方向（升/降、超/欠）；没记录就写「未记录」，不要猜。';
 
 const String kFinalPrompt =
     '【收口】请基于以上全部对话，输出可以直接归档的最终版。\n'
@@ -41,6 +56,57 @@ const String kFinalPrompt =
     '## 其余维度 · 简略结论\n'
     '每个维度一行，格式「维度：一句话结论」，不超过 25 字；没有新信息就写「维持原判断」。\n\n'
     '不要寒暄，不要重复我的原话，不要写“综上”。';
+
+/// 一条分析预设 = 角色 + 指令。内置模板只读，自定义预设存进 ui_states。
+class _Preset {
+  final String name;
+  final String role;
+  final String prompt;
+  const _Preset(this.name, this.role, this.prompt);
+
+  Map<String, String> toJson() => {'name': name, 'role': role, 'prompt': prompt};
+
+  static _Preset? fromJson(dynamic raw) {
+    if (raw is! Map) return null;
+    final name = (raw['name'] ?? '').toString().trim();
+    if (name.isEmpty) return null;
+    final role = (raw['role'] ?? '').toString().trim();
+    final prompt = (raw['prompt'] ?? '').toString().trim();
+    return _Preset(name, role.isEmpty ? kDefaultRole : role,
+        prompt.isEmpty ? kDefaultPrompt : prompt);
+  }
+}
+
+const List<_Preset> kBuiltinPresets = [
+  _Preset('帝国日课复盘（默认）', kDefaultRole, kDefaultPrompt),
+  _Preset(
+    '代谢与营养精算师',
+    '代谢与营养精算师',
+    '只算能量与营养，不做情绪安慰。\n'
+        '先给 3 条核心判断（每行 ≤30 字）；\n'
+        '再用 ### 分板块：碳水/蛋白/钠的实际摄入与目标差、体重波动的归因（水肿还是热量缺口）、'
+        '训练表现与恢复、明日三餐的具体调整量（给克或份）；\n'
+        '数字给具体值与方向，没记录就写「未记录」，不要猜。',
+  ),
+  _Preset(
+    '精力与执行教练',
+    '精力与执行教练',
+    '只谈精力怎么被用掉，不谈感受。\n'
+        '先给 3 条核心判断；\n'
+        '再用 ### 分板块：精力峰谷与任务难度是否对齐、被切碎的时段、单线程化的减法、'
+        '明日 3 个最小动作（≤30 分钟，带时间点）；\n'
+        '每条给可执行动作，不要口号。',
+  ),
+  _Preset(
+    '战略聚焦推进官',
+    '战略聚焦推进官',
+    '只认完成标准，不认「做了」。\n'
+        '先给 3 条核心判断；\n'
+        '再用 ### 分板块：每项聚焦推进到哪一步、离完成标准差什么、卡在能力还是时间、'
+        '乘数是否该调整、明日每项的最小推进动作；\n'
+        '没到标准的一律写「未突破」。',
+  ),
+];
 
 /// 导出结果：由调用方写库，避免面板直接操作页面状态。
 class DeepSeekExport {
@@ -128,6 +194,7 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
 
   final List<_ChatMsg> _msgs = [];
   final List<Map<String, String>> _api = [];
+  final List<_Preset> _presets = [];
   final Set<int> _openThink = <int>{};
   DeepSeekCall? _call;
 
@@ -188,8 +255,25 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
     _roleCtrl.text = role.isEmpty ? kDefaultRole : role;
 
     final prompt = (cfg['gemPrompt'] ?? '').toString().trim();
-    _promptCtrl.text =
-        (prompt.isEmpty || prompt == kLegacyPrompt) ? kDefaultPrompt : prompt;
+    _promptCtrl.text = (prompt.isEmpty ||
+            prompt == kLegacyPrompt ||
+            prompt == kV11Prompt)
+        ? kDefaultPrompt
+        : prompt;
+
+    _presets.clear();
+    try {
+      final rawPresets = await _getState('deepseek_presets');
+      if (rawPresets != null && rawPresets.trim().isNotEmpty) {
+        final decoded = jsonDecode(rawPresets);
+        if (decoded is List) {
+          for (final e in decoded) {
+            final p = _Preset.fromJson(e);
+            if (p != null) _presets.add(p);
+          }
+        }
+      }
+    } catch (_) {}
 
     final target = (cfg['targetField'] ?? '').toString().trim();
     _targetCtrl.text = (target.isEmpty ||
@@ -230,6 +314,35 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
     return t.isEmpty ? widget.defaultTarget : t;
   }
 
+  // ---------------- 预设（角色 + 指令） ----------------
+  Future<void> _savePresets() async {
+    try {
+      await _putState(
+        'deepseek_presets',
+        jsonEncode([for (final p in _presets) p.toJson()]),
+      );
+    } catch (_) {}
+  }
+
+  /// 当前角色 + 指令命中的预设名（内置或自定义），没有则 null。
+  String? _currentPresetName() {
+    final role = _roleCtrl.text.trim();
+    final prompt = _promptCtrl.text.trim();
+    for (final p in [...kBuiltinPresets, ..._presets]) {
+      if (p.role == role && p.prompt == prompt) return p.name;
+    }
+    return null;
+  }
+
+  void _applyPreset(_Preset p) {
+    setState(() {
+      _roleCtrl.text = p.role;
+      _promptCtrl.text = p.prompt;
+    });
+    _save();
+    if (mounted) setState(() => _status = '已套用「${p.name}」');
+  }
+
   // ---------------- 上下文拼装 ----------------
   String _focusBlock() {
     final rows = widget.focusRows.where((e) => e is Map).toList();
@@ -261,11 +374,11 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
 
   String _firstPayload() {
     final n = widget.focusRows.length;
+    // V1.2：正文只发数据本身。分析方式由「分析角色 + 反思指令」在系统提示里给出，
+    // 不再往正文尾巴上贴一段临时指令。
     return '【日期】${widget.date}\n\n'
         '【今日记录】\n${widget.summaryText.trim()}\n\n'
-        '【战略聚焦 · $n 项，已突破 $_focusDone 项】\n${_focusBlock()}\n\n'
-        '请据此做今日反思：先给 3 条核心判断；再分板块分析「精力与执行的错配」'
-        '「战略聚焦的推进实况」「系统性风险」「明日最小动作」。';
+        '【战略聚焦 · $n 项，已突破 $_focusDone 项】\n${_focusBlock()}';
   }
 
   String _systemPrompt() {
@@ -669,11 +782,17 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
             _presetButton(),
           ],
         ),
-        const SizedBox(height: 10),
+        const SizedBox(height: 6),
+        Text(
+          '首轮只发「今日记录 + 战略聚焦」，所以分析方式全部写在下面：'
+          '角色定立场，指令定结构与板块。改完可存成预设，下次一键调用。',
+          style: const TextStyle(fontSize: 10, height: 1.5, color: _sub),
+        ),
+        const SizedBox(height: 8),
         TextField(
           controller: _promptCtrl,
-          minLines: 3,
-          maxLines: 7,
+          minLines: 5,
+          maxLines: 12,
           style: const TextStyle(fontSize: 12, height: 1.45),
           decoration: _dec('反思指令'),
           onChanged: (_) => _save(),
@@ -821,41 +940,22 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
   }
 
   Widget _presetButton() {
-    return PopupMenuButton<Map>(
+    return PopupMenuButton<int>(
       tooltip: '预设',
       padding: EdgeInsets.zero,
-      onSelected: (p) {
-        setState(() {
-          _roleCtrl.text = '${p['name']}';
-          _promptCtrl.text = '${p['prompt']}';
-        });
-        _save();
+      onSelected: (v) {
+        if (v == -1) {
+          _savePresetDialog();
+          return;
+        }
+        if (v == -2) {
+          _managePresets();
+          return;
+        }
+        final list = [...kBuiltinPresets, ..._presets];
+        if (v >= 0 && v < list.length) _applyPreset(list[v]);
       },
-      itemBuilder: (_) => const [
-        PopupMenuItem(
-          value: {
-            'name': '每日状态系统分析师',
-            'prompt': kDefaultPrompt,
-          },
-          child: Text('系统分析师（默认）', style: TextStyle(fontSize: 13)),
-        ),
-        PopupMenuItem(
-          value: {
-            'name': '代谢与营养精算师',
-            'prompt': '聚焦今日饮食结构（碳水/蛋白质/钠）与体重、训练表现，'
-                '先判断水肿或热量缺口，再给明日三餐的具体调整量。用 ### 分板块。',
-          },
-          child: Text('代谢与营养精算师', style: TextStyle(fontSize: 13)),
-        ),
-        PopupMenuItem(
-          value: {
-            'name': '精力与执行教练',
-            'prompt': '结合今日日程完成度与战略聚焦，找出精力与任务的错配点，'
-                '给明日单线程的减法方案。用 ### 分板块，每条给可执行动作。',
-          },
-          child: Text('精力与执行教练', style: TextStyle(fontSize: 13)),
-        ),
-      ],
+      itemBuilder: (_) => _presetItems(),
       child: Container(
         height: 38,
         padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -876,6 +976,354 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
         ),
       ),
     );
+  }
+
+  /// 菜单顺序必须与 onSelected 里的 index 计算一致：内置 → 自定义 → 操作项。
+  List<PopupMenuEntry<int>> _presetItems() {
+    final items = <PopupMenuEntry<int>>[];
+    items.add(_presetHeader('内置模板'));
+    for (int i = 0; i < kBuiltinPresets.length; i++) {
+      items.add(_presetItem(i, kBuiltinPresets[i]));
+    }
+    if (_presets.isNotEmpty) {
+      items.add(_presetHeader('我的预设'));
+      for (int i = 0; i < _presets.length; i++) {
+        items.add(_presetItem(kBuiltinPresets.length + i, _presets[i]));
+      }
+    }
+    items.add(const PopupMenuDivider(height: 12));
+    items.add(const PopupMenuItem<int>(
+      value: -1,
+      height: 40,
+      child: Row(
+        children: [
+          Icon(Icons.add, size: 15, color: _accent),
+          SizedBox(width: 6),
+          Text('保存当前为预设…',
+              style: TextStyle(fontSize: 12.5, color: _accent)),
+        ],
+      ),
+    ));
+    if (_presets.isNotEmpty) {
+      items.add(const PopupMenuItem<int>(
+        value: -2,
+        height: 40,
+        child: Row(
+          children: [
+            Icon(Icons.tune, size: 15, color: _sub),
+            SizedBox(width: 6),
+            Text('管理我的预设…',
+                style: TextStyle(fontSize: 12.5, color: _ink)),
+          ],
+        ),
+      ));
+    }
+    return items;
+  }
+
+  PopupMenuItem<int> _presetHeader(String label) {
+    return PopupMenuItem<int>(
+      enabled: false,
+      height: 28,
+      child: Text(label,
+          style: const TextStyle(
+              fontSize: 10, color: _sub, fontWeight: FontWeight.w700)),
+    );
+  }
+
+  PopupMenuItem<int> _presetItem(int value, _Preset p) {
+    final bool active = _roleCtrl.text.trim() == p.role &&
+        _promptCtrl.text.trim() == p.prompt;
+    return PopupMenuItem<int>(
+      value: value,
+      height: 46,
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(p.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 12.5, color: _ink)),
+                const SizedBox(height: 1),
+                Text(p.role,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 10, color: _sub)),
+              ],
+            ),
+          ),
+          if (active) const Icon(Icons.check, size: 15, color: _accent),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _savePresetDialog() async {
+    final nameCtrl = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: const Text('保存为预设', style: TextStyle(fontSize: 15)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: nameCtrl,
+              autofocus: true,
+              style: const TextStyle(fontSize: 13),
+              decoration: _dec('预设名称'),
+              onSubmitted: (_) => Navigator.pop(dctx, true),
+            ),
+            const SizedBox(height: 8),
+            const Text('保存当前的分析角色与反思指令；同名会覆盖。',
+                style: TextStyle(fontSize: 10.5, color: _sub)),
+          ],
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dctx, false),
+              child: const Text('取消')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: _accent),
+            onPressed: () => Navigator.pop(dctx, true),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    final name = nameCtrl.text.trim();
+    if (ok != true || name.isEmpty) return;
+    final role = _roleCtrl.text.trim();
+    final preset = _Preset(
+      name,
+      role.isEmpty ? kDefaultRole : role,
+      _promptCtrl.text.trim().isEmpty ? kDefaultPrompt : _promptCtrl.text.trim(),
+    );
+    final int i = _presets.indexWhere((p) => p.name == name);
+    setState(() {
+      if (i >= 0) {
+        _presets[i] = preset;
+      } else {
+        _presets.insert(0, preset);
+      }
+    });
+    await _savePresets();
+    if (!mounted) return;
+    setState(() => _status = '已保存预设「$name」');
+  }
+
+  Future<void> _managePresets() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (mctx) => StatefulBuilder(
+        builder: (mctx, setSheet) {
+          return Container(
+            constraints: BoxConstraints(
+                maxHeight: MediaQuery.of(mctx).size.height * 0.78),
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 14, 8, 8),
+                  child: Row(
+                    children: [
+                      const Expanded(
+                        child: Text('我的预设',
+                            style: TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w700,
+                                color: _ink)),
+                      ),
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        icon: const Icon(Icons.close, size: 20, color: _sub),
+                        onPressed: () => Navigator.pop(mctx),
+                      ),
+                    ],
+                  ),
+                ),
+                if (_presets.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+                    child: Text(
+                      '还没有自定义预设。先把角色和指令调到满意，再点下面的按钮存一条；'
+                      '以后在这里可以改、可以删，也可以一键套用。',
+                      style: const TextStyle(
+                          fontSize: 11.5, height: 1.6, color: _sub),
+                    ),
+                  )
+                else
+                  Flexible(
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                      itemCount: _presets.length,
+                      separatorBuilder: (_, __) =>
+                          const Divider(height: 1, color: _line),
+                      itemBuilder: (_, i) {
+                        final p = _presets[i];
+                        return ListTile(
+                          dense: true,
+                          contentPadding:
+                              const EdgeInsets.symmetric(horizontal: 2),
+                          title: Text(p.name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  fontSize: 13, color: _ink)),
+                          subtitle: Text(
+                              '${p.role} · 指令 ${p.prompt.length} 字',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  fontSize: 10, color: _sub)),
+                          onTap: () {
+                            _applyPreset(p);
+                            Navigator.pop(mctx);
+                          },
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                tooltip: '编辑',
+                                visualDensity: VisualDensity.compact,
+                                icon: const Icon(Icons.edit_outlined,
+                                    size: 17, color: _sub),
+                                onPressed: () async {
+                                  final edited = await _editPresetDialog(p);
+                                  if (edited == null) return;
+                                  setState(() => _presets[i] = edited);
+                                  await _savePresets();
+                                  if (mounted) setSheet(() {});
+                                },
+                              ),
+                              IconButton(
+                                tooltip: '删除',
+                                visualDensity: VisualDensity.compact,
+                                icon: const Icon(Icons.delete_outline,
+                                    size: 17, color: Color(0xFFDC2626)),
+                                onPressed: () async {
+                                  final name = p.name;
+                                  setState(() => _presets.removeAt(i));
+                                  await _savePresets();
+                                  if (mounted) {
+                                    setSheet(() {});
+                                    setState(() => _status = '已删除预设「$name」');
+                                  }
+                                },
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                SafeArea(
+                  top: false,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: _accent,
+                          padding: const EdgeInsets.symmetric(vertical: 11),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(10)),
+                        ),
+                        onPressed: () async {
+                          await _savePresetDialog();
+                          if (mounted) setSheet(() {});
+                        },
+                        icon: const Icon(Icons.add, size: 17),
+                        label: const Text('用当前角色与指令新建预设',
+                            style: TextStyle(
+                                fontSize: 12.5, fontWeight: FontWeight.w700)),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<_Preset?> _editPresetDialog(_Preset base) async {
+    final nameCtrl = TextEditingController(text: base.name);
+    final roleCtrl = TextEditingController(text: base.role);
+    final promptCtrl = TextEditingController(text: base.prompt);
+    final res = await showDialog<_Preset>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: const Text('编辑预设', style: TextStyle(fontSize: 15)),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: nameCtrl,
+                  style: const TextStyle(fontSize: 13),
+                  decoration: _dec('预设名称'),
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: roleCtrl,
+                  style: const TextStyle(fontSize: 13),
+                  decoration: _dec('分析角色'),
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: promptCtrl,
+                  minLines: 4,
+                  maxLines: 9,
+                  style: const TextStyle(fontSize: 12, height: 1.45),
+                  decoration: _dec('反思指令'),
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dctx), child: const Text('取消')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: _accent),
+            onPressed: () {
+              final name = nameCtrl.text.trim();
+              if (name.isEmpty) return;
+              final role = roleCtrl.text.trim();
+              final prompt = promptCtrl.text.trim();
+              Navigator.pop(
+                dctx,
+                _Preset(
+                  name,
+                  role.isEmpty ? kDefaultRole : role,
+                  prompt.isEmpty ? kDefaultPrompt : prompt,
+                ),
+              );
+            },
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    return res;
   }
 
   Widget _scopeRow() {
@@ -941,9 +1389,32 @@ class _DeepSeekSheetState extends State<DeepSeekSheet> {
         content: SizedBox(
           width: double.maxFinite,
           child: SingleChildScrollView(
-            child: SelectableText(
-              _firstPayload(),
-              style: const TextStyle(fontSize: 11.5, height: 1.55, color: _ink),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SelectableText(
+                  _firstPayload(),
+                  style:
+                      const TextStyle(fontSize: 11.5, height: 1.55, color: _ink),
+                ),
+                const SizedBox(height: 12),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF8FAFC),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: _line),
+                  ),
+                  child: Text(
+                    '以上只是数据。分析方式由「分析角色 + 反思指令」决定：'
+                    '${_roleCtrl.text.trim().isEmpty ? kDefaultRole : _roleCtrl.text.trim()}'
+                    '${_currentPresetName() == null ? '' : '（预设：${_currentPresetName()}）'}，'
+                    '可点上面的「预设」切换或存成新的。',
+                    style: const TextStyle(fontSize: 10, height: 1.55, color: _sub),
+                  ),
+                ),
+              ],
             ),
           ),
         ),
