@@ -138,7 +138,11 @@ class ClipPromptActivity : Activity() {
             setPadding(dp(10), dp(8), dp(10), dp(8))
         }
         go.setOnClickListener { openIntake(text, blind) }
-        no.setOnClickListener { finish() }
+        no.setOnClickListener {
+            // 「略过」也算一次消费：关掉后别马上又弹同一条。
+            ClipWatchService.markConsumed()
+            finish()
+        }
 
         card.addView(col)
         card.addView(go)
@@ -155,6 +159,8 @@ class ClipPromptActivity : Activity() {
     }
 
     private fun openIntake(text: String, blind: Boolean) {
+        // 先标记「已消费」：不透传的话，进 App 后页面渲染会再次触发服务，又弹一次。
+        ClipWatchService.markConsumed()
         try {
             val i = Intent(this, MainActivity::class.java)
             i.action = Intent.ACTION_SEND

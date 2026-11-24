@@ -105,7 +105,14 @@ class ClipWatchService : AccessibilityService() {
         val e = event ?: return
         val pkg = e.packageName?.toString() ?: ""
         val now = System.currentTimeMillis()
-        if (pkg.isNotEmpty() && pkg != packageName) {
+
+        // 自己的窗口一律不处理。
+        // 少了这一句：点「整理」跳进来时，App 渲染页面会产生内容变化事件，
+        // 而 15 秒内还在「内容类 App」的上下文里，于是又读一次剪贴板、又弹一次 ——
+        // 用户看到的就是「已经点了整理，进去还问我整不整理」。
+        if (pkg == packageName) return
+
+        if (pkg.isNotEmpty()) {
             lastPkg = pkg
             lastEventAt = now
             if (isContentApp(pkg)) {
@@ -124,13 +131,25 @@ class ClipWatchService : AccessibilityService() {
         val t = e.eventType
 
         // 信号 1：点的就是这个控件 —— 「复制链接」「复制」「Copy」。
-        // B站分享面板、抖音分享面板都是标准按钮，这条在真机上最灵。
+        // B站/抖音分享面板都是标准按钮，这条在真机上最灵。
         if (t == AccessibilityEvent.TYPE_VIEW_CLICKED) {
             val label = nodeLabel(e.source)
-            if (looksLikeCopyAction(label)) {
-                lastCopySignalAt = now
-                checkClip(true, "click")
-                return
+            when (copySignal(label)) {
+                2 -> {
+                    // 明确是「复制链接」，不管在哪个 App 都算数
+                    lastCopySignalAt = now
+                    checkClip(true, "click")
+                    return
+                }
+                1 -> {
+                    // 只写「复制」：微信/QQ 里复制一段聊天文字也会命中，
+                    // 所以只在短视频/内容平台里认（那里的分享面板复制的一定是链接）。
+                    if (isSharePlatform(recentContentPkg)) {
+                        lastCopySignalAt = now
+                        checkClip(true, "click")
+                        return
+                    }
+                }
             }
         }
 
@@ -185,14 +204,40 @@ class ClipWatchService : AccessibilityService() {
         return sb.toString().trim()
     }
 
-    /// 只认短的按钮文字：「复制链接」「复制」「Copy」，避免把正文里出现"复制"的长文本误判。
-    private fun looksLikeCopyAction(label: String): Boolean {
-        if (label.isEmpty() || label.length > 16) return false
+    /// 复制动作的置信度：2 = 明确是链接，1 = 只写了「复制」，0 = 不是。
+    ///
+    /// 为什么要分级：微信/QQ 里长按消息点「复制」也是「复制」两个字，
+    /// 但那是聊天文字，不是外链——这种不该弹。只有分享面板里的「复制链接」才是确定的外链。
+    private fun copySignal(label: String): Int {
+        if (label.isEmpty() || label.length > 16) return 0
         val s = label.lowercase()
-        return s == "复制" || s == "copy" || s.contains("复制链接") ||
-            s.contains("复制地址") || s.contains("复制分享") ||
+        if (s.contains("复制链接") || s.contains("复制地址") || s.contains("复制分享") ||
+            s.contains("拷贝链接") || s.contains("copy link")
+        ) {
+            return 2
+        }
+        val justCopy = s == "复制" || s == "copy" || s == "拷贝" ||
             (s.startsWith("复制") && s.length <= 8) ||
             (s.contains("copy") && s.length <= 12)
+        return if (justCopy) 1 else 0
+    }
+
+    /// 这些 App 的「复制」几乎只出现在分享面板里，等价于复制链接。
+    /// 微信/QQ 故意不在里面：它们的「复制」是复制聊天内容。
+    private fun isSharePlatform(pkg: String): Boolean {
+        val list = arrayOf(
+            "tv.danmaku.bili",
+            "com.ss.android.ugc.aweme",
+            "com.ss.android.ugc.aweme.lite",
+            "com.ss.android.ugc.live",
+            "com.xingin.xhs",
+            "com.zhihu.android",
+            "com.sina.weibo",
+            "com.smile.gifmaker",
+            "com.google.android.youtube"
+        )
+        for (p in list) if (pkg == p) return true
+        return false
     }
 
     private fun looksLikeCopiedToast(t: String): Boolean {
@@ -218,6 +263,9 @@ class ClipWatchService : AccessibilityService() {
     private fun checkClip(force: Boolean, reason: String) {
         if (promptShowing) return
         val now = System.currentTimeMillis()
+        // 用户刚点过「整理」进 App：半分钟内一律不再打扰。
+        // 不然后台那点残留事件会让弹窗在 App 里再冒出来一次。
+        if (now - consumedAt < 30000) return
         if (!force && now - lastCheckAt < 220) return
         lastCheckAt = now
         val text = readClipText()
@@ -540,7 +588,10 @@ class ClipWatchService : AccessibilityService() {
             removeOverlay()
             openApp(text, text.isEmpty())
         }
-        no.setOnClickListener { removeOverlay() }
+        no.setOnClickListener {
+            markConsumed()
+            removeOverlay()
+        }
 
         card.addView(col)
         card.addView(go)
@@ -596,6 +647,12 @@ class ClipWatchService : AccessibilityService() {
         @Volatile var err: String = ""
         // 上次提示到底走通了哪条通道：activity / notification / overlay / none
         @Volatile var promptVia: String = ""
+        // 用户点过「整理」的时间，30 秒内不再弹
+        @Volatile var consumedAt: Long = 0L
+
+        fun markConsumed() {
+            consumedAt = System.currentTimeMillis()
+        }
 
         private var clipListener: ClipboardManager.OnPrimaryClipChangedListener? = null
 

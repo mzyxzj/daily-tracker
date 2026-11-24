@@ -1705,6 +1705,113 @@ class _SidePanel extends StatelessWidget {
 
 // ==================== 内嵌自动播放 ====================
 
+/// B站 的清晰度码 → 给人看的档位名。
+///
+/// B站 player 的 quality 取值：127=8K / 126=杜比 / 125=HDR / 120=4K /
+/// 116=1080P60 / 112=1080P+ / 80=1080P / 74=720P60 / 64=720P / 32=480P / 16=360P。
+/// 0 表示「不干预，跟随播放器默认」。
+String clipQualityLabel(int q) {
+  switch (q) {
+    case 120:
+      return '4K';
+    case 116:
+      return '1080P60';
+    case 112:
+      return '1080P 高码率';
+    case 80:
+      return '1080P';
+    case 74:
+      return '720P60';
+    case 64:
+      return '720P';
+    case 32:
+      return '480P';
+    case 16:
+      return '360P';
+    default:
+      return '自动';
+  }
+}
+
+/// 调 B站 播放器实例切码率。返回 false 说明这个视频没有该档位。
+///
+/// 新版播放器是 <bwp-video>，player 挂在元素上而不是 window，
+/// 所以两条路都试一遍。
+Future<bool> clipApplyQuality(WebViewController c, int q) async {
+  try {
+    final r = await c.runJavaScriptReturningResult("""
+(function(q){
+  function apply(p){
+    if(!p) return false;
+    try{ if(typeof p.setQuality==='function'){p.setQuality(q); return true;} }catch(e){}
+    try{ if('quality' in p){p.quality=q; return true;} }catch(e){}
+    return false;
+  }
+  var ok=false;
+  try{ ok=apply(window.player); }catch(e){}
+  if(!ok){
+    try{
+      var els=document.querySelectorAll('bwp-video');
+      for(var i=0;i<els.length;i++){
+        if(apply(els[i].player)||apply(els[i])){ok=true;break;}
+      }
+    }catch(e){}
+  }
+  return ok?'ok':'no';
+})($q)
+""");
+    return '$r'.contains('ok');
+  } catch (_) {
+    return false;
+  }
+}
+
+/// 清晰度选择面板。返回选中的 quality 码（取消返回 null）。
+Future<int?> showQualitySheet(BuildContext context, int current) {
+  final opts = <int>[0, 120, 116, 80, 64, 32, 16];
+  return showModalBottomSheet<int>(
+    context: context,
+    backgroundColor: const Color(0xFF141A26),
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+    ),
+    builder: (bctx) => SafeArea(
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 14, 16, 6),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Text('清晰度',
+                style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white70)),
+          ),
+        ),
+        ...opts.map((q) => ListTile(
+              dense: true,
+              visualDensity: VisualDensity.compact,
+              title: Text(clipQualityLabel(q),
+                  style: TextStyle(
+                      fontSize: 13.5,
+                      color: current == q ? kFeedInk : Colors.white70)),
+              trailing: current == q
+                  ? const Icon(Icons.check, size: 17, color: Colors.white70)
+                  : null,
+              onTap: () => Navigator.of(bctx).pop(q),
+            )),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 2, 16, 14),
+          child: Text(
+            '档位由 B站 自己给：未登录通常只有 480P / 360P，登录后才到 1080P。',
+            style: TextStyle(fontSize: 10.5, height: 1.6, color: Colors.white38),
+          ),
+        ),
+      ]),
+    ),
+  );
+}
+
 /// 流里就地播放：滑到这一页就自动播，滑走就暂停，页面销毁时一起回收。
 ///
 /// 和「点开播放器页」的区别：不再需要点两下。抖音的做法是滑到即播，
@@ -2001,72 +2108,10 @@ $_kDeepQuery
 
   // ---------------- 清晰度 ----------------
 
-  static String qualityLabel(int q) {
-    switch (q) {
-      case 120:
-        return '4K';
-      case 116:
-        return '1080P60';
-      case 112:
-        return '1080P 高码率';
-      case 80:
-        return '1080P';
-      case 74:
-        return '720P60';
-      case 64:
-        return '720P';
-      case 32:
-        return '480P';
-      case 16:
-        return '360P';
-      default:
-        return '自动';
-    }
-  }
+  static String qualityLabel(int q) => clipQualityLabel(q);
 
   Future<void> _pickQuality() async {
-    final opts = <int>[0, 120, 116, 80, 64, 32, 16];
-    final picked = await showModalBottomSheet<int>(
-      context: context,
-      backgroundColor: const Color(0xFF141A26),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (bctx) => SafeArea(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 14, 16, 6),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text('清晰度',
-                  style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w700,
-                      color: Colors.white70)),
-            ),
-          ),
-          ...opts.map((q) => ListTile(
-                dense: true,
-                visualDensity: VisualDensity.compact,
-                title: Text(qualityLabel(q),
-                    style: TextStyle(
-                        fontSize: 13.5,
-                        color: _quality == q ? kFeedInk : Colors.white70)),
-                trailing: _quality == q
-                    ? const Icon(Icons.check, size: 17, color: Colors.white70)
-                    : null,
-                onTap: () => Navigator.of(bctx).pop(q),
-              )),
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 2, 16, 14),
-            child: Text(
-              '档位由 B站 自己给：未登录通常只有 480P / 360P，登录后才到 1080P。切换后会自动接着播。',
-              style: TextStyle(fontSize: 10.5, height: 1.6, color: Colors.white38),
-            ),
-          ),
-        ]),
-      ),
-    );
+    final picked = await showQualitySheet(context, _quality);
     if (picked != null) await _applyQuality(picked);
   }
 
@@ -2075,31 +2120,7 @@ $_kDeepQuery
     final c = _ctrl;
     if (c == null) return false;
     setState(() => _qBusy = true);
-    var ok = false;
-    try {
-      final r = await c.runJavaScriptReturningResult("""
-(function(q){
-  function apply(p){
-    if(!p) return false;
-    try{ if(typeof p.setQuality==='function'){p.setQuality(q); return true;} }catch(e){}
-    try{ if('quality' in p){p.quality=q; return true;} }catch(e){}
-    return false;
-  }
-  var ok=false;
-  try{ ok=apply(window.player); }catch(e){}
-  if(!ok){
-    try{
-      var els=document.querySelectorAll('bwp-video');
-      for(var i=0;i<els.length;i++){
-        if(apply(els[i].player)||apply(els[i])){ok=true;break;}
-      }
-    }catch(e){}
-  }
-  return ok?'ok':'no';
-})($q)
-""");
-      ok = '$r'.contains('ok');
-    } catch (_) {}
+    final ok = await clipApplyQuality(c, q);
     if (!mounted) return false;
     setState(() {
       _qBusy = false;
@@ -2271,6 +2292,12 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
   bool _loginMode = false;
   String _failHint = '';
 
+  // 清晰度：0 = 跟随 B站 默认。只对 kind == 'bili' 生效。
+  int _quality = 0;
+  bool _qBusy = false;
+
+  bool get _canPickQuality => _target?.kind == 'bili';
+
   String get _url => cultureNormalizeUrl('${widget.item['url'] ?? ''}');
 
   /// 依次尝试的地址：平台播放器 → 官方 iframe → 桌面版页面。
@@ -2397,6 +2424,33 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
     }
     final t = _target;
     if (t != null && t.isPlatformPlayer) _probeVideo();
+    // 播放器初始化要时间，等 1.2s 再套用用户选过的清晰度。
+    if (_quality != 0 && t?.kind == 'bili') {
+      Future.delayed(const Duration(milliseconds: 1200), () {
+        if (mounted && !_failed) _applyQuality(_quality, silent: true);
+      });
+    }
+  }
+
+  Future<void> _pickQuality() async {
+    final picked = await showQualitySheet(context, _quality);
+    if (picked != null) await _applyQuality(picked);
+  }
+
+  Future<bool> _applyQuality(int q, {bool silent = false}) async {
+    final c = _ctrl;
+    if (c == null) return false;
+    setState(() => _qBusy = true);
+    final ok = await clipApplyQuality(c, q);
+    if (!mounted) return false;
+    setState(() {
+      _qBusy = false;
+      if (ok) _quality = q;
+    });
+    if (!silent) {
+      _snack(ok ? '已切到 ${clipQualityLabel(q)}' : '这个视频没有 ${clipQualityLabel(q)} 这一档');
+    }
+    return ok;
   }
 
   /// 平台播放器页加载完不代表真的出画面：
@@ -2769,6 +2823,40 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
                   shape: BoxShape.circle,
                 ),
                 child: const Icon(Icons.tune, size: 17, color: Colors.white54),
+              ),
+            ),
+          ),
+        // 清晰度常驻入口：不跟顶部/底部浮层一起隐藏，
+        // 否则用户一藏操作条就找不到它了。
+        if (_canPickQuality && !_failed)
+          Positioned(
+            right: 10,
+            top: MediaQuery.of(context).padding.top + 52,
+            child: Material(
+              color: Colors.black.withOpacity(0.5),
+              borderRadius: BorderRadius.circular(14),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(14),
+                onTap: _qBusy ? null : _pickQuality,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    _qBusy
+                        ? const SizedBox(
+                            width: 12,
+                            height: 12,
+                            child: CircularProgressIndicator(
+                                strokeWidth: 1.6, color: Colors.white70))
+                        : const Icon(Icons.hd_outlined,
+                            size: 14, color: Colors.white),
+                    const SizedBox(width: 5),
+                    Text(clipQualityLabel(_quality),
+                        style: const TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white)),
+                  ]),
+                ),
               ),
             ),
           ),

@@ -86,6 +86,10 @@ class MainActivity : FlutterActivity() {
             pendingReadClip = true
         }
         text = text.trim()
+        if (text.isEmpty() && !pendingReadClip) return
+        // 只要用户点过「整理」，就先按已消费处理：服务那边半分钟内不再弹，
+        // 否则进 App 后页面一渲染又冒一次「要整理吗」。
+        ClipWatchService.markConsumed()
         if (text.isEmpty()) return
         emit(text)
     }

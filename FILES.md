@@ -1,36 +1,31 @@
-# Empire-V4.3 覆盖清单（4.3.0）
+# Empire-V4.3 覆盖清单（4.3.1）
 
 整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml` + `.android-inject/`。
 
-> 这一版的核心是**把「复制链接没反应」真正查清楚了**——不是 ColorOS 的问题，是逻辑本身走不到弹窗。
+> 这一版是 4.3.0 的修补，三件事：
 >
-> 1. **复制即弹：三条不依赖剪贴板读取的信号**。V4.2 依赖 `addPrimaryClipChangedListener`，
->    但 Android 10+ 这条回调只在应用有焦点时派发，无障碍服务在后台**永远收不到**；
->    事件路径读剪贴板又被系统拒绝（返回空），空内容 + `reason="event"` 直接 return。
->    所以「点了复制，代码一行都没执行到弹窗」。现在改成：
->    点到「复制链接」控件 / 系统 Toast「已复制」/ 窗口内容变化（兜底）。
-> 2. **弹窗三通道兜底**。ColorOS 关掉「后台弹出界面」时 `startActivity` 不报错也不显示，
->    靠 try/catch 永远发现不了。现在 Activity 起 700ms 后查 `onResume` 回执，
->    没回执就改发通知，通知没权限再退无障碍悬浮窗。**新增 `POST_NOTIFICATIONS` 运行时权限**。
-> 3. **清晰度调节**。B站 播放器左下角：自动 / 4K / 1080P60 / 1080P / 720P / 480P / 360P，
->    直接调 `player.setQuality()`。档位由 B站 给，未登录通常只有 480P/360P。
-> 4. **播放穿透 shadow DOM**。B站 新版是 `<bwp-video>`，真 `<video>` 在 shadowRoot 里，
->    `document.querySelector('video')` 返回 null —— 上一版「滑到即播」实际什么都没做。
-> 5. **黑屏探测**。3.5s / 7.5s 各看一次 `videoWidth`，连续两次为 0 自动换源
->    （黑屏不触发 `onWebResourceError`，只能这么认）。
+> 1. **清晰度按钮补到独立播放器页**。4.3.0 只加在信息流内嵌播放器，
+>    而「在这里看」打开的是 `CulturePlayerPage`（另一套 WebView），那一页看不到按钮。
+>    现在右上角常驻一个档位胶囊，不跟浮层一起隐藏。
+> 2. **点了「整理」进 App 又弹一次**。App 渲染页面产生的 `WINDOW_CONTENT_CHANGED`
+>    落在 15 秒的「内容类 App 上下文」里，于是又读一次剪贴板、又弹。
+>    现在：自己包名的事件一律 return；点「整理」/「略过」后 30 秒内不再弹（`consumedAt`）。
+> 3. **只在复制外链时弹**。复制动作按置信度分级：
+>    「复制链接」= 2（任何 App 都算）；仅「复制」= 1（只在 B站/抖音/小红书等短视频平台算）。
+>    微信/QQ 的「复制」是复制聊天文字，不在白名单里。
 >
-> 数据库不动（仍是 15）；依赖不变。`flutter analyze` 无 error（仅 2 条既有 info）。
+> 数据库不动（仍是 15）；依赖不变。`flutter analyze` 无 error。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
-| `pubspec.yaml` | 558 | `6b94bc9bde6e5638de43af4c5f4ba7c2` |
-| `README.md` | 31,122 | `c445dce47187cb8653a782c2b732e270` |
+| `pubspec.yaml` | 558 | `5cf71c4ca614c02618cf95c0669afd5b` |
+| `README.md` | 32,838 | `147e87bb0eb96f697c185180f6d516bf` |
 | `.github/workflows/build.yml` | 9,510 | `8bf57bcb3475baac480584878f35875b` |
 | `lib/app_update.dart` | 14,455 | `a931e3cabb03f54bf7d81073af50427b` |
 | `lib/content_feed.dart` | 14,941 | `c477ce3b9f98a85a1099be539f3337a1` |
 | `lib/content_fetch.dart` | 23,847 | `d4d49bbb91d7c81f4fcd25dfa38d32e0` |
 | `lib/content_intake.dart` | 23,270 | `e1546f54fcd91d758601a4b4701710b2` |
-| `lib/culture_feed.dart` | 119,509 | `71baf4cedaa7167bb6f4e24872d499fd` |
+| `lib/culture_feed.dart` | 122,808 | `2bb0b8fa5c62427d93f16c7e46105fdc` |
 | `lib/culture_page.dart` | 51,430 | `fe3166f67eb69afd8ea792a02828ae82` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
 | `lib/deepseek_sheet.dart` | 72,621 | `ccd3d91379d101cfbbc0ada026a813e3` |
@@ -42,9 +37,9 @@
 | `lib/native_clip.dart` | 7,430 | `0b36583f1fd34fff83a2e5020db0f2fa` |
 | `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
 | `lib/player_target.dart` | 6,481 | `bbfbb1328e00507d5e1d6aec0bcead12` |
-| `.android-inject/MainActivity.kt` | 10,982 | `f5fdf1329b6c2845f2049877753c2c3a` |
-| `.android-inject/ClipWatchService.kt` | 27,680 | `8ee6f331c44181cb2198d499c36081e9` |
-| `.android-inject/ClipPromptActivity.kt` | 7,038 | `607e69c1ee6ee589890f5fd9d4e0e48a` |
+| `.android-inject/MainActivity.kt` | 11,262 | `2ace607c46c4d9626f52fe3a3c96e472` |
+| `.android-inject/ClipWatchService.kt` | 30,140 | `6d26333b7226dbbb0e3813907f79cc18` |
+| `.android-inject/ClipPromptActivity.kt` | 7,346 | `7bb2d5f83cbfafeb33ccab85619b3e22` |
 | `.android-inject/ApkProvider.kt` | 1,937 | `7c62fa727307282c4ac3b31494cd6b2b` |
 | `.android-inject/patch.py` | 11,142 | `e3187f554e526518c3a1befa50771057` |
 | `.android-inject/dt-release.jks` | 2,704 | `4ad915351096720f929147c9554d725a` |
