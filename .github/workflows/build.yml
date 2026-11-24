@@ -109,7 +109,36 @@ jobs:
           find ~/.pub-cache/ -name "build.gradle.kts" -type f -exec sed -i 's/flutter.compileSdkVersion/36/g' {} + || true
 
       - name: Build Release APK
-        run: flutter build apk --release --no-tree-shake-icons
+        run: |
+          set -o pipefail
+          flutter build apk --release --no-tree-shake-icons 2>&1 | tee /tmp/build.log
+          exit ${PIPESTATUS[0]}
+
+      # 失败时把关键报错塞进 check-run annotation：
+      # 这样即使拿不到 blob 上的原始日志，也能从 API 直接读到原因。
+      - name: Surface build errors
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          import os
+          p = '/tmp/build.log'
+          if not os.path.exists(p):
+              print('::error::build.log missing, build likely failed before gradle')
+              raise SystemExit(0)
+          s = open(p, encoding='utf-8', errors='ignore').read()
+          lines = s.splitlines()
+          keys = ('What went wrong', 'FAILURE:', 'e: ', 'error:', 'Execution failed', 'Caused by', 'Could not')
+          idx = [i for i, l in enumerate(lines) if any(k in l for k in keys)]
+          if idx:
+              start = max(0, idx[0] - 15)
+              chunk = '\n'.join(lines[start:start + 150])
+          else:
+              chunk = '\n'.join(lines[-100:])
+          chunk = chunk[:55000]
+          print('--- BUILD ERROR CONTEXT ---')
+          print(chunk)
+          print('::error::' + chunk.replace('\n', '%0A'))
+          PY
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
