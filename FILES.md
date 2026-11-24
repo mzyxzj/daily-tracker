@@ -42,8 +42,9 @@
 | `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
 | `lib/medical_page.dart` | 66,637 | `cac60111718de4e5939b357a29719d6c` |
 | `.android-inject/MainActivity.kt` | 4,453 | `950782a1728c6157be7117dfbaa7bda2` |
-| `.android-inject/ClipWatchService.kt` | 8,083 | `71b9f44873357278e133539535d4cc27` |
+| `.android-inject/ClipWatchService.kt` | 8,089 | `5cb8413b224ac5b1b49bd9e8d4ba7c0a` |
 | `.android-inject/patch.py` | 4,936 | `df5f39d2c8463bfa01763e0df964f46d` |
+
 
 ## 领地渲染图（L01→L09）
 

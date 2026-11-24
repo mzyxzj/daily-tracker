@@ -117,7 +117,7 @@ class ClipWatchService : AccessibilityService() {
             textSize = 12.5f
             maxLines = 2
             ellipsize = TextUtils.TruncateAt.END
-            text = "这条要整理进「文化」吗？"
+            setText("这条要整理进「文化」吗？")
             layoutParams = LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
             )
@@ -125,7 +125,7 @@ class ClipWatchService : AccessibilityService() {
         val go = TextView(this).apply {
             setTextColor(Color.parseColor("#0B0F17"))
             textSize = 12f
-            text = "整理"
+            setText("整理")
             setPadding(dp(12), dp(6), dp(12), dp(6))
             background = GradientDrawable().apply {
                 setColor(Color.WHITE)
@@ -135,7 +135,7 @@ class ClipWatchService : AccessibilityService() {
         val no = TextView(this).apply {
             setTextColor(Color.parseColor("#94A3B8"))
             textSize = 12f
-            text = "略过"
+            setText("略过")
             setPadding(dp(9), dp(6), dp(9), dp(6))
         }
         tv.setOnClickListener { openApp(text); hideOverlay() }
