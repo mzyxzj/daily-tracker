@@ -17,6 +17,7 @@ import 'culture_page.dart';
 import 'medical_page.dart';
 import 'content_fetch.dart';
 import 'content_intake.dart';
+import 'native_clip.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -63,7 +64,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
-      version: 14,
+      version: 15,
       onCreate: (db, v) async {
         await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, allow_inherit INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE status_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, value TEXT DEFAULT "", UNIQUE(item_id, date))');
@@ -81,6 +82,10 @@ class AppDatabase {
         await MedicalDb.ensureTables(db);
       },
       onUpgrade: (db, oldV, newV) async {
+        if (oldV.compareTo(15) == -1) {
+          // v15：内置播放器「取正文」要落一列 content_text。
+          try { await CultureDb.ensureTables(db); } catch (_) {}
+        }
         if (oldV.compareTo(14) == -1) {
           // v14：内容引进要存封面/作者/分级标签，老库补 4 列。
           try { await CultureDb.ensureTables(db); } catch (_) {}
@@ -396,18 +401,44 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   bool _intakeOpen = false;
   Timer? _pendingTimer;
 
+  StreamSubscription<String>? _nativeSub;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _clip = ClipboardIntakeWatcher(db: widget.db, onFound: _onShareFound);
     _clip!.start();
+    _wireNative();
+  }
+
+  /// 两条路一起用：
+  ///   - 原生无障碍服务：复制那一刻就弹悬浮窗，点「整理」把链接带进 App；
+  ///   - Flutter 侧前台读取：没开无障碍权限时的兜底（切回 App 时读一次）。
+  Future<void> _wireNative() async {
+    // 冷启动：悬浮窗点「整理」带进来的链接。
+    try {
+      final initial = await NativeClip.getInitial();
+      if (initial.isNotEmpty) {
+        final share = parseShareText(initial);
+        if (!share.isEmpty) _onShareFound(share);
+      }
+    } catch (_) {}
+    // 运行中：服务读到新链接时推过来。
+    try {
+      _nativeSub = NativeClip.events.listen((text) {
+        if (text.isEmpty) return;
+        final share = parseShareText(text);
+        if (!share.isEmpty) _onShareFound(share);
+      });
+    } catch (_) {}
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _pendingTimer?.cancel();
+    _nativeSub?.cancel();
     _clip?.stop();
     super.dispose();
   }

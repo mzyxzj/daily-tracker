@@ -26,6 +26,14 @@ jobs:
             || test -f "$GITHUB_WORKSPACE/android/app/build.gradle"
           echo "android/ generated from template"
 
+      # 「复制链接就弹窗」必须由系统级的无障碍服务做（Android 10+ 后台读不到剪贴板）。
+      # 仓库里不带 android/ 目录，所以在壳生成之后把 Kotlin 服务和 manifest 改进去。
+      - name: Inject clipboard accessibility service
+        run: |
+          python3 .android-inject/patch.py
+          echo '--- manifest head ---'
+          sed -n '1,12p' android/app/src/main/AndroidManifest.xml
+
       # 防御：资源已改为 Dart 常量，不再需要 asset bundle。
       # 万一仓库里的 pubspec.yaml 还留着旧的 assets 声明，构建前直接剥掉，
       # 避免 aot_android_asset_bundle 因缺文件整包失败。

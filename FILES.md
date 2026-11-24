@@ -1,40 +1,49 @@
-# Empire-V3.0 覆盖清单（3.0.0）
+# Empire-V4.0 覆盖清单（4.0.0）
 
-整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml`。
+整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml` + `.android-inject/`。
 
-> 这一版把「内容引进 / 流量算法 / 分级」缝成一条流水线：
-> 1. **复制就能引进**：抖音 / B站 分享文案整段复制，切回 App 自动问「要不要引进」；
->    封面、标题、作者、时长自动抓（B站 view 接口 → 抖音 iteminfo → og:meta → 分享文案兜底），
->    用户只需要点一个分级标签。
-> 2. **按电量推荐**：读医疗页的前额叶电量落档，同档优先、今日聚焦加权、同库最多两条；
->    比当前档更耗电的直接隐藏；红灯区把「别碰什么」摆到最上面。
-> 3. **库首页**：库宫格（三图拼贴 + 条数 + 没看数）→ 库内 16:9 海报流 / 9:16 竖版流 /
->    横版卡片流，配分级筛选、搜索、排序，10 秒定位。
+> 这一版把「内容引进 / 流量算法 / 分级」三件合成一件：
+> 1. **首页就是流**：竖向全屏一屏一条，上下滑；没有 tab、没有宫格、不用先选库。
+>    顶部电量胶囊点一下切换「只看这一档 / 看全部」。
+> 2. **侧边栏**（右上角滑块或右边缘滑出）：复制即弹状态、电量、引进、分级、库、
+>    工具包、最近存的，一屏全在。**优质源已删掉。**
+> 3. **内置播放器**：全屏 WebView + 沉浸模式（注入 CSS 隐藏推荐流/评论/侧栏）+
+>    登录入口（同 WebView 打开平台登录页，cookie 持久）。
+> 4. **再创作 = DeepSeek**：正文 + 我的笔记 → 步骤 / 模板 / 清单 / 别照搬的部分，
+>    流式输出，可存成工具包。
+> 5. **复制即弹**：`.android-inject/` 里的无障碍服务在屏幕上方弹「整理 / 略过」，
+>    点整理直接带链接进 App。没开权限时有分享面板 / 前台读取两条兜底。
 >
-> 数据库 13 → **14**：`culture_items` 增 `grade_tier / author / ext_id / from_share` 四列，
-> 老库用 `PRAGMA table_info` 检查后 ALTER，旧条目与封面不动。
-> 新增 `lib/content_fetch.dart`、`lib/content_intake.dart`，无新增第三方依赖（网络走 `dart:io`）。
-> 55 个测试全绿（解析 / 元数据 / 落档 / 推荐 / 迁移 / 页面接线）。
+> 数据库 14 → **15**：`culture_items` 增 `content_text`，老库 ALTER，不丢数据。
+> 无新增依赖，`url_launcher` 已移除。69 个测试全绿。
 >
-> 覆盖文件：`lib/culture_page.dart`、`lib/content_fetch.dart`、`lib/content_intake.dart`、
-> `lib/main.dart`、`pubspec.yaml`、`README.md`、`FILES.md`。
+> 覆盖文件：`lib/culture_feed.dart`（新）、`lib/content_feed.dart`（新）、
+> `lib/native_clip.dart`（新）、`lib/culture_page.dart`、`lib/main.dart`、
+> `lib/content_intake.dart`、`pubspec.yaml`、`README.md`、`FILES.md`、
+> `.github/workflows/build.yml`、`.android-inject/`（3 个文件）。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
-| `pubspec.yaml` | 448 | `d14a9fdb68eae54ac76fb0ada6c5c611` |
-| `README.md` | 16,519 | `87804c803682c75718ce20b6e2680e17` |
-| `.github/workflows/build.yml` | 5,522 | `1b9488bba4d632454cbb8db0023738c6` |
-| `lib/main.dart` | 136,673 | `290bc3e50600cf8cf36b8ef5e6d2de64` |
-| `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
+| `pubspec.yaml` | 426 | `f915efe7e3731cfbb8eea2eeafbb234f` |
+| `README.md` | 20,875 | `19568333922700cca3c7e0c9c06e52fe` |
+| `.github/workflows/build.yml` | 5,968 | `d93149eb806ffdb1383547d14650ac71` |
+| `lib/main.dart` | 137,818 | `6c38f5a63dc21b5485a6011254edc0f7` |
+| `lib/culture_page.dart` | 51,430 | `fe3166f67eb69afd8ea792a02828ae82` |
+| `lib/culture_feed.dart` | 88,090 | `d1c0c872c5f2bc7f7a70c5ceeee3c87b` |
+| `lib/content_fetch.dart` | 23,847 | `d4d49bbb91d7c81f4fcd25dfa38d32e0` |
+| `lib/content_feed.dart` | 14,941 | `c477ce3b9f98a85a1099be539f3337a1` |
+| `lib/content_intake.dart` | 23,270 | `e1546f54fcd91d758601a4b4701710b2` |
+| `lib/native_clip.dart` | 2,304 | `83c6053c0ad7da02b2d2fdd135e46f1c` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
 | `lib/deepseek_sheet.dart` | 72,621 | `ccd3d91379d101cfbbc0ada026a813e3` |
 | `lib/empire_page.dart` | 71,718 | `9bab00fac714fa2db5694fe15d00041d` |
 | `lib/empire_data.dart` | 19,564 | `aaca4183f71cc53fce9777e9181e76c2` |
 | `lib/empire_assets.dart` | 897,977 | `61e06d9173a85e0dc101524597d8acc6` |
-| `lib/culture_page.dart` | 163,003 | `d63ff75db469ebb742e05972af44e906` |
+| `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
 | `lib/medical_page.dart` | 66,637 | `cac60111718de4e5939b357a29719d6c` |
-| `lib/content_fetch.dart` | 23,847 | `d4d49bbb91d7c81f4fcd25dfa38d32e0` |
-| `lib/content_intake.dart` | 23,270 | `e1546f54fcd91d758601a4b4701710b2` |
+| `.android-inject/MainActivity.kt` | 4,453 | `950782a1728c6157be7117dfbaa7bda2` |
+| `.android-inject/ClipWatchService.kt` | 8,083 | `71b9f44873357278e133539535d4cc27` |
+| `.android-inject/patch.py` | 4,936 | `df5f39d2c8463bfa01763e0df964f46d` |
 
 ## 领地渲染图（L01→L09）
 
