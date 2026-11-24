@@ -1,33 +1,40 @@
-# Empire-V2.1 覆盖清单（2.8.0）
+# Empire-V3.0 覆盖清单（3.0.0）
 
 整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml`。
 
-> 本版两件事：
-> 1. **「分级」从医疗搬到文化**，成为文化的第四个板块（内容引进 / 再创作 / 流量算法 / 分级）。
->    医疗只剩预防 / 急救 / 治疗。旧 `medical_grades` 的数据会在升级时原样迁到
->    `culture_grades`，用户改过的档位文案不丢。
-> 2. **文化 / 医疗的全部条目都能编辑、删除、保存**：资源库、内容、工具包、优质源、分级、
->    预防预案、急救预案、恢复手段。列表右上角「⋯」或详情页均可改，改完立刻落库刷新。
+> 这一版把「内容引进 / 流量算法 / 分级」缝成一条流水线：
+> 1. **复制就能引进**：抖音 / B站 分享文案整段复制，切回 App 自动问「要不要引进」；
+>    封面、标题、作者、时长自动抓（B站 view 接口 → 抖音 iteminfo → og:meta → 分享文案兜底），
+>    用户只需要点一个分级标签。
+> 2. **按电量推荐**：读医疗页的前额叶电量落档，同档优先、今日聚焦加权、同库最多两条；
+>    比当前档更耗电的直接隐藏；红灯区把「别碰什么」摆到最上面。
+> 3. **库首页**：库宫格（三图拼贴 + 条数 + 没看数）→ 库内 16:9 海报流 / 9:16 竖版流 /
+>    横版卡片流，配分级筛选、搜索、排序，10 秒定位。
 >
-> 数据库 12 → **13**（新增 `culture_grades`）；无新增依赖；治疗卡片补了「⋯」菜单。
+> 数据库 13 → **14**：`culture_items` 增 `grade_tier / author / ext_id / from_share` 四列，
+> 老库用 `PRAGMA table_info` 检查后 ALTER，旧条目与封面不动。
+> 新增 `lib/content_fetch.dart`、`lib/content_intake.dart`，无新增第三方依赖（网络走 `dart:io`）。
+> 55 个测试全绿（解析 / 元数据 / 落档 / 推荐 / 迁移 / 页面接线）。
 >
-> 覆盖文件：`lib/culture_page.dart`、`lib/medical_page.dart`、`lib/main.dart`、
-> `pubspec.yaml`、`README.md`、`FILES.md`。
+> 覆盖文件：`lib/culture_page.dart`、`lib/content_fetch.dart`、`lib/content_intake.dart`、
+> `lib/main.dart`、`pubspec.yaml`、`README.md`、`FILES.md`。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
-| `pubspec.yaml` | 448 | `44883371e9a31526e3b3246fea15050c` |
-| `README.md` | 16,131 | `b12544185e0cbdfc3a20ed71e8dfacdc` |
+| `pubspec.yaml` | 448 | `d14a9fdb68eae54ac76fb0ada6c5c611` |
+| `README.md` | 16,519 | `87804c803682c75718ce20b6e2680e17` |
 | `.github/workflows/build.yml` | 5,522 | `1b9488bba4d632454cbb8db0023738c6` |
-| `lib/main.dart` | 132,782 | `95be7ed1ce3f3b0ed8f19fa35f8dbacf` |
+| `lib/main.dart` | 136,673 | `290bc3e50600cf8cf36b8ef5e6d2de64` |
 | `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
 | `lib/deepseek_sheet.dart` | 72,621 | `ccd3d91379d101cfbbc0ada026a813e3` |
 | `lib/empire_page.dart` | 71,718 | `9bab00fac714fa2db5694fe15d00041d` |
 | `lib/empire_data.dart` | 19,564 | `aaca4183f71cc53fce9777e9181e76c2` |
 | `lib/empire_assets.dart` | 897,977 | `61e06d9173a85e0dc101524597d8acc6` |
-| `lib/culture_page.dart` | 129,681 | `411ff1861576e045359a07d5730da862` |
+| `lib/culture_page.dart` | 163,003 | `d63ff75db469ebb742e05972af44e906` |
 | `lib/medical_page.dart` | 66,637 | `cac60111718de4e5939b357a29719d6c` |
+| `lib/content_fetch.dart` | 23,847 | `d4d49bbb91d7c81f4fcd25dfa38d32e0` |
+| `lib/content_intake.dart` | 23,270 | `e1546f54fcd91d758601a4b4701710b2` |
 
 ## 领地渲染图（L01→L09）
 

@@ -5,18 +5,18 @@ import 'dart:math' as math;
 import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart' hide TextDirection;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
 import 'package:sqflite/sqflite.dart';
 import 'pages_extra.dart';
 import 'deepseek_sheet.dart';
 import 'empire_page.dart';
 import 'culture_page.dart';
 import 'medical_page.dart';
+import 'content_fetch.dart';
+import 'content_intake.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -63,7 +63,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
-      version: 13,
+      version: 14,
       onCreate: (db, v) async {
         await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, allow_inherit INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE status_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, value TEXT DEFAULT "", UNIQUE(item_id, date))');
@@ -81,6 +81,10 @@ class AppDatabase {
         await MedicalDb.ensureTables(db);
       },
       onUpgrade: (db, oldV, newV) async {
+        if (oldV.compareTo(14) == -1) {
+          // v14：内容引进要存封面/作者/分级标签，老库补 4 列。
+          try { await CultureDb.ensureTables(db); } catch (_) {}
+        }
         if (oldV.compareTo(13) == -1) {
           // 分级从医疗搬到文化：ensureTables 会把旧 medical_grades 原样迁到 culture_grades，
           // 用户之前改过的档位文案不会丢。
@@ -382,9 +386,111 @@ class MainShell extends StatefulWidget {
   State createState() => _MainShellState();
 }
 
-class _MainShellState extends State<MainShell> {
+class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   int _idx = 2;
   int _empireTick = 0;
+  int _cultureTick = 0;
+
+  ClipboardIntakeWatcher? _clip;
+  ParsedShare? _pending;
+  bool _intakeOpen = false;
+  Timer? _pendingTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _clip = ClipboardIntakeWatcher(db: widget.db, onFound: _onShareFound);
+    _clip!.start();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _pendingTimer?.cancel();
+    _clip?.stop();
+    super.dispose();
+  }
+
+  /// 只在前台轮询：后台读剪贴板既没意义，也会被系统拦。
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _clip?.start();
+      _clip?.checkNow();
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      _clip?.stop();
+    }
+  }
+
+  void _onShareFound(ParsedShare share) {
+    if (!mounted || _intakeOpen) return;
+    _pendingTimer?.cancel();
+    setState(() => _pending = share);
+    _pendingTimer = Timer(const Duration(seconds: 18), () {
+      if (mounted && _pending?.url == share.url) setState(() => _pending = null);
+    });
+  }
+
+  Future<void> _dismissPending() async {
+    final share = _pending;
+    _pendingTimer?.cancel();
+    setState(() => _pending = null);
+    if (share != null) await CultureDb.addSeenUrl(widget.db, share.url);
+  }
+
+  Future<void> _muteClip() async {
+    await CultureDb.setClipEnabled(widget.db, false);
+    _pendingTimer?.cancel();
+    if (!mounted) return;
+    setState(() => _pending = null);
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+      content: Text('已关闭剪贴板自动识别，可在「文化」右上角菜单重新打开',
+          style: TextStyle(fontSize: 12.5)),
+      duration: Duration(seconds: 3),
+    ));
+  }
+
+  Future<void> _importPending() async {
+    final share = _pending;
+    if (share == null || _intakeOpen) return;
+    _intakeOpen = true;
+    _pendingTimer?.cancel();
+    setState(() => _pending = null);
+    try {
+      final db = await AppDatabase.instance.database;
+      final libs = await db.query('culture_libraries',
+          orderBy: 'sort_order ASC, id ASC');
+      final grades = await db.query('culture_grades',
+          orderBy: 'sort_order ASC, tier ASC, id ASC');
+      final batteryRaw =
+          await AppDatabase.getUiState(db, 'medical_battery_now');
+      if (!mounted) return;
+      final ok = await showModalBottomSheet<bool>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: Colors.transparent,
+        builder: (_) => ContentIntakeSheet(
+          db: db,
+          share: share,
+          libs: libs,
+          grades: grades,
+          battery: int.tryParse('${batteryRaw ?? ''}'.trim()),
+        ),
+      );
+      _clip?.remember(share.url);
+      if (ok == true && mounted) {
+        setState(() {
+          _idx = 5;
+          _cultureTick++;
+        });
+      }
+    } finally {
+      _intakeOpen = false;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return FutureBuilder(
@@ -397,18 +503,36 @@ class _MainShellState extends State<MainShell> {
           TodayPage(db: activeDb),
           EmpirePage(db: activeDb, reloadToken: _empireTick),
           PlanPage(db: activeDb),
-          CulturePage(db: activeDb),
+          CulturePage(db: activeDb, reloadToken: _cultureTick),
           MedicalPage(db: activeDb),
         ];
         return Scaffold(
-          body: pages[_idx],
+          body: Stack(children: [
+            pages[_idx],
+            if (_pending != null)
+              Positioned(
+                left: 10,
+                right: 10,
+                top: MediaQuery.of(context).padding.top + 56,
+                child: IntakeBanner(
+                  share: _pending!,
+                  onImport: _importPending,
+                  onDismiss: _dismissPending,
+                  onMute: _muteClip,
+                ),
+              ),
+          ]),
           bottomNavigationBar: NavigationBar(
             height: 62,
             selectedIndex: _idx,
-            onDestinationSelected: (i) => setState(() {
-              _idx = i;
-              if (i == 3) _empireTick++;
-            }),
+            onDestinationSelected: (i) {
+              setState(() {
+                _idx = i;
+                if (i == 3) _empireTick++;
+              });
+              // 点开文化时顺手查一次剪贴板：用户可能刚在别的 App 复制完就切过来。
+              if (i == 5) _clip?.checkNow();
+            },
             destinations: const [
               NavigationDestination(icon: Icon(Icons.search), label: '查找'),
               NavigationDestination(icon: Icon(Icons.home_outlined), label: '家庭'),
@@ -971,7 +1095,7 @@ class _TodayPageState extends State<TodayPage> {
             }
           } else {
             currentField = matchedField;
-            if (remainder.isNotEmpty) addTextLine(currentDate, currentField!, remainder);
+            if (remainder.isNotEmpty) addTextLine(currentDate, currentField, remainder);
           }
         } else {
           final targetField = currentField ?? '状态与异状';

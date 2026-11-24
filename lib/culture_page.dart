@@ -24,6 +24,9 @@ import 'package:sqflite/sqflite.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import 'content_fetch.dart';
+import 'content_intake.dart';
+
 // ==================== 常量与纯函数 ====================
 
 const Color kCultureInk = Color(0xFF1E293B);
@@ -93,20 +96,7 @@ Color cultureGradeColor(int maxB) {
 
 
 /// 从链接推断平台。只做域名匹配，不联网。
-String cultureDetectPlatform(String url) {
-  final u = url.toLowerCase();
-  if (u.contains('bilibili.com') || u.contains('b23.tv')) return 'B站';
-  if (u.contains('douyin.com') || u.contains('iesdouyin.com')) return '抖音';
-  if (u.contains('youtube.com') || u.contains('youtu.be')) return 'YouTube';
-  if (u.contains('xiaohongshu.com') || u.contains('xhslink.com')) return '小红书';
-  if (u.contains('mp.weixin.qq.com')) return '公众号';
-  if (u.contains('zhihu.com')) return '知乎';
-  if (u.contains('github.com')) return 'GitHub';
-  if (u.contains('weibo.com')) return '微博';
-  if (u.contains('twitter.com') || u.contains('x.com/')) return 'X';
-  if (u.contains('notion.')) return 'Notion';
-  return url.trim().isEmpty ? '' : '网页';
-}
+String cultureDetectPlatform(String url) => contentDetectPlatform(url);
 
 /// 平台主色，做封面兜底和标签色。
 Color culturePlatformColor(String platform) {
@@ -155,6 +145,7 @@ bool cultureMatches(Map item, String kw) {
     item['tags'],
     item['note'],
     item['platform'],
+    item['author'],
     item['url'],
   ].map((e) => '${e ?? ''}'.toLowerCase()).join(' ');
   return hay.contains(k);
@@ -345,8 +336,16 @@ class CultureDb {
         'weight INTEGER DEFAULT 3, '
         "note TEXT DEFAULT '', "
         'created_at TEXT NOT NULL)');
+    // v14：内容引进要 Auto 带封面/标题/作者，还要挂「分级标签」。
+    // 老库直接 ALTER，保留原有条目。
+    await _ensureColumn(db, 'culture_items', 'grade_tier', 'INTEGER DEFAULT 0');
+    await _ensureColumn(db, 'culture_items', 'author', "TEXT DEFAULT ''");
+    await _ensureColumn(db, 'culture_items', 'ext_id', "TEXT DEFAULT ''");
+    await _ensureColumn(db, 'culture_items', 'from_share', 'INTEGER DEFAULT 0');
     await db.execute(
         'CREATE INDEX IF NOT EXISTS idx_culture_items_lib ON culture_items(lib_id)');
+    await db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_culture_items_url ON culture_items(url)');
     await db.execute(
         'CREATE INDEX IF NOT EXISTS idx_culture_kits_lib ON culture_kits(lib_id)');
     await db.execute('CREATE TABLE IF NOT EXISTS culture_grades ('
@@ -361,6 +360,16 @@ class CultureDb {
         'sort_order INTEGER DEFAULT 0)');
 
     await _seedGrades(db);
+  }
+
+  /// SQLite 没有 ADD COLUMN IF NOT EXISTS，先看 PRAGMA 再补，避免老库升级报错。
+  static Future<void> _ensureColumn(
+      Database db, String table, String column, String def) async {
+    try {
+      final info = await db.rawQuery('PRAGMA table_info($table)');
+      if (info.any((r) => '${r['name']}' == column)) return;
+      await db.execute('ALTER TABLE $table ADD COLUMN $column $def');
+    } catch (_) {}
   }
 
   /// 分级种子的三条路：已种过 → 不动；医疗旧表有数据 → 原样迁过来（保留用户改过的内容）；
@@ -562,9 +571,70 @@ class CultureDb {
       'state': data['state'] ?? 0,
       'open_count': 0,
       'last_open_at': '',
+      'grade_tier': data['grade_tier'] ?? 0,
+      'author': data['author'] ?? '',
+      'ext_id': data['ext_id'] ?? '',
+      'from_share': data['from_share'] ?? 0,
       'created_at': now,
       'updated_at': now,
     });
+  }
+
+  /// 全库按链接找一条（不限库），用于「这条是不是已经引进过」。
+  static Future<Map?> findItemByUrl(Database db, String rawUrl) async {
+    final url = cultureNormalizeUrl(rawUrl);
+    if (url.isEmpty) return null;
+    final rows = await db.query('culture_items',
+        where: 'url = ?', whereArgs: [url], limit: 1);
+    return rows.isEmpty ? null : Map<String, dynamic>.from(rows.first);
+  }
+
+  /// 已经处理过的链接记 60 条，避免同一条反复弹「要不要引进」。
+  static Future<bool> isSeenUrl(Database db, String rawUrl) async {
+    final url = cultureNormalizeUrl(rawUrl);
+    if (url.isEmpty) return true;
+    final raw = await _getState(db, 'content_seen_urls');
+    if (raw == null || raw.isEmpty) return false;
+    try {
+      return (jsonDecode(raw) as List).map((e) => '$e').contains(url);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> addSeenUrl(Database db, String rawUrl) async {
+    final url = cultureNormalizeUrl(rawUrl);
+    if (url.isEmpty) return;
+    final raw = await _getState(db, 'content_seen_urls');
+    final list = <String>[];
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        list.addAll((jsonDecode(raw) as List).map((e) => '$e'));
+      } catch (_) {}
+    }
+    list.remove(url);
+    list.insert(0, url);
+    if (list.length > 60) list.removeRange(60, list.length);
+    await _setState(db, 'content_seen_urls', jsonEncode(list));
+  }
+
+  /// 剪贴板自动识别开关，存在 ui_states 里，主壳每轮读一次。
+  static Future<bool> isClipEnabled(Database db) async {
+    final v = await _getState(db, 'content_clip_enabled');
+    return v != '0';
+  }
+
+  static Future<void> setClipEnabled(Database db, bool on) async {
+    await _setState(db, 'content_clip_enabled', on ? '1' : '0');
+  }
+
+  /// 只改分级标签：列表里的「⋯ → 设置分级」用它。
+  static Future<void> updateItemGrade(Database db, int id, int tier) async {
+    await db.update(
+        'culture_items',
+        {'grade_tier': tier, 'updated_at': DateTime.now().toIso8601String()},
+        where: 'id = ?',
+        whereArgs: [id]);
   }
 
   /// 打开一次就记一次，作为「最近看过的」排序依据。
@@ -635,24 +705,32 @@ class CultureDb {
 
 class CulturePage extends StatefulWidget {
   final Database db;
-  const CulturePage({super.key, required this.db});
+
+  /// 主壳引进内容后 +1，页面收到新 token 就重载，不用整页重建。
+  final int reloadToken;
+  const CulturePage({super.key, required this.db, this.reloadToken = 0});
   @override
   State createState() => _CulturePageState();
 }
 
 class _CulturePageState extends State<CulturePage> {
   int _tab = 0; // 0 内容引进 1 再创作 2 流量算法 3 分级
-  int _view = 0; // 0 卡片流 1 竖版流 2 紧凑列表
-  int? _libId;
+  int _view = 2; // 0 卡片流 1 竖版流 2 海报流（默认海报，最像 B 站分区）
+  int? _libId; // null = 库首页，-1 = 全部内容，其它 = 某个库
   String _kw = '';
   int _filter = 0; // 0 全部 1 未看 2 收藏 3 看过
   bool _searchOpen = false;
+  bool _onlyCurrentTier = true; // 流量算法：只推当前电量这一档
+  int _sortMode = 0; // 0 推荐 1 最新 2 收藏 3 最短
+  int _tierFilter = -1; // -1 = 全部档，0 = 未标级，其它 = 对应分级
+  int _batch = 0; // 「换一批」的轮转游标
 
   List _libs = [];
   List _items = [];
   List _kits = [];
   List _sources = [];
   List _grades = [];
+  List<String> _focusDims = [];
   int? _battery; // 从医疗页写的 ui_states 读，用来高亮当前档位
   bool _loading = true;
 
@@ -662,6 +740,12 @@ class _CulturePageState extends State<CulturePage> {
   void initState() {
     super.initState();
     _boot();
+  }
+
+  @override
+  void didUpdateWidget(covariant CulturePage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.reloadToken != widget.reloadToken) _reload(syncLibs: true);
   }
 
   @override
@@ -684,6 +768,8 @@ class _CulturePageState extends State<CulturePage> {
       _view = (m['view'] as num?)?.toInt() ?? 0;
       _libId = (m['libId'] as num?)?.toInt();
       _filter = (m['filter'] as num?)?.toInt() ?? 0;
+      _onlyCurrentTier = m['onlyTier'] != false;
+      _sortMode = (m['sort'] as num?)?.toInt() ?? 0;
     } catch (_) {}
   }
 
@@ -691,7 +777,14 @@ class _CulturePageState extends State<CulturePage> {
     await CultureDb._setState(
       widget.db,
       'culture_ui_state',
-      jsonEncode({'tab': _tab, 'view': _view, 'libId': _libId, 'filter': _filter}),
+      jsonEncode({
+        'tab': _tab,
+        'view': _view,
+        'libId': _libId,
+        'filter': _filter,
+        'onlyTier': _onlyCurrentTier,
+        'sort': _sortMode,
+      }),
     );
   }
 
@@ -714,6 +807,13 @@ class _CulturePageState extends State<CulturePage> {
           orderBy: 'sort_order ASC, tier ASC, id ASC');
       final batteryRaw =
           await CultureDb._getState(db, 'medical_battery_now');
+      var dims = <String>[];
+      try {
+        final rows = await db.rawQuery(
+            "SELECT DISTINCT title FROM focus_items WHERE TRIM(title) <> '' "
+            'ORDER BY date DESC LIMIT 40');
+        dims = rows.map((e) => '${e['title']}'.trim()).where((e) => e.isNotEmpty).toList();
+      } catch (_) {}
       await CultureDb.refreshSignals(db);
       if (!mounted) return;
       setState(() {
@@ -722,9 +822,10 @@ class _CulturePageState extends State<CulturePage> {
         _kits = kits;
         _sources = sources;
         _grades = grades;
+        _focusDims = dims;
         _battery = int.tryParse('${batteryRaw ?? ''}'.trim());
         _loading = false;
-        if (_libId != null && !_libs.any((l) => l['id'] == _libId)) {
+        if (_libId != null && _libId! > 0 && !_libs.any((l) => l['id'] == _libId)) {
           _libId = null;
         }
       });
@@ -735,16 +836,44 @@ class _CulturePageState extends State<CulturePage> {
 
   List get _libItems {
     var list = _items.where((e) {
-      if (_libId != null && e['lib_id'] != _libId) return false;
+      if (_libId != null && _libId != -1 && e['lib_id'] != _libId) return false;
       return cultureMatches(e as Map, _kw);
     }).toList();
     if (_filter == 1) list = list.where((e) => (e['state'] as num?)?.toInt() == 0).toList();
     if (_filter == 2) list = list.where((e) => ((e['fav'] as num?)?.toInt() ?? 0) == 1).toList();
     if (_filter == 3) list = list.where((e) => (e['state'] as num?)?.toInt() == 2).toList();
-    return cultureSortItems(list);
+    if (_tierFilter >= 0) {
+      list = list
+          .where((e) => ((e['grade_tier'] as num?)?.toInt() ?? 0) == _tierFilter)
+          .toList();
+    }
+    final rows = cultureSortItems(list);
+    if (_sortMode == 1) {
+      rows.sort((a, b) => '${b['created_at'] ?? ''}'.compareTo('${a['created_at'] ?? ''}'));
+    } else if (_sortMode == 2) {
+      rows.sort((a, b) {
+        final fa = (a['fav'] as num?)?.toInt() ?? 0;
+        final fb = (b['fav'] as num?)?.toInt() ?? 0;
+        if (fa != fb) return fb - fa;
+        return '${b['created_at'] ?? ''}'.compareTo('${a['created_at'] ?? ''}');
+      });
+    } else if (_sortMode == 3) {
+      rows.sort((a, b) => _secondsOf(a['duration']).compareTo(_secondsOf(b['duration'])));
+    }
+    return rows;
+  }
+
+  int _secondsOf(dynamic raw) {
+    final s = '${raw ?? ''}'.trim();
+    if (s.isEmpty) return 999999;
+    final parts = s.split(':').map((e) => int.tryParse(e) ?? 0).toList();
+    if (parts.length == 2) return parts[0] * 60 + parts[1];
+    if (parts.length == 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    return 999999;
   }
 
   Map? _libOf(int? id) {
+    if (id == null || id == -1) return null;
     for (final l in _libs) {
       if (l['id'] == id) return Map<String, dynamic>.from(l as Map);
     }
@@ -777,6 +906,95 @@ class _CulturePageState extends State<CulturePage> {
     _reload();
   }
 
+  Future _fabIntake() async {
+    final act = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _sheetShell(
+        title: '引进一条内容',
+        children: [
+          _sheetAction(Icons.content_paste_go, '从剪贴板引进', 'clip',
+              note: '自动抓封面 / 标题 / 作者，只让你选分级'),
+          _sheetAction(Icons.edit_note, '手动填写', 'manual', note: '抓不到或想自己写标题时用'),
+        ],
+      ),
+    );
+    if (act == 'clip') await _intakeFromClipboard();
+    if (act == 'manual') await _addItem();
+  }
+
+  Future _pickGrade(Map item) async {
+    final cur = (item['grade_tier'] as num?)?.toInt() ?? 0;
+    final picked = await showModalBottomSheet<int>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _sheetShell(
+        title: '这条属于哪一档？',
+        children: [
+          for (final g in _grades)
+            _gradeChoice(
+              tier: (g['tier'] as num?)?.toInt() ?? 0,
+              name: '${g['name'] ?? ''}',
+              color: cultureGradeColor(((g['max_b'] as num?)?.toInt() ?? 100)),
+              note: '${g['allow'] ?? ''}',
+              selected: cur == (g['tier'] as num?)?.toInt(),
+            ),
+          _gradeChoice(
+            tier: 0,
+            name: '先不标',
+            color: const Color(0xFF94A3B8),
+            note: '不参与分级推荐，仍会出现在「全部」里',
+            selected: cur == 0,
+          ),
+        ],
+      ),
+    );
+    if (picked == null) return;
+    await CultureDb.updateItemGrade(widget.db, item['id'] as int, picked);
+    await _reload();
+    if (mounted) _toast('分级已更新');
+  }
+
+  Widget _gradeChoice({
+    required int tier,
+    required String name,
+    required Color color,
+    required String note,
+    required bool selected,
+  }) {
+    return ListTile(
+      dense: true,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+      leading: Container(
+        width: 10,
+        height: 10,
+        decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+      ),
+      title: Text(name,
+          style: TextStyle(
+              fontSize: 13,
+              fontWeight: selected ? FontWeight.w800 : FontWeight.w600,
+              color: kCultureInk)),
+      subtitle: note.trim().isEmpty
+          ? null
+          : Text(note,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 10.5, color: kCultureSub)),
+      trailing: selected
+          ? Icon(Icons.check_circle, size: 18, color: color)
+          : const Icon(Icons.circle_outlined, size: 18, color: Color(0xFFCBD5E1)),
+      onTap: () => Navigator.pop(context, tier),
+    );
+  }
+
+  Future _toggleClip() async {
+    final on = await CultureDb.isClipEnabled(widget.db);
+    await CultureDb.setClipEnabled(widget.db, !on);
+    if (!mounted) return;
+    _toast(!on ? '已开启：复制分享链接，切回来就会问你要不要引进' : '已关闭剪贴板识别，可在右上角菜单再打开');
+  }
+
   Future _addItem({int? libId}) async {
     if (_libs.isEmpty) {
       await _newLib();
@@ -790,6 +1008,7 @@ class _CulturePageState extends State<CulturePage> {
       builder: (_) => CultureItemSheet(
         db: widget.db,
         libs: _libs,
+        grades: _grades,
         libId: id,
         onSaved: _reload,
       ),
@@ -805,6 +1024,7 @@ class _CulturePageState extends State<CulturePage> {
       builder: (_) => CultureItemSheet(
         db: widget.db,
         libs: _libs,
+        grades: _grades,
         libId: item['lib_id'] as int? ?? 0,
         item: item,
         onSaved: _reload,
@@ -1130,12 +1350,14 @@ class _CulturePageState extends State<CulturePage> {
               if (v == 'lib') _newLib();
               if (v == 'source') _addSource();
               if (v == 'grades') _restoreGrades();
+              if (v == 'clip') _toggleClip();
               if (v == 'help') _showHelp();
             },
             itemBuilder: (_) => const [
               PopupMenuItem(value: 'lib', child: Text('新建资源库', style: TextStyle(fontSize: 13))),
               PopupMenuItem(value: 'source', child: Text('添加优质源', style: TextStyle(fontSize: 13))),
               PopupMenuItem(value: 'grades', child: Text('恢复内置分级', style: TextStyle(fontSize: 13))),
+              PopupMenuItem(value: 'clip', child: Text('剪贴板自动识别：开/关', style: TextStyle(fontSize: 13))),
               PopupMenuItem(value: 'help', child: Text('这一页怎么用', style: TextStyle(fontSize: 13))),
             ],
           ),
@@ -1159,7 +1381,7 @@ class _CulturePageState extends State<CulturePage> {
       floatingActionButton: FloatingActionButton.extended(
         backgroundColor: kCultureAccent,
         onPressed: _tab == 0
-            ? () => _addItem()
+            ? _fabIntake
             : _tab == 1
                 ? _newKit
                 : _tab == 2
@@ -1168,7 +1390,7 @@ class _CulturePageState extends State<CulturePage> {
         icon: Icon(_tab == 2 ? Icons.add_link : Icons.add, size: 18),
         label: Text(
           _tab == 0
-              ? '存一条'
+              ? '引进'
               : _tab == 1
                   ? '新建工具包'
                   : _tab == 2
@@ -1267,16 +1489,273 @@ class _CulturePageState extends State<CulturePage> {
   // ---------- 内容引进 ----------
 
   Widget _inflowBody() {
+    if (_libId == null && _kw.trim().isEmpty && _tierFilter < 0) {
+      return Column(children: [
+        _libStrip(),
+        Expanded(child: _libHome()),
+      ]);
+    }
     final items = _libItems;
     return Column(children: [
       _libStrip(),
+      _gradeStrip(),
       _filterRow(items.length),
       Expanded(
         child: items.isEmpty
             ? _emptyInflow()
-            : (_view == 1 ? _shortsGrid(items) : _cardsList(items)),
+            : (_view == 2
+                ? _posterGrid(items)
+                : _view == 1
+                    ? _shortsGrid(items)
+                    : _cardsList(items)),
       ),
     ]);
+  }
+
+  // ---------- 库首页：像 B 站分区一样先看库，再进库看视频 ----------
+
+  Widget _libHome() {
+    final tier = tierForBattery(_grades, _battery);
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 96),
+      children: [
+        if (tier != null) _batteryBanner(tier),
+        _intakeCard(),
+        const SizedBox(height: 16),
+        Row(children: [
+          const Text('聚焦维度 · 库',
+              style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w700, color: kCultureInk)),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text('${_libs.length} 个库 · ${_items.length} 条',
+                style: const TextStyle(fontSize: 10.5, color: kCultureSub)),
+          ),
+          GestureDetector(
+            onTap: _newLib,
+            child: const Row(children: [
+              Icon(Icons.add, size: 14, color: kCultureAccent),
+              Text('新建', style: TextStyle(fontSize: 11, color: kCultureAccent)),
+            ]),
+          ),
+        ]),
+        const SizedBox(height: 8),
+        GridView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 2,
+            crossAxisSpacing: 10,
+            mainAxisSpacing: 10,
+            childAspectRatio: 1.38,
+          ),
+          itemCount: _libs.length + 1,
+          itemBuilder: (ctx, i) => i == _libs.length
+              ? _allLibCard()
+              : _libCard(Map<String, dynamic>.from(_libs[i] as Map)),
+        ),
+      ],
+    );
+  }
+
+  Widget _libCard(Map lib) {
+    final id = (lib['id'] as num?)?.toInt();
+    final items = _items.where((e) => e['lib_id'] == id).toList();
+    final unread =
+        items.where((e) => (e['state'] as num?)?.toInt() == 0).length;
+    return GestureDetector(
+      onTap: () {
+        setState(() => _libId = id);
+        _saveUi();
+      },
+      onLongPress: () => _libMenu(lib),
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: kCultureLine),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          SizedBox(height: 54, child: _mosaic(items, '${lib['icon'] ?? '📚'}')),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(9, 7, 9, 8),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('${lib['icon'] ?? ''} ${lib['name']}'.trim(),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      fontSize: 12.5, fontWeight: FontWeight.w700, color: kCultureInk)),
+              const SizedBox(height: 3),
+              Text(
+                items.isEmpty
+                    ? '空库 · 长按可改名/删除'
+                    : '${items.length} 条${unread > 0 ? ' · $unread 条没看' : ' · 都看过'}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 9.5, color: kCultureSub),
+              ),
+            ]),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Widget _allLibCard() {
+    return GestureDetector(
+      onTap: () {
+        setState(() => _libId = -1);
+        _saveUi();
+      },
+      child: Container(
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF0E7490), Color(0xFF155E75)],
+          ),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            const Icon(Icons.all_inbox, size: 18, color: Colors.white),
+            const Spacer(),
+            Text('${_items.length}',
+                style: const TextStyle(
+                    fontSize: 16, fontWeight: FontWeight.w800, color: Colors.white)),
+          ]),
+          const Spacer(),
+          const Text('全部内容',
+              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Colors.white)),
+          const SizedBox(height: 2),
+          const Text('不按库，按推荐/最新排',
+              style: TextStyle(fontSize: 9.5, color: Color(0xFFCFFAFE))),
+        ]),
+      ),
+    );
+  }
+
+  /// 库封面拼贴：最多三张，没封面就退回平台色块，避免一片灰。
+  Widget _mosaic(List items, String icon) {
+    final covers = items
+        .map((e) => '${e['cover'] ?? ''}'.trim())
+        .where((e) => e.isNotEmpty)
+        .take(3)
+        .toList();
+    if (covers.isEmpty) {
+      return Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFFE0F2FE), Color(0xFFF0F9FF)],
+          ),
+        ),
+        child: Center(child: Text(icon, style: const TextStyle(fontSize: 22))),
+      );
+    }
+    return Row(children: [
+      for (var i = 0; i < 3; i++)
+        Expanded(
+          child: i < covers.length
+              ? Image.network(
+                  covers[i],
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => Container(color: kCultureSoft),
+                )
+              : Container(color: const Color(0xFFF1F5F9)),
+        ),
+    ]);
+  }
+
+  Widget _intakeCard() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 13, 14, 13),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFF1E293B), Color(0xFF0F172A)],
+        ),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Row(children: [
+          Icon(Icons.content_paste_go, size: 17, color: Colors.white),
+          SizedBox(width: 6),
+          Text('复制链接，回来就能存',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Colors.white)),
+        ]),
+        const SizedBox(height: 7),
+        const Text(
+          '抖音 / B站 的分享文案整段复制，切回 App 会自动问「要不要引进」。\n'
+          '封面、标题、作者、时长自动抓，你只需要点一个分级标签。',
+          style: TextStyle(fontSize: 11.5, height: 1.7, color: Color(0xFFCBD5E1)),
+        ),
+        const SizedBox(height: 11),
+        Row(children: [
+          FilledButton.icon(
+            style: FilledButton.styleFrom(
+                backgroundColor: kCultureAccent,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                minimumSize: Size.zero),
+            onPressed: _intakeFromClipboard,
+            icon: const Icon(Icons.add_link, size: 16),
+            label: const Text('从剪贴板引进', style: TextStyle(fontSize: 12)),
+          ),
+          const SizedBox(width: 8),
+          TextButton(
+            style: TextButton.styleFrom(
+                foregroundColor: const Color(0xFFCBD5E1),
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                minimumSize: Size.zero),
+            onPressed: _addItem,
+            child: const Text('手动填', style: TextStyle(fontSize: 11.5)),
+          ),
+        ]),
+      ]),
+    );
+  }
+
+  Widget _batteryBanner(Map tier) {
+    final color = cultureGradeColor(((tier['max_b'] as num?)?.toInt() ?? 100));
+    final forbid = '${tier['forbid'] ?? ''}'.trim();
+    return GestureDetector(
+      onTap: () {
+        setState(() => _tab = 2);
+        _saveUi();
+      },
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 10),
+        padding: const EdgeInsets.fromLTRB(12, 9, 10, 9),
+        decoration: BoxDecoration(
+          color: color.withOpacity(0.08),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: color.withOpacity(0.28)),
+        ),
+        child: Row(children: [
+          Container(
+            width: 8,
+            height: 8,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 7),
+          Text('现在 ${_battery ?? 0}% · ${tier['name']}',
+              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700, color: color)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              forbid.isEmpty ? '点这里看这一档能看什么' : '别碰：$forbid',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 10, color: kCultureSub),
+            ),
+          ),
+          Icon(Icons.chevron_right, size: 16, color: color),
+        ]),
+      ),
+    );
   }
 
   Widget _libStrip() {
@@ -1289,11 +1768,24 @@ class _CulturePageState extends State<CulturePage> {
         padding: const EdgeInsets.symmetric(horizontal: 12),
         children: [
           _libChip(
-            label: '全部',
-            count: total,
+            label: '库',
+            count: _libs.length,
             selected: _libId == null,
             onTap: () {
-              setState(() => _libId = null);
+              setState(() {
+                _libId = null;
+                _tierFilter = -1;
+              });
+              _saveUi();
+            },
+            onLongPress: null,
+          ),
+          _libChip(
+            label: '全部',
+            count: total,
+            selected: _libId == -1,
+            onTap: () {
+              setState(() => _libId = -1);
               _saveUi();
             },
             onLongPress: null,
@@ -1367,16 +1859,86 @@ class _CulturePageState extends State<CulturePage> {
     );
   }
 
+  /// 分级筛选条：内容分级标签就在这里，点一下只看这一档。
+  Widget _gradeStrip() {
+    if (_grades.isEmpty) return const SizedBox.shrink();
+    return Container(
+      height: 38,
+      color: Colors.white,
+      padding: const EdgeInsets.only(bottom: 6),
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        children: [
+          _tierChip(null, '全部档', _items.length),
+          for (final g in _grades)
+            _tierChip(
+              g as Map,
+              '${g['name'] ?? ''}',
+              _items.where((e) => (e['grade_tier'] as num?)?.toInt() == (g['tier'] as num?)?.toInt()).length,
+            ),
+          _tierChip(const {'tier': 0, 'name': '未标级', 'max_b': 100}, '未标级',
+              _items.where((e) => ((e['grade_tier'] as num?)?.toInt() ?? 0) == 0).length,
+              mono: true),
+        ],
+      ),
+    );
+  }
+
+  Widget _tierChip(Map? g, String label, int count, {bool mono = false}) {
+    final tier = g == null ? -1 : ((g['tier'] as num?)?.toInt() ?? 0);
+    final on = _tierFilter == tier;
+    final color = g == null
+        ? kCultureAccent
+        : (mono ? const Color(0xFF94A3B8) : cultureGradeColor(((g['max_b'] as num?)?.toInt() ?? 100)));
+    return GestureDetector(
+      onTap: () {
+        setState(() {
+          _tierFilter = on ? -1 : tier;
+          _libId ??= -1;
+        });
+        _saveUi();
+      },
+      child: Container(
+        margin: const EdgeInsets.only(right: 6, top: 2, bottom: 2),
+        padding: const EdgeInsets.symmetric(horizontal: 9),
+        decoration: BoxDecoration(
+          color: on ? color.withOpacity(0.12) : const Color(0xFFF8FAFC),
+          borderRadius: BorderRadius.circular(7),
+          border: Border.all(color: on ? color : kCultureLine),
+        ),
+        child: Row(children: [
+          Container(
+            width: 6,
+            height: 6,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 4),
+          Text(label,
+              style: TextStyle(
+                  fontSize: 10.5,
+                  fontWeight: on ? FontWeight.w700 : FontWeight.w500,
+                  color: on ? color : kCultureSub)),
+          const SizedBox(width: 3),
+          Text('$count', style: const TextStyle(fontSize: 9, color: Color(0xFF94A3B8))),
+        ]),
+      ),
+    );
+  }
+
   Widget _filterRow(int count) {
     const labels = ['全部', '未看', '收藏', '看过'];
     final lib = _libOf(_libId);
+    final title = _libId == -1
+        ? '全部内容'
+        : (lib == null ? '全部内容' : '${lib['name']}${'${lib['note'] ?? ''}'.isEmpty ? '' : ' · ${lib['note']}'}');
     return Container(
       color: Colors.white,
       padding: const EdgeInsets.fromLTRB(12, 0, 8, 8),
       child: Row(children: [
         Expanded(
           child: Text(
-            lib == null ? '全部内容' : '${lib['name']} · ${lib['note'] ?? ''}',
+            title,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(fontSize: 11.5, color: kCultureSub),
@@ -1403,7 +1965,21 @@ class _CulturePageState extends State<CulturePage> {
                   )),
             ),
           ),
-        const SizedBox(width: 4),
+        PopupMenuButton<int>(
+          tooltip: '排序',
+          padding: EdgeInsets.zero,
+          icon: const Icon(Icons.swap_vert, size: 18, color: kCultureSub),
+          onSelected: (v) {
+            setState(() => _sortMode = v);
+            _saveUi();
+          },
+          itemBuilder: (_) => const [
+            PopupMenuItem(value: 0, child: Text('推荐顺序', style: TextStyle(fontSize: 13))),
+            PopupMenuItem(value: 1, child: Text('最新引进', style: TextStyle(fontSize: 13))),
+            PopupMenuItem(value: 2, child: Text('收藏优先', style: TextStyle(fontSize: 13))),
+            PopupMenuItem(value: 3, child: Text('时长从短到长', style: TextStyle(fontSize: 13))),
+          ],
+        ),
         IconButton(
           tooltip: '切换呈现方式',
           visualDensity: VisualDensity.compact,
@@ -1414,7 +1990,7 @@ class _CulturePageState extends State<CulturePage> {
                 ? Icons.view_agenda_outlined
                 : _view == 1
                     ? Icons.grid_view_rounded
-                    : Icons.view_list_outlined,
+                    : Icons.dashboard_outlined,
             size: 18,
             color: kCultureSub,
           ),
@@ -1431,6 +2007,135 @@ class _CulturePageState extends State<CulturePage> {
     );
   }
 
+  /// 海报流：两列 16:9 封面，B 站式扫读；一屏能看到 6 条。
+  Widget _posterGrid(List items) {
+    return GridView.builder(
+      padding: const EdgeInsets.fromLTRB(10, 10, 10, 96),
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 260,
+        mainAxisExtent: 186,
+        crossAxisSpacing: 10,
+        mainAxisSpacing: 12,
+      ),
+      itemCount: items.length,
+      itemBuilder: (ctx, i) {
+        final item = items[i] as Map;
+        final platform = '${item['platform'] ?? ''}';
+        final color = culturePlatformColor(platform);
+        final title = '${item['title'] ?? ''}';
+        final read = (item['state'] as num?)?.toInt() ?? 0;
+        return GestureDetector(
+          onTap: () => _openItem(item),
+          onLongPress: () => _itemMenu(item),
+          child: Container(
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: kCultureLine),
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              AspectRatio(
+                aspectRatio: 16 / 9,
+                child: _cover(item, color, title, radius: 0),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(8, 7, 8, 8),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(title.isEmpty ? '（无标题）' : title,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                          fontSize: 12,
+                          height: 1.32,
+                          fontWeight: FontWeight.w600,
+                          color: read == 2 ? const Color(0xFF94A3B8) : kCultureInk)),
+                  const SizedBox(height: 5),
+                  Row(children: [
+                    if (platform.isNotEmpty) _platformTag(platform, color),
+                    const SizedBox(width: 4),
+                    _gradeBadge(item),
+                    const Spacer(),
+                    if ((item['fav'] as num?)?.toInt() == 1)
+                      const Icon(Icons.star, size: 12, color: Color(0xFFF59E0B)),
+                  ]),
+                ]),
+              ),
+            ]),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 分级小标签：绿 / 黄 / 橙 / 红，未标级显示灰点。
+  Widget _gradeBadge(Map item) {
+    final t = (item['grade_tier'] as num?)?.toInt() ?? 0;
+    Map? g;
+    for (final e in _grades) {
+      if ((e['tier'] as num?)?.toInt() == t) g = e as Map;
+    }
+    if (t == 0 || g == null) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+        decoration: BoxDecoration(
+            color: const Color(0xFFF1F5F9), borderRadius: BorderRadius.circular(4)),
+        child: const Text('未标级',
+            style: TextStyle(fontSize: 8.5, color: Color(0xFF94A3B8))),
+      );
+    }
+    final color = cultureGradeColor(((g['max_b'] as num?)?.toInt() ?? 100));
+    final name = '${g['name'] ?? ''}';
+    final short = name.length >= 2 ? name.substring(0, 1) : name;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+      decoration: BoxDecoration(
+          color: color.withOpacity(0.12), borderRadius: BorderRadius.circular(4)),
+      child: Text(short,
+          style: TextStyle(fontSize: 8.5, color: color, fontWeight: FontWeight.w700)),
+    );
+  }
+
+  Future _intakeFromClipboard() async {
+    String text = '';
+    try {
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      text = data?.text ?? '';
+    } catch (_) {}
+    final parsed = parseShareText(text);
+    if (parsed.isEmpty) {
+      _toast('剪贴板里没有可识别的链接，先复制一条分享文案');
+      return;
+    }
+    await _openIntake(parsed);
+  }
+
+  Future<void> _openIntake(ParsedShare share) async {
+    if (_libs.isEmpty) {
+      await _newLib();
+      if (!mounted) return;
+    }
+    final ok = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => ContentIntakeSheet(
+        db: widget.db,
+        share: share,
+        libs: _libs,
+        grades: _grades,
+        battery: _battery,
+      ),
+    );
+    if (ok == true) {
+      await _reload();
+      if (!mounted) return;
+      setState(() {
+        _tab = 0;
+        _libId = -1;
+      });
+    }
+  }
   Widget _emptyInflow() {
     final lib = _libOf(_libId);
     return Center(
@@ -1450,18 +2155,25 @@ class _CulturePageState extends State<CulturePage> {
           ),
           const SizedBox(height: 6),
           const Text(
-            '把看到的好东西扔进来：链接 + 一句话标题就够了。\n'
-            '库会按聚焦维度自动对齐，找的时候先搜关键词。',
+            '在抖音 / B站 复制分享文案，切回来就会问你「要不要引进」。\n'
+            '封面和标题自动抓，你只选分级；找不到就先手动存一条。',
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 12, height: 1.7, color: kCultureSub),
           ),
-          const SizedBox(height: 16),
-          FilledButton.icon(
-            style: FilledButton.styleFrom(backgroundColor: kCultureAccent),
-            onPressed: () => _addItem(),
-            icon: const Icon(Icons.add_link, size: 18),
-            label: const Text('存第一条'),
-          ),
+          const SizedBox(height: 14),
+          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            FilledButton.icon(
+              style: FilledButton.styleFrom(backgroundColor: kCultureAccent),
+              onPressed: _intakeFromClipboard,
+              icon: const Icon(Icons.content_paste_go, size: 17),
+              label: const Text('从剪贴板引进', style: TextStyle(fontSize: 12.5)),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton(
+              onPressed: () => _addItem(),
+              child: const Text('手动填', style: TextStyle(fontSize: 12.5)),
+            ),
+          ]),
         ]),
       ),
     );
@@ -1492,7 +2204,8 @@ class _CulturePageState extends State<CulturePage> {
       child: InkWell(
         onTap: () => _openItem(item),
         onLongPress: () => _itemMenu(item),
-        child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        // 列表里高度不受限，Row 不能用 stretch，否则会拿到无限高约束。
+        child: Row(children: [
           SizedBox(
             width: 128,
             height: 84,
@@ -1519,11 +2232,8 @@ class _CulturePageState extends State<CulturePage> {
                   const SizedBox(height: 4),
                   Row(children: [
                     if (platform.isNotEmpty) _platformTag(platform, color),
-                    if ('${item['duration'] ?? ''}'.isNotEmpty) ...[
-                      const SizedBox(width: 5),
-                      Text('${item['duration']}',
-                          style: const TextStyle(fontSize: 10, color: kCultureSub)),
-                    ],
+                    const SizedBox(width: 4),
+                    _gradeBadge(item),
                     const Spacer(),
                     if ((item['fav'] as num?)?.toInt() == 1)
                       const Icon(Icons.star, size: 13, color: Color(0xFFF59E0B)),
@@ -1678,6 +2388,7 @@ class _CulturePageState extends State<CulturePage> {
               (item['state'] as num?)?.toInt() == 2 ? '标记为未看' : '标记已看完',
               'read'),
           _sheetAction(Icons.build_outlined, '转成工具包（再创作）', 'kit'),
+          _sheetAction(Icons.signal_cellular_alt, '设置分级', 'grade'),
           _sheetAction(Icons.edit_outlined, '编辑这条', 'edit'),
           if ('${item['url'] ?? ''}'.isNotEmpty)
             _sheetAction(Icons.copy, '复制链接', 'copy'),
@@ -1712,6 +2423,9 @@ class _CulturePageState extends State<CulturePage> {
           builder: (_) => CultureKitPage(db: db, kitId: id),
         ));
         _reload();
+        break;
+      case 'grade':
+        await _pickGrade(item);
         break;
       case 'edit':
         _editItem(item);
@@ -1876,43 +2590,59 @@ class _CulturePageState extends State<CulturePage> {
   // ---------- 流量算法 ----------
 
   Widget _algoBody() {
-    final today = culturePickToday(_libs, _items, _sources);
-    return ListView(padding: const EdgeInsets.fromLTRB(12, 10, 12, 90), children: [
-      Container(
-        padding: const EdgeInsets.fromLTRB(14, 13, 14, 13),
-        decoration: BoxDecoration(
-          gradient: const LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [Color(0xFF0E7490), Color(0xFF155E75)],
-          ),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Row(children: [
-            Icon(Icons.alt_route, size: 17, color: Colors.white),
-            SizedBox(width: 6),
-            Text('直达优质资源',
-                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Colors.white)),
-          ]),
-          const SizedBox(height: 7),
-          Text(
-            '别在推荐流里刮彩票。把真正好的源钉在这里，权重越高越靠前；'
-            '每天只从这里取 ${today.isEmpty ? 3 : today.length} 条，看完就关。',
-            style: const TextStyle(fontSize: 11.5, height: 1.65, color: Color(0xFFCFFAFE)),
-          ),
-        ]),
-      ),
+    final res = recommendContent(
+      items: _items,
+      libs: _libs,
+      grades: _grades,
+      sources: _sources,
+      focusDims: _focusDims,
+      battery: _battery,
+      limit: 3,
+      offset: _batch,
+      onlyCurrentTier: _onlyCurrentTier,
+    );
+    final tier = res.tier;
+    final color = tier == null
+        ? kCultureAccent
+        : cultureGradeColor(((tier['max_b'] as num?)?.toInt() ?? 100));
+
+    return ListView(padding: const EdgeInsets.fromLTRB(12, 10, 12, 96), children: [
+      _batteryCard(res, color),
       const SizedBox(height: 14),
       Row(children: [
-        const Text('今日 3 条',
+        const Text('现在能看的 3 条',
             style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w700, color: kCultureInk)),
-        const SizedBox(width: 6),
-        const Text('按权重 / 收藏 / 没看过的，各库轮流取',
-            style: TextStyle(fontSize: 10.5, color: kCultureSub)),
         const Spacer(),
+        GestureDetector(
+          onTap: () {
+            setState(() => _onlyCurrentTier = !_onlyCurrentTier);
+            _saveUi();
+          },
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: _onlyCurrentTier ? color.withOpacity(0.1) : const Color(0xFFF1F5F9),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                  color: _onlyCurrentTier ? color.withOpacity(0.4) : kCultureLine),
+            ),
+            child: Row(children: [
+              Icon(_onlyCurrentTier ? Icons.filter_alt : Icons.filter_alt_off,
+                  size: 12,
+                  color: _onlyCurrentTier ? color : kCultureSub),
+              const SizedBox(width: 3),
+              Text('只看这一档',
+                  style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                      color: _onlyCurrentTier ? color : kCultureSub)),
+            ]),
+          ),
+        ),
         TextButton(
-          onPressed: _reload,
+          onPressed: () {
+            setState(() => _batch++);
+          },
           style: TextButton.styleFrom(
             padding: const EdgeInsets.symmetric(horizontal: 6),
             minimumSize: Size.zero,
@@ -1921,8 +2651,13 @@ class _CulturePageState extends State<CulturePage> {
           child: const Text('换一批', style: TextStyle(fontSize: 11)),
         ),
       ]),
-      const SizedBox(height: 6),
-      if (today.isEmpty)
+      Text(res.note,
+          style: TextStyle(
+              fontSize: 10,
+              height: 1.5,
+              color: res.blocked ? const Color(0xFFDC2626) : kCultureSub)),
+      const SizedBox(height: 8),
+      if (res.isEmpty)
         Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
@@ -1930,13 +2665,25 @@ class _CulturePageState extends State<CulturePage> {
             borderRadius: BorderRadius.circular(10),
             border: Border.all(color: kCultureLine),
           ),
-          child: const Text(
-            '内容库还是空的。先去「内容引进」存两条，这里才会给你排今天该看的。',
-            style: TextStyle(fontSize: 11.5, height: 1.6, color: kCultureSub),
-          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('这一档没有能推的',
+                style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: kCultureInk)),
+            const SizedBox(height: 5),
+            const Text(
+              '要么去「内容引进」补两条并标上这一档；要么先把「只看这一档」关掉，看看别的档有什么。',
+              style: TextStyle(fontSize: 11.5, height: 1.6, color: kCultureSub),
+            ),
+            const SizedBox(height: 10),
+            FilledButton.icon(
+              style: FilledButton.styleFrom(backgroundColor: kCultureAccent),
+              onPressed: _intakeFromClipboard,
+              icon: const Icon(Icons.add_link, size: 17),
+              label: const Text('从剪贴板引进'),
+            ),
+          ]),
         )
       else
-        for (final it in today) _todayCard(it),
+        for (final it in res.items) _recoCard(it, color),
       const SizedBox(height: 18),
       Row(children: [
         const Text('优质源',
@@ -1976,40 +2723,122 @@ class _CulturePageState extends State<CulturePage> {
     ]);
   }
 
-  Widget _todayCard(Map item) {
+  /// 顶部电量卡：把「为什么推这些」说清楚，而不是黑箱。
+  Widget _batteryCard(RecommendResult res, Color color) {
+    final tier = res.tier;
+    final battery = res.battery;
+    final allow = '${tier?['allow'] ?? ''}'.trim();
+    final forbid = '${tier?['forbid'] ?? ''}'.trim();
+    final tierNote = '${tier?['note'] ?? ''}'.trim();
+    final batteryNote = battery == null
+        ? '没有电量就分不清「现在该学」还是「现在该睡」。先去「医疗」记一次，再回来。'
+        : (tierNote.isEmpty ? '按这一档的承载力给你排内容。' : tierNote);
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 13, 14, 13),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [color, Color.lerp(color, Colors.black, 0.22)!],
+        ),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.bolt, size: 18, color: Colors.white),
+          const SizedBox(width: 5),
+          Text(battery == null ? '还没记电量' : '前额叶电量 $battery%',
+              style: const TextStyle(
+                  fontSize: 14, fontWeight: FontWeight.w800, color: Colors.white)),
+          const Spacer(),
+          if (tier != null)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.18),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Text('${tier['name']}',
+                  style: const TextStyle(
+                      fontSize: 11, fontWeight: FontWeight.w700, color: Colors.white)),
+            ),
+        ]),
+        const SizedBox(height: 8),
+        Text(
+          batteryNote,
+          style: const TextStyle(fontSize: 11.5, height: 1.65, color: Colors.white),
+        ),
+        if (allow.isNotEmpty) ...[
+          const SizedBox(height: 7),
+          Text('能做：$allow',
+              style: const TextStyle(fontSize: 10.5, height: 1.5, color: Colors.white70)),
+        ],
+        if (forbid.isNotEmpty) ...[
+          const SizedBox(height: 3),
+          Text('别碰：$forbid',
+              style: const TextStyle(
+                  fontSize: 10.5, height: 1.5, color: Color(0xFFFEE2E2), fontWeight: FontWeight.w600)),
+        ],
+      ]),
+    );
+  }
+
+  Widget _recoCard(Map item, Color tierColor) {
     final platform = '${item['platform'] ?? ''}';
     final color = culturePlatformColor(platform);
     final lib = _libOf((item['lib_id'] as num?)?.toInt());
+    final reason = '${item['_reason'] ?? ''}';
+    final kind = '${item['kind'] ?? '视频'}';
     return GestureDetector(
       onTap: () => _openItem(item),
+      onLongPress: () => _itemMenu(item),
       child: Container(
-        margin: const EdgeInsets.only(bottom: 8),
-        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+        margin: const EdgeInsets.only(bottom: 9),
         decoration: BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.circular(10),
           border: Border.all(color: kCultureLine),
         ),
+        clipBehavior: Clip.antiAlias,
         child: Row(children: [
-          Container(width: 3, height: 34, decoration: BoxDecoration(
-            color: color, borderRadius: BorderRadius.circular(2))),
-          const SizedBox(width: 10),
+          SizedBox(width: 104, height: 64, child: _cover(item, color, '${item['title'] ?? ''}', radius: 0)),
           Expanded(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text('${item['title'] ?? ''}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                      fontSize: 12.5, fontWeight: FontWeight.w600, color: kCultureInk)),
-              const SizedBox(height: 3),
-              Text(
-                '${lib?['name'] ?? ''} · ${platform.isEmpty ? '网页' : platform}'
-                '${'${item['duration'] ?? ''}'.isEmpty ? '' : ' · ${item['duration']}'}',
-                style: const TextStyle(fontSize: 10.5, color: kCultureSub),
-              ),
-            ]),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('${item['title'] ?? ''}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        fontSize: 12.5, height: 1.3, fontWeight: FontWeight.w600, color: kCultureInk)),
+                const SizedBox(height: 4),
+                Row(children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                    decoration: BoxDecoration(
+                        color: tierColor.withOpacity(0.12),
+                        borderRadius: BorderRadius.circular(4)),
+                    child: Text(kind,
+                        style: TextStyle(
+                            fontSize: 8.5, color: tierColor, fontWeight: FontWeight.w700)),
+                  ),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      '${lib?['name'] ?? ''}${reason.isEmpty ? '' : ' · $reason'}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 9.5, color: kCultureSub),
+                    ),
+                  ),
+                ]),
+              ]),
+            ),
           ),
-          const Icon(Icons.play_circle_fill, size: 24, color: kCultureAccent),
+          const Padding(
+            padding: EdgeInsets.only(right: 8),
+            child: Icon(Icons.play_circle_fill, size: 24, color: kCultureAccent),
+          ),
         ]),
       ),
     );
@@ -2519,12 +3348,17 @@ class _CulturePageState extends State<CulturePage> {
     );
   }
 
-  Widget _sheetAction(IconData icon, String label, String value, {bool danger = false}) {
+  Widget _sheetAction(IconData icon, String label, String value,
+      {bool danger = false, String? note}) {
     final color = danger ? const Color(0xFFDC2626) : kCultureInk;
     return ListTile(
       dense: true,
       leading: Icon(icon, size: 19, color: color),
       title: Text(label, style: TextStyle(fontSize: 13, color: color)),
+      subtitle: (note == null || note.trim().isEmpty)
+          ? null
+          : Text(note,
+              style: const TextStyle(fontSize: 10.5, height: 1.4, color: kCultureSub)),
       onTap: () => Navigator.pop(context, value),
     );
   }
@@ -2564,9 +3398,9 @@ class _CulturePageState extends State<CulturePage> {
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 2, 16, 14),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: const [
-            _HelpLine('内容引进', '别再从推荐流里碰运气。按聚焦维度建库，一条内容 = 链接 + 一句话，找的时候搜关键词，10 秒拿到。'),
+            _HelpLine('内容引进', '复制抖音 / B站 的分享文案，切回来会自动问要不要引进：封面、标题、作者、时长自动抓，你只点一个分级标签。库按聚焦维度自动建，进库就是 16:9 海报流，配搜索 / 分级筛选，10 秒定位。'),
             _HelpLine('再创作', '看完不等于留下。把内容转成工具包：目标、步骤、模板正文，勾着做完，能复制能分享。'),
-            _HelpLine('流量算法', '把真正好的源钉住并排权重，每天只从里面取 3 条，用内置浏览器看完就走，不跳去别的 App。'),
+            _HelpLine('流量算法', '不再按「最新」喂你。先读医疗页的前额叶电量，落在哪一档就只推那一档能承接的内容；同档优先、今日聚焦加权、同库最多两条。红灯区会直接告诉你别看了。'),
             _HelpLine('分级', '同一件事在满血和见底时性质不同。四档写清能做什么、别碰什么；医疗页记一次电量，这里会高亮你在哪一档。'),
             SizedBox(height: 6),
             Text('库、内容、工具包、优质源、分级都可以编辑和删除：点条目右上角「⋯」或在详情页里改，改完即存。',
@@ -2613,6 +3447,7 @@ class _HelpLine extends StatelessWidget {
 class CultureItemSheet extends StatefulWidget {
   final Database db;
   final List libs;
+  final List grades;
   final int libId;
   final Map? item;
   final Future Function()? onSaved;
@@ -2621,6 +3456,7 @@ class CultureItemSheet extends StatefulWidget {
     required this.db,
     required this.libs,
     required this.libId,
+    this.grades = const [],
     this.item,
     this.onSaved,
   });
@@ -2635,10 +3471,14 @@ class _CultureItemSheetState extends State<CultureItemSheet> {
   late TextEditingController _note;
   late TextEditingController _cover;
   late TextEditingController _duration;
+  late TextEditingController _author;
   late int _libId;
+  late int _tier;
   late String _kind;
   bool _pasteBusy = false;
   String? _err;
+
+  List get _gradesForSheet => widget.grades;
 
   @override
   void initState() {
@@ -2650,6 +3490,10 @@ class _CultureItemSheetState extends State<CultureItemSheet> {
     _note = TextEditingController(text: '${it?['note'] ?? ''}');
     _cover = TextEditingController(text: '${it?['cover'] ?? ''}');
     _duration = TextEditingController(text: '${it?['duration'] ?? ''}');
+    _author = TextEditingController(text: '${it?['author'] ?? ''}');
+    _tier = (it?['grade_tier'] as num?)?.toInt() ?? 0;
+    // 分级可能被删过，下拉框的 value 必须能在 items 里找到，否则会断言失败。
+    if (!widget.grades.any((g) => (g['tier'] as num?)?.toInt() == _tier)) _tier = 0;
     _kind = '${it?['kind'] ?? '视频'}';
     _libId = widget.libId != 0
         ? widget.libId
@@ -2668,6 +3512,7 @@ class _CultureItemSheetState extends State<CultureItemSheet> {
     _note.dispose();
     _cover.dispose();
     _duration.dispose();
+    _author.dispose();
     super.dispose();
   }
 
@@ -2711,6 +3556,8 @@ class _CultureItemSheetState extends State<CultureItemSheet> {
       'note': _note.text.trim(),
       'cover': _cover.text.trim(),
       'duration': _duration.text.trim(),
+      'author': _author.text.trim(),
+      'grade_tier': _tier,
     };
     if (widget.item == null) {
       await CultureDb.addItem(widget.db, data);
@@ -2813,6 +3660,38 @@ class _CultureItemSheetState extends State<CultureItemSheet> {
                         value: k, child: Text(k, style: const TextStyle(fontSize: 12.5))),
                 ],
                 onChanged: (v) => setState(() => _kind = v ?? _kind),
+              ),
+            ),
+          ]),
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(
+              child: TextField(
+                controller: _author,
+                style: const TextStyle(fontSize: 13),
+                decoration: const InputDecoration(
+                    labelText: '作者 / UP 主（可选）',
+                    isDense: true,
+                    border: OutlineInputBorder()),
+              ),
+            ),
+            const SizedBox(width: 8),
+            SizedBox(
+              width: 132,
+              child: DropdownButtonFormField<int>(
+                value: _tier,
+                isDense: true,
+                decoration: const InputDecoration(
+                    labelText: '分级', isDense: true, border: OutlineInputBorder()),
+                items: [
+                  const DropdownMenuItem(value: 0, child: Text('先不标', style: TextStyle(fontSize: 12))),
+                  for (final g in _gradesForSheet)
+                    DropdownMenuItem(
+                      value: (g['tier'] as num?)?.toInt() ?? 0,
+                      child: Text('${g['name'] ?? ''}', style: const TextStyle(fontSize: 12)),
+                    ),
+                ],
+                onChanged: (v) => setState(() => _tier = v ?? 0),
               ),
             ),
           ]),
