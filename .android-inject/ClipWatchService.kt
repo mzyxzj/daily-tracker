@@ -64,6 +64,7 @@ class ClipWatchService : AccessibilityService() {
     private var lastBlindAt: Long = 0L
     private var blindPkg: String = ""
     private var recentContentAt: Long = 0L
+    private var recentContentPkg: String = ""
     private var promptToken: Long = 0L
 
     // 悬浮窗兜底时挂着的 View，别泄漏
@@ -107,10 +108,18 @@ class ClipWatchService : AccessibilityService() {
         if (pkg.isNotEmpty() && pkg != packageName) {
             lastPkg = pkg
             lastEventAt = now
-            if (isContentApp(pkg)) recentContentAt = now
+            if (isContentApp(pkg)) {
+                recentContentAt = now
+                recentContentPkg = pkg
+            }
         }
-        // 只在自己和内容类 App 里干活；银行/输入法那种地方连剪贴板都不碰。
-        if (!isContentApp(pkg)) return
+        // 只在自己和「内容类 App 的上下文」里干活；银行/输入法那种地方连剪贴板都不碰。
+        //
+        // 注意不能只认当前包名：部分 ROM 的分享面板是 systemui 弹出的，
+        // 点「复制链接」时事件包名会变成 com.android.systemui，
+        // 只看当前包就会漏掉刚在 B站 里点的那一下。所以 15 秒内停留过内容 App 也算。
+        val inContent = isContentApp(pkg) || (now - recentContentAt < 15000)
+        if (!inContent) return
 
         val t = e.eventType
 
@@ -232,7 +241,23 @@ class ClipWatchService : AccessibilityService() {
         if (now - lastBlindAt < 12000) return
         blindPkg = lastPkg
         lastBlindAt = now
-        showPrompt("")
+        // 盲弹没有正文，但至少能说出平台，用户一眼知道这条是从哪来的。
+        showPrompt("", guessPlatform(recentContentPkg))
+    }
+
+    private fun guessPlatform(pkg: String): String {
+        return when (pkg) {
+            "tv.danmaku.bili" -> "B站"
+            "com.ss.android.ugc.aweme", "com.ss.android.ugc.aweme.lite",
+            "com.ss.android.ugc.live" -> "抖音"
+            "com.xingin.xhs" -> "小红书"
+            "com.zhihu.android" -> "知乎"
+            "com.sina.weibo" -> "微博"
+            "com.tencent.mm" -> "公众号"
+            "com.smile.gifmaker" -> "快手"
+            "com.google.android.youtube" -> "YouTube"
+            else -> ""
+        }
     }
 
     private fun looksLikeShare(text: String): Boolean {
@@ -292,7 +317,7 @@ class ClipWatchService : AccessibilityService() {
     }
 
     /// 弹提示卡：先走透明 Activity（体验最好），700ms 内拿不到「已显示」回执就换通道。
-    private fun showPrompt(text: String) {
+    private fun showPrompt(text: String, guessPlat: String = "") {
         if (promptShowing) return
         promptShowing = true
         lastOverlayAt = System.currentTimeMillis()
@@ -315,6 +340,7 @@ class ClipWatchService : AccessibilityService() {
                 if (p.isNotEmpty()) i.putExtra(ClipPromptActivity.EXTRA_PLATFORM, p)
             } else {
                 i.putExtra(MainActivity.EXTRA_READ_CLIP, true)
+                if (guessPlat.isNotEmpty()) i.putExtra(ClipPromptActivity.EXTRA_PLATFORM, guessPlat)
             }
             i.putExtra(ClipPromptActivity.EXTRA_TOKEN, token)
             startActivity(i)

@@ -43,8 +43,8 @@
 | `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
 | `lib/player_target.dart` | 6,481 | `bbfbb1328e00507d5e1d6aec0bcead12` |
 | `.android-inject/MainActivity.kt` | 10,982 | `f5fdf1329b6c2845f2049877753c2c3a` |
-| `.android-inject/ClipWatchService.kt` | 26,355 | `05acd6eadc975aeb0993a6ed0d078620` |
-| `.android-inject/ClipPromptActivity.kt` | 6,938 | `31b73bedfcbab2026b37f297188b992e` |
+| `.android-inject/ClipWatchService.kt` | 27,680 | `8ee6f331c44181cb2198d499c36081e9` |
+| `.android-inject/ClipPromptActivity.kt` | 7,038 | `607e69c1ee6ee589890f5fd9d4e0e48a` |
 | `.android-inject/ApkProvider.kt` | 1,937 | `7c62fa727307282c4ac3b31494cd6b2b` |
 | `.android-inject/patch.py` | 11,142 | `e3187f554e526518c3a1befa50771057` |
 | `.android-inject/dt-release.jks` | 2,704 | `4ad915351096720f929147c9554d725a` |

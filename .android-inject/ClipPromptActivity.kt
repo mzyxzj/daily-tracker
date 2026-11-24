@@ -106,7 +106,10 @@ class ClipPromptActivity : Activity() {
             ellipsize = TextUtils.TruncateAt.END
             setPadding(0, dp(3), 0, 0)
             if (blind) {
-                setText("系统不让后台读剪贴板 · 点「整理」后自动接上")
+                setText(
+                    if (plat.isEmpty()) "点「整理」后自动接上剪贴板"
+                    else "$plat · 点「整理」后自动接上"
+                )
             } else {
                 val brief = text.replace("\n", " ").trim()
                 val cut = if (brief.length > 40) brief.substring(0, 40) + "…" else brief
