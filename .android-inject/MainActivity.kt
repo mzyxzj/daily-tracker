@@ -3,6 +3,7 @@ package __PKG__
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -128,6 +129,8 @@ class MainActivity : FlutterActivity() {
                 "status" -> result.success(ClipWatchService.status(this))
                 "test" -> result.success(ClipWatchService.test())
                 "readClip" -> result.success(readClipSafe())
+                "notifyReady" -> result.success(ClipWatchService.canNotify(this))
+                "requestNotify" -> result.success(requestNotifyPermission())
                 "openSettings" -> result.success(openAccessibilitySettings())
                 "openOverlaySettings" -> result.success(openOverlaySettings())
                 else -> result.notImplemented()
@@ -244,6 +247,25 @@ class MainActivity : FlutterActivity() {
             val i = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(i)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 通知权限（Android 13+ 是运行时权限）。
+     *
+     * 为什么需要：ColorOS 会静默拦「后台弹出界面」，startActivity 不报错也不显示。
+     * 这时唯一的兜底是发通知 —— 但没授权的话通知会被直接丢弃，用户还是什么都看不到。
+     */
+    private fun requestNotifyPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
+        return try {
+            val granted = checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED
+            if (granted) return false
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 2001)
             true
         } catch (e: Exception) {
             false

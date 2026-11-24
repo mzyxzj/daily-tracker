@@ -643,6 +643,13 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
   /// 服务进程还活着、能不能读剪贴板、浮层权限给没给。这三件事分开显示。
   Future<void> _showClipDiag() async {
     var st = _clipStatus;
+    // 打开自检时顺手要一次通知权限：ColorOS 拦掉「后台弹出界面」后，
+    // 唯一的兜底就是通知；没权限的话通知会被系统静默丢弃，用户还是什么都看不到。
+    if (!st.notifyPermission) {
+      await NativeClip.requestNotify();
+      st = await NativeClip.status();
+    }
+    if (!mounted) return;
     await showDialog<void>(
       context: context,
       builder: (dctx) => StatefulBuilder(builder: (dctx, setSt) {
@@ -692,11 +699,17 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
                     good: st.connected, bad: !st.connected),
                 row('浮层权限', st.overlayPermission ? '已授权' : '未授权',
                     good: st.overlayPermission, bad: false),
+                row('通知权限', st.notifyPermission ? '已授权' : '未授权',
+                    good: st.notifyPermission, bad: false),
+                row('上次提示方式', st.viaLabel,
+                    good: st.promptVia == 'activity' || st.promptVia == 'notification' || st.promptVia == 'overlay',
+                    bad: st.promptVia == 'none'),
                 const Divider(color: Colors.white10, height: 16),
                 row('最近一次系统事件', ago(st.lastEventAgo)),
-                row('最近读到剪贴板', ago(st.lastClipAgo),
-                    bad: st.lastClipAgo < 0 && st.enabled),
-                row('最近弹过提示卡', ago(st.lastOverlayAgo)),
+                row('最近识别到「复制」', ago(st.lastCopySignalAgo),
+                    bad: st.lastCopySignalAgo < 0 && st.enabled),
+                row('最近读到剪贴板', ago(st.lastClipAgo)),
+                row('最近弹过提示', ago(st.lastOverlayAgo)),
                 if (st.lastPkg.isNotEmpty) row('最近前台 App', st.lastPkg),
                 if (st.error.isNotEmpty)
                   Padding(
@@ -717,9 +730,11 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
                         ? '系统把它停了（小米/OPPO 常见）：去设置里关掉再打开一次，然后回来点「刷新」。'
                         : (!st.enabled
                             ? '还没开启。点下面「去开启」，在系统列表里找到「文化 · 复制即整理」打开。'
-                            : (noOverlay
-                                ? '已经能用。再给一个「显示在其他应用上层」权限，提示卡能从后台弹出来（安卓 10 起后台起界面的前提）。'
-                                : '一切正常。复制一条抖音/B站分享链接试试，屏幕上方会立刻出现「整理 / 略过」。')),
+                            : (!st.notifyPermission
+                                ? '通知权限没开。ColorOS 会拦「后台弹出界面」，这种时候我们改发通知提醒；不给通知权限，就什么都看不到。点「通知权限」开一下。'
+                                : (!st.overlayPermission
+                                    ? '已经能用。再给一个「显示在其他应用上层」权限，提示卡能更稳地从后台弹出来。'
+                                    : '一切正常。去 B站/抖音 点「复制链接」，屏幕上方会立刻出现「整理 / 略过」。'))),
                     style: const TextStyle(
                         fontSize: 10.5, height: 1.65, color: Colors.white60),
                   ),
@@ -730,6 +745,14 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
           actionsOverflowDirection: VerticalDirection.down,
           actions: [
             TextButton(onPressed: refresh, child: const Text('刷新')),
+            if (!st.notifyPermission)
+              TextButton(
+                onPressed: () async {
+                  await NativeClip.requestNotify();
+                  await refresh();
+                },
+                child: const Text('通知权限'),
+              ),
             if (noOverlay)
               TextButton(
                 onPressed: () async {
@@ -1721,6 +1744,14 @@ class _InlineVideoState extends State<_InlineVideo> {
   bool _ready = false;
   bool _started = false;
 
+  // B站清晰度：0 = 跟随播放器默认；其余是 B站 的 quality 码。
+  int _quality = 0;
+  bool _qBusy = false;
+  int _probeFails = 0;
+
+  /// 只对 B站 显示清晰度按钮：抖音官方播放页由平台自己决定码率，没有可调的档位。
+  bool get _canPickQuality => _target?.kind == 'bili';
+
   String get _url => cultureNormalizeUrl('${widget.item['url'] ?? ''}');
 
   List<String> get _sources {
@@ -1781,7 +1812,24 @@ class _InlineVideoState extends State<_InlineVideo> {
           if (!mounted) return;
           setState(() => _ready = true);
           await _fitCss();
+          // 播放器是异步初始化的：立刻 play 往往打在空对象上，所以 0.4s / 2.6s 各踢一次。
           await _kickPlay();
+          for (final ms in [400, 2600]) {
+            Future.delayed(Duration(milliseconds: ms), () {
+              if (mounted && !_failed) _kickPlay();
+            });
+          }
+          if (_quality != 0) {
+            Future.delayed(const Duration(milliseconds: 1400), () {
+              if (mounted && !_failed) _applyQuality(_quality, silent: true);
+            });
+          }
+          // 3.5s / 7.5s 各探一次：黑屏不报错，只能看 videoWidth 才认得出来。
+          for (final ms in [3500, 7500]) {
+            Future.delayed(Duration(milliseconds: ms), () {
+              if (mounted && !_failed) _probe();
+            });
+          }
         },
         onWebResourceError: (e) {
           if (e.isForMainFrame == true) _nextSource();
@@ -1820,6 +1868,7 @@ class _InlineVideoState extends State<_InlineVideo> {
       return;
     }
     _tryIdx++;
+    _probeFails = 0;
     final c = _ctrl;
     if (c == null) return;
     final desktop = _target?.kind == 'bili' && _tryIdx == 2;
@@ -1843,11 +1892,32 @@ class _InlineVideoState extends State<_InlineVideo> {
   if(!s){s=document.createElement('style');s.id='dt-fit';
     (document.head||document.documentElement).appendChild(s);}
   s.textContent='html,body{margin:0!important;padding:0!important;overflow:hidden!important;background:#000!important;}'
-   +'video{width:100%!important;height:100%!important;object-fit:contain!important;background:#000!important;}';
+   +'video,bwp-video,.bpx-player-video-wrap,.mplayer-video-wrap{width:100%!important;height:100%!important;object-fit:contain!important;background:#000!important;}';
 })();
 """);
     } catch (_) {}
   }
+
+  /// 找 video / bwp-video 必须穿透 shadow DOM。
+  ///
+  /// B站 新版播放器是 <bwp-video> 自定义元素，真正的 <video> 在它的 shadowRoot 里，
+  /// document.querySelector('video') 直接返回 null —— 上一版“滑到即播没反应”就是这里。
+  static const String _kDeepQuery = r"""
+  function dtDeep(sel){
+    function walk(root){
+      try{ var el=root.querySelector(sel); if(el) return el; }catch(e){}
+      var all;
+      try{ all=root.querySelectorAll('*'); }catch(e){ return null; }
+      for(var i=0;i<all.length;i++){
+        var sr=null;
+        try{ sr=all[i].shadowRoot; }catch(e){}
+        if(sr){ var r=walk(sr); if(r) return r; }
+      }
+      return null;
+    }
+    return walk(document);
+  }
+""";
 
   Future<void> _kickPlay() async {
     final c = _ctrl;
@@ -1855,24 +1925,200 @@ class _InlineVideoState extends State<_InlineVideo> {
     try {
       await c.runJavaScript("""
 (function(){
-  var v=document.querySelector('video');
-  if(!v) return 'no';
-  try{v.muted=false;}catch(e){}
-  var p=v.play();
-  if(p&&p.catch){p.catch(function(){try{v.muted=true;v.play();}catch(e){}});}
-  return 'ok';
+$_kDeepQuery
+  var v=dtDeep('video');
+  if(!v){
+    var bw=dtDeep('bwp-video');
+    if(bw && typeof bw.play==='function'){ try{ bw.play(); return; }catch(e){} }
+    return;
+  }
+  try{ v.muted=false; }catch(e){}
+  try{
+    var p=v.play();
+    if(p&&p.catch){ p.catch(function(){ try{ v.muted=true; v.play(); }catch(e){} }); }
+  }catch(e){}
 })();
 """);
     } catch (_) {}
+  }
+
+  /// 探一眼到底有没有画面。黑屏时不会有 onWebResourceError，
+  /// 只能靠 videoWidth 判断，然后换下一个源。
+  Future<void> _probe() async {
+    final c = _ctrl;
+    if (c == null || _failed) return;
+    String s = '';
+    try {
+      final r = await c.runJavaScriptReturningResult("""
+(function(){
+$_kDeepQuery
+  var v=dtDeep('video');
+  if(!v) return 'none';
+  var w=0, rs=0;
+  try{ w=v.videoWidth||0; rs=v.readyState||0; }catch(e){}
+  return rs+'|'+w;
+})()
+""");
+      s = '$r'.replaceAll('"', '').trim();
+    } catch (_) {
+      return;
+    }
+    if (!mounted || _failed) return;
+    final parts = s.split('|');
+    final rs = int.tryParse(parts.isNotEmpty ? parts[0] : '0') ?? 0;
+    final w = int.tryParse(parts.length > 1 ? parts[1] : '0') ?? 0;
+    // readyState>=2 且有宽度 = 真的出画了
+    if (rs >= 2 && w > 0) return;
+    _probeFails++;
+    if (_probeFails >= 2) {
+      _probeFails = 0;
+      _nextSource();
+    }
   }
 
   Future<void> _pause() async {
     final c = _ctrl;
     if (c == null) return;
     try {
-      await c.runJavaScript(
-          "document.querySelectorAll('video').forEach(function(v){try{v.pause();}catch(e){}})");
+      await c.runJavaScript("""
+(function(){
+  function walk(root){
+    var vs=[];
+    try{ vs=root.querySelectorAll('video'); }catch(e){}
+    for(var i=0;i<vs.length;i++){ try{ vs[i].pause(); }catch(e){} }
+    var all=[];
+    try{ all=root.querySelectorAll('*'); }catch(e){}
+    for(var i=0;i<all.length;i++){
+      var sr=null; try{ sr=all[i].shadowRoot; }catch(e){}
+      if(sr) walk(sr);
+    }
+  }
+  walk(document);
+})();
+""");
     } catch (_) {}
+  }
+
+  // ---------------- 清晰度 ----------------
+
+  static String qualityLabel(int q) {
+    switch (q) {
+      case 120:
+        return '4K';
+      case 116:
+        return '1080P60';
+      case 112:
+        return '1080P 高码率';
+      case 80:
+        return '1080P';
+      case 74:
+        return '720P60';
+      case 64:
+        return '720P';
+      case 32:
+        return '480P';
+      case 16:
+        return '360P';
+      default:
+        return '自动';
+    }
+  }
+
+  Future<void> _pickQuality() async {
+    final opts = <int>[0, 120, 116, 80, 64, 32, 16];
+    final picked = await showModalBottomSheet<int>(
+      context: context,
+      backgroundColor: const Color(0xFF141A26),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (bctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 14, 16, 6),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text('清晰度',
+                  style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white70)),
+            ),
+          ),
+          ...opts.map((q) => ListTile(
+                dense: true,
+                visualDensity: VisualDensity.compact,
+                title: Text(qualityLabel(q),
+                    style: TextStyle(
+                        fontSize: 13.5,
+                        color: _quality == q ? kFeedInk : Colors.white70)),
+                trailing: _quality == q
+                    ? const Icon(Icons.check, size: 17, color: Colors.white70)
+                    : null,
+                onTap: () => Navigator.of(bctx).pop(q),
+              )),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 2, 16, 14),
+            child: Text(
+              '档位由 B站 自己给：未登录通常只有 480P / 360P，登录后才到 1080P。切换后会自动接着播。',
+              style: TextStyle(fontSize: 10.5, height: 1.6, color: Colors.white38),
+            ),
+          ),
+        ]),
+      ),
+    );
+    if (picked != null) await _applyQuality(picked);
+  }
+
+  /// 通过 B站 播放器实例切码率。返回 false 说明这个视频没有该档位。
+  Future<bool> _applyQuality(int q, {bool silent = false}) async {
+    final c = _ctrl;
+    if (c == null) return false;
+    setState(() => _qBusy = true);
+    var ok = false;
+    try {
+      final r = await c.runJavaScriptReturningResult("""
+(function(q){
+  function apply(p){
+    if(!p) return false;
+    try{ if(typeof p.setQuality==='function'){p.setQuality(q); return true;} }catch(e){}
+    try{ if('quality' in p){p.quality=q; return true;} }catch(e){}
+    return false;
+  }
+  var ok=false;
+  try{ ok=apply(window.player); }catch(e){}
+  if(!ok){
+    try{
+      var els=document.querySelectorAll('bwp-video');
+      for(var i=0;i<els.length;i++){
+        if(apply(els[i].player)||apply(els[i])){ok=true;break;}
+      }
+    }catch(e){}
+  }
+  return ok?'ok':'no';
+})($q)
+""");
+      ok = '$r'.contains('ok');
+    } catch (_) {}
+    if (!mounted) return false;
+    setState(() {
+      _qBusy = false;
+      if (ok) _quality = q;
+    });
+    if (!silent) {
+      _snack(ok ? '已切到 ${qualityLabel(q)}' : '这个视频没有 ${qualityLabel(q)} 这一档');
+      if (ok) await _kickPlay();
+    }
+    return ok;
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(msg, style: const TextStyle(fontSize: 12)),
+      behavior: SnackBarBehavior.floating,
+      duration: const Duration(milliseconds: 1400),
+    ));
   }
 
   @override
@@ -1888,6 +2134,38 @@ class _InlineVideoState extends State<_InlineVideo> {
               child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white38)),
         ),
       if (_failed) _failedCard(),
+      // 清晰度：只对 B站 显示。抖音官方播放页没有可调档位。
+      if (_canPickQuality && !_failed)
+        Positioned(
+          left: 8,
+          bottom: widget.full ? 12 : 190,
+          child: Material(
+            color: Colors.black.withOpacity(0.42),
+            borderRadius: BorderRadius.circular(14),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(14),
+              onTap: _qBusy ? null : _pickQuality,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  _qBusy
+                      ? const SizedBox(
+                          width: 12,
+                          height: 12,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 1.6, color: Colors.white70))
+                      : const Icon(Icons.hd_outlined, size: 14, color: Colors.white),
+                  const SizedBox(width: 5),
+                  Text(qualityLabel(_quality),
+                      style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white)),
+                ]),
+              ),
+            ),
+          ),
+        ),
       // 全屏：自己实现，B站播放器里的全屏按钮在 WebView 里是无效的
       Positioned(
         right: 6,

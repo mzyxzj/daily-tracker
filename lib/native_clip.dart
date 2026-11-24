@@ -30,23 +30,31 @@ class ClipStatus {
   final bool enabled;
   final bool connected;
   final bool overlayPermission;
+  final bool notifyPermission;
 
-  /// 距离上次事件 / 读到剪贴板 / 弹出提示卡过了多少秒；-1 表示从未。
+  /// 距离上次事件 / 读到剪贴板 / 弹出提示卡 / 识别到「复制」动作过了多少秒；-1 表示从未。
   final int lastEventAgo;
   final int lastClipAgo;
   final int lastOverlayAgo;
+  final int lastCopySignalAgo;
   final String lastPkg;
   final String error;
+
+  /// 上次提示走通了哪条通道：activity / notification / overlay / none
+  final String promptVia;
 
   const ClipStatus({
     this.enabled = false,
     this.connected = false,
     this.overlayPermission = false,
+    this.notifyPermission = false,
     this.lastEventAgo = -1,
     this.lastClipAgo = -1,
     this.lastOverlayAgo = -1,
+    this.lastCopySignalAgo = -1,
     this.lastPkg = '',
     this.error = '',
+    this.promptVia = '',
   });
 
   /// 真正能用：开关开着，服务也在跑。
@@ -62,8 +70,25 @@ class ClipStatus {
   String get detail {
     if (!enabled) return '点一下，开一次无障碍权限就行';
     if (!connected) return '去系统设置把它关掉再打开一次';
+    if (!notifyPermission) return '先允许通知：弹不出卡时会改发通知，否则你会什么都看不到';
     if (!overlayPermission) return '能用；给个「显示在其他应用上层」会更稳';
     return '复制抖音/B站分享文案，屏幕上方会直接问你要不要整理';
+  }
+
+  /// 上次提示实际走通的通道，给自检面板用。
+  String get viaLabel {
+    switch (promptVia) {
+      case 'activity':
+        return '提示卡';
+      case 'notification':
+        return '通知（提示卡被系统拦了）';
+      case 'overlay':
+        return '悬浮条';
+      case 'none':
+        return '全部被拦';
+      default:
+        return '还没弹过';
+    }
   }
 
   static ClipStatus from(Object? v) {
@@ -80,11 +105,14 @@ class ClipStatus {
       enabled: b('enabled'),
       connected: b('connected'),
       overlayPermission: b('overlayPermission'),
+      notifyPermission: b('notifyPermission'),
       lastEventAgo: i('lastEventAgo'),
       lastClipAgo: i('lastClipAgo'),
       lastOverlayAgo: i('lastOverlayAgo'),
+      lastCopySignalAgo: i('lastCopySignalAgo'),
       lastPkg: '${v['lastPkg'] ?? ''}',
       error: '${v['error'] ?? ''}',
+      promptVia: '${v['promptVia'] ?? ''}',
     );
   }
 }
@@ -145,6 +173,27 @@ class NativeClip {
       return (v ?? '').trim();
     } catch (_) {
       return '';
+    }
+  }
+
+  /// 请求通知权限（Android 13+ 运行时权限）。返回 false 表示系统版本不需要，
+  /// 或已经授过权。
+  static Future<bool> requestNotify() async {
+    try {
+      final v = await _m.invokeMethod<bool>('requestNotify');
+      return v ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 通知权限当前是否可用。
+  static Future<bool> notifyReady() async {
+    try {
+      final v = await _m.invokeMethod<bool>('notifyReady');
+      return v ?? false;
+    } catch (_) {
+      return false;
     }
   }
 

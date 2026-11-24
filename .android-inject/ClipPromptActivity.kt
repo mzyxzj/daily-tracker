@@ -55,6 +55,16 @@ class ClipPromptActivity : Activity() {
         handler.postDelayed(dismiss, 12000)
     }
 
+    override fun onResume() {
+        super.onResume()
+        // 回执：服务在 700ms 后检查这个值。没变就说明 Activity 被系统拦了、根本没显示，
+        // 这时服务会改发通知 —— ColorOS 上「后台弹出界面」关着就是这种情况。
+        try {
+            shownToken = intent?.getLongExtra(EXTRA_TOKEN, -1L) ?: -1L
+        } catch (e: Exception) {
+        }
+    }
+
     override fun onDestroy() {
         handler.removeCallbacks(dismiss)
         super.onDestroy()
@@ -166,5 +176,10 @@ class ClipPromptActivity : Activity() {
 
     companion object {
         const val EXTRA_PLATFORM = "dt_platform"
+        const val EXTRA_TOKEN = "dt_token"
+
+        /// 最后一次成功 onResume 的弹窗 token。服务用它判断「Activity 到底显示了没有」。
+        @Volatile
+        var shownToken: Long = -1L
     }
 }

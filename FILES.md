@@ -1,56 +1,52 @@
-# Empire-V4.2 覆盖清单（4.2.0）
+# Empire-V4.3 覆盖清单（4.3.0）
 
 整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml` + `.android-inject/`。
 
-> 这一版修三件「点了没用 / 根本没有」的事，另外补了应用内升级：
+> 这一版的核心是**把「复制链接没反应」真正查清楚了**——不是 ColorOS 的问题，是逻辑本身走不到弹窗。
 >
-> 1. **复制即弹：悬浮窗改用透明 Activity**。一加 13T 上自检显示「弹过悬浮条 25 秒前」，
->    但屏幕什么都没有——ColorOS/氧OS 上 `addView` 成功、窗口不可见。
->    现在改 `ClipPromptActivity`（真实窗口，12 秒自动消失，复制时先振动），
->    起不来会把原因写进自检的「底层报错」。
+> 1. **复制即弹：三条不依赖剪贴板读取的信号**。V4.2 依赖 `addPrimaryClipChangedListener`，
+>    但 Android 10+ 这条回调只在应用有焦点时派发，无障碍服务在后台**永远收不到**；
+>    事件路径读剪贴板又被系统拒绝（返回空），空内容 + `reason="event"` 直接 return。
+>    所以「点了复制，代码一行都没执行到弹窗」。现在改成：
+>    点到「复制链接」控件 / 系统 Toast「已复制」/ 窗口内容变化（兜底）。
+> 2. **弹窗三通道兜底**。ColorOS 关掉「后台弹出界面」时 `startActivity` 不报错也不显示，
+>    靠 try/catch 永远发现不了。现在 Activity 起 700ms 后查 `onResume` 回执，
+>    没回执就改发通知，通知没权限再退无障碍悬浮窗。**新增 `POST_NOTIFICATIONS` 运行时权限**。
+> 3. **清晰度调节**。B站 播放器左下角：自动 / 4K / 1080P60 / 1080P / 720P / 480P / 360P，
+>    直接调 `player.setQuality()`。档位由 B站 给，未登录通常只有 480P/360P。
+> 4. **播放穿透 shadow DOM**。B站 新版是 `<bwp-video>`，真 `<video>` 在 shadowRoot 里，
+>    `document.querySelector('video')` 返回 null —— 上一版「滑到即播」实际什么都没做。
+> 5. **黑屏探测**。3.5s / 7.5s 各看一次 `videoWidth`，连续两次为 0 自动换源
+>    （黑屏不触发 `onWebResourceError`，只能这么认）。
 >
-> 2. **滑到就播**。视频条目在流里直接挂 WebView，划到即自动播放、划走暂停回收；
->    关键是不让 WebView 要求用户手势，否则自动播放被静默拦掉。
->
-> 3. **全屏真的能全屏**。B站自带的全屏按钮在 WebView 里无效（缺少 onShowCustomView 宿主实现），
->    换成播放器右下角的 Flutter 全屏：横屏 + 沉浸 + 收起浮层，返回键先退全屏。
->
-> 4. **应用内升级**。侧栏「检查更新」→ 读 Release → 就地下载 → 系统安装器覆盖安装，
->    不用再卸载重装导数据。
->
-> 数据库不动（仍是 15）；新增依赖 `webview_flutter_android`（为了关掉手势限制）。
-> 80 个测试全绿。
->
-> 覆盖文件：`lib/app_update.dart`（新）、`lib/culture_feed.dart`、`lib/native_clip.dart`、
-> `pubspec.yaml`、`README.md`、`FILES.md`、`.android-inject/`（6 个文件，
-> 新增 `ClipPromptActivity.kt` / `ApkProvider.kt`）。
+> 数据库不动（仍是 15）；依赖不变。`flutter analyze` 无 error（仅 2 条既有 info）。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
-| `pubspec.yaml` | 558 | `5fc1d51289906cc6d9134445dbff80e1` |
-| `README.md` | 28,064 | `c69995ec854ac711f4087f49767c9d9c` |
+| `pubspec.yaml` | 558 | `6b94bc9bde6e5638de43af4c5f4ba7c2` |
+| `README.md` | 31,122 | `c445dce47187cb8653a782c2b732e270` |
 | `.github/workflows/build.yml` | 9,510 | `8bf57bcb3475baac480584878f35875b` |
-| `lib/main.dart` | 138,272 | `9aca3c8de3857fb7e2d5b61ca74740d0` |
-| `lib/culture_page.dart` | 51,430 | `fe3166f67eb69afd8ea792a02828ae82` |
-| `lib/culture_feed.dart` | 109,665 | `a25018f75f890d5b4ac1013bbd5d783a` |
-| `lib/content_fetch.dart` | 23,847 | `d4d49bbb91d7c81f4fcd25dfa38d32e0` |
-| `lib/content_feed.dart` | 14,941 | `c477ce3b9f98a85a1099be539f3337a1` |
-| `lib/content_intake.dart` | 23,270 | `e1546f54fcd91d758601a4b4701710b2` |
-| `lib/native_clip.dart` | 5,921 | `df17a3904bf6195a7bc50340b026bf28` |
-| `lib/player_target.dart` | 6,481 | `bbfbb1328e00507d5e1d6aec0bcead12` |
 | `lib/app_update.dart` | 14,455 | `a931e3cabb03f54bf7d81073af50427b` |
+| `lib/content_feed.dart` | 14,941 | `c477ce3b9f98a85a1099be539f3337a1` |
+| `lib/content_fetch.dart` | 23,847 | `d4d49bbb91d7c81f4fcd25dfa38d32e0` |
+| `lib/content_intake.dart` | 23,270 | `e1546f54fcd91d758601a4b4701710b2` |
+| `lib/culture_feed.dart` | 119,509 | `71baf4cedaa7167bb6f4e24872d499fd` |
+| `lib/culture_page.dart` | 51,430 | `fe3166f67eb69afd8ea792a02828ae82` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
 | `lib/deepseek_sheet.dart` | 72,621 | `ccd3d91379d101cfbbc0ada026a813e3` |
-| `lib/empire_page.dart` | 71,718 | `9bab00fac714fa2db5694fe15d00041d` |
-| `lib/empire_data.dart` | 19,564 | `aaca4183f71cc53fce9777e9181e76c2` |
 | `lib/empire_assets.dart` | 897,977 | `61e06d9173a85e0dc101524597d8acc6` |
-| `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
+| `lib/empire_data.dart` | 19,564 | `aaca4183f71cc53fce9777e9181e76c2` |
+| `lib/empire_page.dart` | 71,718 | `9bab00fac714fa2db5694fe15d00041d` |
+| `lib/main.dart` | 138,272 | `9aca3c8de3857fb7e2d5b61ca74740d0` |
 | `lib/medical_page.dart` | 66,637 | `cac60111718de4e5939b357a29719d6c` |
-| `.android-inject/MainActivity.kt` | 9,945 | `8c64574d15106326d703fa389f51a881` |
-| `.android-inject/ClipWatchService.kt` | 15,968 | `7384ba7330204a0a613c07c814ab76f8` |
-| `.android-inject/ClipPromptActivity.kt` | 6,307 | `c6095c4dce6736b8be9ca84300dedfc2` |
+| `lib/native_clip.dart` | 7,430 | `0b36583f1fd34fff83a2e5020db0f2fa` |
+| `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
+| `lib/player_target.dart` | 6,481 | `bbfbb1328e00507d5e1d6aec0bcead12` |
+| `.android-inject/MainActivity.kt` | 10,982 | `f5fdf1329b6c2845f2049877753c2c3a` |
+| `.android-inject/ClipWatchService.kt` | 26,355 | `05acd6eadc975aeb0993a6ed0d078620` |
+| `.android-inject/ClipPromptActivity.kt` | 6,938 | `31b73bedfcbab2026b37f297188b992e` |
 | `.android-inject/ApkProvider.kt` | 1,937 | `7c62fa727307282c4ac3b31494cd6b2b` |
-| `.android-inject/patch.py` | 10,757 | `e9e6fcd46518f66385d2d76c87206083` |
+| `.android-inject/patch.py` | 11,142 | `e3187f554e526518c3a1befa50771057` |
 | `.android-inject/dt-release.jks` | 2,704 | `4ad915351096720f929147c9554d725a` |
 
 ## 领地渲染图（L01→L09）
@@ -88,5 +84,7 @@ python tools/gen_realm.py <图片目录> --size 768 --quality 80
 grep -c '^  assets:' pubspec.yaml                  # 期望 0
 grep -c '_kRealmL09Webp' lib/empire_assets.dart    # 期望 2（常量定义 + map 引用）
 grep -c 'buildReal' lib/empire_data.dart           # 期望 ≥ 1
+grep -c 'POST_NOTIFICATIONS' .android-inject/patch.py   # 期望 1
+grep -c 'dtDeep' lib/culture_feed.dart             # 期望 ≥ 3
 md5sum lib/empire_assets.dart                      # 应等于上表
 ```

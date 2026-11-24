@@ -2,6 +2,10 @@ package __PKG__
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
@@ -9,42 +13,49 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
-import android.os.VibrationEffect
-import android.os.Vibrator
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.provider.Settings
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.LinearLayout
 import android.widget.TextView
 
 /**
- * 复制链接就能问「要不要整理」的系统级实现。
+ * 复制链接就问「要不要整理」。
  *
- * 为什么必须用无障碍服务：Android 10 起普通 App 退到后台就读不到剪贴板，
- * 只有默认输入法和无障碍服务还有这个能力。
+ * 为什么必须用无障碍服务：Android 10 起普通 App 退到后台就读不到剪贴板。
  *
- * 这一版针对两个真实翻车点做了加固：
+ * === 这一版修的是什么 ===
  *
- * 1. 只监听「窗口切换」会漏掉复制动作。B站/抖音的「复制成功」是一个自绘气泡，
- *    多数 ROM 只回 TYPE_WINDOW_CONTENT_CHANGED，甚至只有剪贴板回调。
- *    现在几类事件都监听，并且在 60/260/700ms 各读一次（不同 ROM 写入时机不同）。
+ * V4.2 之前依赖 `addPrimaryClipChangedListener`：只有剪贴板真的变了才读、才弹。
+ * 但 Android 10+ 的这条回调**只在应用有焦点时派发**，无障碍服务在后台收不到。
+ * 于是 `clipApiOk` 永远是 false，事件路径读剪贴板又被系统拒绝（返回空），
+ * 空内容 + reason="event" 直接 return —— 结果就是「点了复制，什么都不发生」。
+ * 一加 13T / ColorOS 上就是这个现象。
  *
- * 2. 小米/OPPO/vivo 会拦「后台读剪贴板」，读到的是空。
- *    以前这里直接 return，用户看到的现象就是「复制了，但什么都不弹」。
- *    现在读不到内容也照弹，只是不带预览——点「整理」App 到前台再读，
- *    前台一定读得到。为了不乱弹，只在内容类 App（抖音/B站/小红书/微信/浏览器…）
- *    里、且刚发生过点击时才走这条路。
+ * 现在改成三条互补信号，都不依赖读取剪贴板权限：
+ *   1. 点到了文字是「复制链接 / 复制 / Copy」的控件（最关键，B站分享面板就是这个）；
+ *   2. 系统 Toast 出现「已复制 / 复制成功」；
+ *   3. 窗口内容变化（兜底，延迟 300ms 再试）。
+ * 读到内容就带预览弹；读不到（被 ROM 拦）也照弹，点「整理」后 App 到前台再读。
+ *
+ * === 弹窗三条通道，谁通谁上 ===
+ *
+ * ColorOS 会静默拦「后台弹出界面」，startActivity 不抛异常也被丢弃。所以：
+ *   Activity 起 700ms 后检查 onResume 回执（ClipPromptActivity.shownToken），
+ *   没回执就改发通知（通知不需要后台弹窗权限），通知也没权限再退无障碍悬浮窗。
+ * 三条都失败才记报错，自检面板能直接看到是哪一条被拦。
  */
 class ClipWatchService : AccessibilityService() {
 
     private var promptShowing: Boolean = false
-    private var wm: WindowManager? = null
-    private var listener: ClipboardManager.OnPrimaryClipChangedListener? = null
     private val handler = Handler(Looper.getMainLooper())
 
     private var lastText: String = ""
@@ -52,19 +63,17 @@ class ClipWatchService : AccessibilityService() {
     private var lastCheckAt: Long = 0L
     private var lastBlindAt: Long = 0L
     private var blindPkg: String = ""
-    // 剪贴板回调能不能用。能用就不再靠无障碍事件兜底读——
-    // Android 12+ 每读一次剪贴板系统都会提示「已粘贴」，多读一次就多烦一次。
-    private var clipApiOk: Boolean = false
-    // 最近一次停留在内容类 App 的时间。用「最近 8 秒」而不是「当前包名」，
-    // 是因为系统分享面板可能把包名切成 systemui，但人显然还在同一条内容上。
     private var recentContentAt: Long = 0L
+    private var promptToken: Long = 0L
+
+    // 悬浮窗兜底时挂着的 View，别泄漏
+    private var overlayView: View? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         connected = true
         err = ""
         attach(this)
-        wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         // 动态设一遍，比只靠 res/xml 可靠：部分 ROM 会忽略 XML 里的 eventTypes。
         try {
             val info = serviceInfo ?: AccessibilityServiceInfo()
@@ -73,20 +82,19 @@ class ClipWatchService : AccessibilityService() {
             info.flags = info.flags or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
                 AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
-            info.notificationTimeout = 80
+            info.notificationTimeout = 60
             serviceInfo = info
         } catch (e: Exception) {
             err = "setServiceInfo: " + e.message
         }
+        // 剪贴板回调只当加分项：能收到就直接读，收不到也不影响主路径。
         try {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             val l = ClipboardManager.OnPrimaryClipChangedListener {
-                // 剪贴板变了就是最直接的信号，立刻读（只读这一次）。
-                clipApiOk = true
                 checkClip(true, "clip")
             }
-            listener = l
             cm.addPrimaryClipChangedListener(l)
+            clipListener = l
         } catch (e: Exception) {
             err = "clipListener: " + e.message
         }
@@ -95,24 +103,46 @@ class ClipWatchService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val e = event ?: return
         val pkg = e.packageName?.toString() ?: ""
+        val now = System.currentTimeMillis()
         if (pkg.isNotEmpty() && pkg != packageName) {
             lastPkg = pkg
-            lastEventAt = System.currentTimeMillis()
-            if (isContentApp(pkg)) recentContentAt = lastEventAt
+            lastEventAt = now
+            if (isContentApp(pkg)) recentContentAt = now
         }
-        // 剪贴板回调已经生效，就不再读剪贴板：事件只是噪音，
-        // 而每多读一次，Android 12+ 就多弹一次「已粘贴」。
-        if (clipApiOk) return
-        // 只在内容类 App 里兜底，银行/输入法那种地方连剪贴板都不碰。
+        // 只在自己和内容类 App 里干活；银行/输入法那种地方连剪贴板都不碰。
         if (!isContentApp(pkg)) return
+
         val t = e.eventType
-        val clickish = t == AccessibilityEvent.TYPE_VIEW_CLICKED ||
-            t == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
-        val windowish = t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-            t == AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED
-        if (!clickish && !windowish) return
-        // 复制之后 ROM 才写剪贴板，300ms 补读一次就够。
-        handler.postDelayed({ checkClip(false, "event") }, 320)
+
+        // 信号 1：点的就是这个控件 —— 「复制链接」「复制」「Copy」。
+        // B站分享面板、抖音分享面板都是标准按钮，这条在真机上最灵。
+        if (t == AccessibilityEvent.TYPE_VIEW_CLICKED) {
+            val label = nodeLabel(e.source)
+            if (looksLikeCopyAction(label)) {
+                lastCopySignalAt = now
+                checkClip(true, "click")
+                return
+            }
+        }
+
+        // 信号 2：系统 Toast「已复制」「链接已复制」。
+        if (t == AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) {
+            val txt = ArrayList<CharSequence>()
+            e.text?.let { txt.addAll(it) }
+            if (looksLikeCopiedToast(txt.joinToString(" "))) {
+                lastCopySignalAt = now
+                // Toast 出现时剪贴板可能刚写，读不到也无所谓，直接盲弹。
+                checkClip(true, "toast")
+                return
+            }
+        }
+
+        // 信号 3：内容变化 —— 复制成功的自绘气泡多数 ROM 只回这个。
+        if (t == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+            t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        ) {
+            handler.postDelayed({ checkClip(false, "event") }, 300)
+        }
     }
 
     override fun onInterrupt() {}
@@ -128,10 +158,40 @@ class ClipWatchService : AccessibilityService() {
         detach(this)
         try {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            listener?.let { cm.removePrimaryClipChangedListener(it) }
+            clipListener?.let { cm.removePrimaryClipChangedListener(it) }
         } catch (e: Exception) {
         }
+        removeOverlay()
         promptShowing = false
+    }
+
+    private fun nodeLabel(node: AccessibilityNodeInfo?): String {
+        if (node == null) return ""
+        val sb = StringBuilder()
+        try {
+            node.text?.let { sb.append(it).append(' ') }
+            node.contentDescription?.let { sb.append(it).append(' ') }
+        } catch (e: Exception) {
+        }
+        return sb.toString().trim()
+    }
+
+    /// 只认短的按钮文字：「复制链接」「复制」「Copy」，避免把正文里出现"复制"的长文本误判。
+    private fun looksLikeCopyAction(label: String): Boolean {
+        if (label.isEmpty() || label.length > 16) return false
+        val s = label.lowercase()
+        return s == "复制" || s == "copy" || s.contains("复制链接") ||
+            s.contains("复制地址") || s.contains("复制分享") ||
+            (s.startsWith("复制") && s.length <= 8) ||
+            (s.contains("copy") && s.length <= 12)
+    }
+
+    private fun looksLikeCopiedToast(t: String): Boolean {
+        if (t.isEmpty() || t.length > 40) return false
+        val s = t.lowercase()
+        return s.contains("已复制") || s.contains("复制成功") ||
+            s.contains("链接已复制") || s.contains("copied") ||
+            s.contains("已拷贝")
     }
 
     private fun readClipText(): String {
@@ -140,8 +200,7 @@ class ClipWatchService : AccessibilityService() {
             if (!cm.hasPrimaryClip()) return ""
             val clip = cm.primaryClip ?: return ""
             if (clip.itemCount == 0) return ""
-            val t = clip.getItemAt(0).coerceToText(this)?.toString()?.trim() ?: ""
-            t
+            clip.getItemAt(0).coerceToText(this)?.toString()?.trim() ?: ""
         } catch (e: Exception) {
             ""
         }
@@ -150,18 +209,14 @@ class ClipWatchService : AccessibilityService() {
     private fun checkClip(force: Boolean, reason: String) {
         if (promptShowing) return
         val now = System.currentTimeMillis()
-        if (!force && now - lastCheckAt < 150) return
+        if (!force && now - lastCheckAt < 220) return
         lastCheckAt = now
         val text = readClipText()
 
         if (text.isNotEmpty()) {
             lastClipAt = now
             if (text.length > 1200) return
-            val share = looksLikeShare(text)
-            if (!share) {
-                // 不认识平台时，只认「浏览器里复制的一条 http 链接」
-                if (!(text.contains("http") && isBrowser(lastPkg))) return
-            }
+            if (!looksLikeShare(text)) return
             if (text == lastText && now - lastAt < 20000) return
             lastText = text
             lastAt = now
@@ -169,15 +224,14 @@ class ClipWatchService : AccessibilityService() {
             return
         }
 
-        // ---- 读不到内容：大概率被 ROM 的剪贴板保护拦了 ----
-        // 只在「刚点了复制」这种时机、且前台是内容类 App 时盲弹，避免乱弹。
-        if (reason != "click" && reason != "clip") return
-        // 8 秒内还在内容类 App（或刚从里面点出来）才盲弹，别在别处乱弹。
-        if (now - recentContentAt > 8000) return
-        if (blindPkg == lastPkg && now - lastBlindAt < 60000) return
+        // ---- 读不到内容：ROM 的剪贴板保护拦了 ----
+        // 只有「明确点了复制」或「看到复制成功提示」才盲弹；
+        // 窗口内容变化这种弱信号不盲弹，否则在 B站 里划两下就弹一次。
+        if (reason == "event") return
+        if (now - recentContentAt > 15000) return
+        if (now - lastBlindAt < 12000) return
         blindPkg = lastPkg
         lastBlindAt = now
-        err = "clipboard may be blocked by system"
         showPrompt("")
     }
 
@@ -237,16 +291,17 @@ class ClipWatchService : AccessibilityService() {
         }
     }
 
-    /// 弹提示卡。
-    ///
-    /// 不用悬浮窗：一加/ColorOS 上 addView 会「成功」但窗口不可见，
-    /// 日志一切正常、用户什么也看不到。这里改成启动一个透明 Activity，
-    /// 那是真窗口，只要有「显示在其他应用上层」权限就能盖住 B站/抖音。
+    /// 弹提示卡：先走透明 Activity（体验最好），700ms 内拿不到「已显示」回执就换通道。
     private fun showPrompt(text: String) {
         if (promptShowing) return
         promptShowing = true
         lastOverlayAt = System.currentTimeMillis()
+        promptVia = "activity"
         buzz()
+
+        val token = System.currentTimeMillis()
+        promptToken = token
+        var launched = false
         try {
             val i = Intent(this, ClipPromptActivity::class.java)
             i.addFlags(
@@ -261,14 +316,210 @@ class ClipWatchService : AccessibilityService() {
             } else {
                 i.putExtra(MainActivity.EXTRA_READ_CLIP, true)
             }
+            i.putExtra(ClipPromptActivity.EXTRA_TOKEN, token)
             startActivity(i)
+            launched = true
             err = ""
         } catch (e: Exception) {
-            // 后台启动 Activity 被拦（ColorOS「后台弹出界面」关着）时，
-            // 至少把原因写进自检面板，别静默。
             err = "startPrompt: " + (e.message ?: e.javaClass.simpleName)
         }
-        handler.postDelayed({ promptShowing = false }, 13000)
+
+        // 回执检查：Activity 真的 onResume 了才算弹成功。
+        // ColorOS 的「后台弹出界面」关着时 startActivity 不报错但页面根本不出现，
+        // 只有这个回执能识别出来。
+        handler.postDelayed({
+            if (ClipPromptActivity.shownToken != token) {
+                if (launched) err = "后台弹出界面被系统拦（activity 未显示）"
+                fallbackPrompt(text, token)
+            }
+        }, 700)
+
+        handler.postDelayed({ promptShowing = false }, 8000)
+    }
+
+    /// Activity 起不来时的兜底：通知 → 无障碍悬浮窗。
+    private fun fallbackPrompt(text: String, token: Long) {
+        val okNotify = notifyPrompt(text)
+        if (okNotify) {
+            promptVia = "notification"
+            err = ""
+            return
+        }
+        val okOverlay = overlayPrompt(text, token)
+        promptVia = if (okOverlay) "overlay" else "none"
+        err = if (okOverlay) "" else "提示通道全被拦：开通知权限，或允许「后台弹出界面」"
+    }
+
+    /// 通道 2：通知。不需要后台弹窗权限，ColorOS 上最通的一条路。
+    private fun notifyPrompt(text: String): Boolean {
+        return try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && !nm.areNotificationsEnabled()) {
+                return false
+            }
+            val chId = "dt_clip"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (nm.getNotificationChannel(chId) == null) {
+                    val ch = NotificationChannel(
+                        chId, "复制即整理", NotificationManager.IMPORTANCE_HIGH
+                    )
+                    ch.description = "复制分享链接后的整理提醒"
+                    ch.enableVibration(true)
+                    nm.createNotificationChannel(ch)
+                }
+            }
+            val i = Intent(this, MainActivity::class.java)
+            i.action = Intent.ACTION_SEND
+            if (text.isNotEmpty()) {
+                i.putExtra(MainActivity.EXTRA_TEXT, text)
+                i.putExtra(Intent.EXTRA_TEXT, text)
+            } else {
+                i.putExtra(MainActivity.EXTRA_READ_CLIP, true)
+            }
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            var flags = PendingIntent.FLAG_UPDATE_CURRENT
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                flags = flags or PendingIntent.FLAG_IMMUTABLE
+            }
+            val pi = PendingIntent.getActivity(this, 1001, i, flags)
+            val plat = platformOf(text)
+            val title = if (plat.isEmpty()) "复制了内容 · 要整理吗？" else "$plat · 要整理进「文化」吗？"
+            val body = if (text.isEmpty()) {
+                "点开自动读取剪贴板"
+            } else {
+                text.replace("\n", " ").trim().let { if (it.length > 60) it.substring(0, 60) + "…" else it }
+            }
+            val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Notification.Builder(this, chId)
+            } else {
+                @Suppress("DEPRECATION")
+                Notification.Builder(this)
+            }
+            b.setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setContentTitle(title)
+                .setContentText(body)
+                .setStyle(Notification.BigTextStyle().bigText(body))
+                .setAutoCancel(true)
+                .setContentIntent(pi)
+                .setPriority(Notification.PRIORITY_HIGH)
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                @Suppress("DEPRECATION")
+                b.setDefaults(Notification.DEFAULT_ALL)
+            }
+            nm.notify(1001, b.build())
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /// 通道 3：无障碍悬浮窗。TYPE_ACCESSIBILITY_OVERLAY 不需要 SYSTEM_ALERT_WINDOW，
+    /// 是服务权限内最"名正言顺"的窗口；有些 ROM 上反而比 Activity 靠谱。
+    private fun overlayPrompt(text: String, token: Long): Boolean {
+        return try {
+            removeOverlay()
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val card = buildOverlayCard(text, token)
+            val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+            } else {
+                @Suppress("DEPRECATION")
+                WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+            }
+            val lp = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                type,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT
+            )
+            lp.gravity = Gravity.TOP
+            lp.y = statusBarHeight() + dp(8)
+            lp.x = 0
+            wm.addView(card, lp)
+            overlayView = card
+            handler.postDelayed({ removeOverlay() }, 9000)
+            true
+        } catch (e: Exception) {
+            err = "overlay: " + (e.message ?: e.javaClass.simpleName)
+            false
+        }
+    }
+
+    private fun removeOverlay() {
+        val v = overlayView ?: return
+        overlayView = null
+        try {
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            wm.removeView(v)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun buildOverlayCard(text: String, token: Long): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(11), dp(8), dp(11))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#F21E293B"))
+                cornerRadius = dp(18).toFloat()
+                setStroke(dp(1), Color.parseColor("#33FFFFFF"))
+            }
+        }
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val head = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            setText(if (text.isEmpty()) "复制了内容 · 要整理进「文化」吗？" else "这条要整理进「文化」吗？")
+        }
+        val sub = TextView(this).apply {
+            setTextColor(Color.parseColor("#94A3B8"))
+            textSize = 10.5f
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(0, dp(3), 0, 0)
+            setText(
+                if (text.isEmpty()) "点「整理」后自动接上剪贴板"
+                else text.replace("\n", " ").trim().let { if (it.length > 42) it.substring(0, 42) + "…" else it }
+            )
+        }
+        col.addView(head)
+        col.addView(sub)
+
+        val go = TextView(this).apply {
+            setTextColor(Color.parseColor("#0B0F17"))
+            textSize = 13f
+            setText("整理")
+            isClickable = true
+            setPadding(dp(15), dp(8), dp(15), dp(8))
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE)
+                cornerRadius = dp(14).toFloat()
+            }
+        }
+        val no = TextView(this).apply {
+            setTextColor(Color.parseColor("#94A3B8"))
+            textSize = 12.5f
+            setText("略过")
+            isClickable = true
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+        }
+        go.setOnClickListener {
+            removeOverlay()
+            openApp(text, text.isEmpty())
+        }
+        no.setOnClickListener { removeOverlay() }
+
+        card.addView(col)
+        card.addView(go)
+        card.addView(no)
+        return card
     }
 
     /// 抖一下：即使视觉被系统吞了，手上也有反馈。
@@ -301,14 +552,6 @@ class ClipWatchService : AccessibilityService() {
         }
     }
 
-    private fun canOverlay(): Boolean {
-        return try {
-            Settings.canDrawOverlays(this)
-        } catch (e: Exception) {
-            false
-        }
-    }
-
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     private fun statusBarHeight(): Int {
@@ -322,8 +565,13 @@ class ClipWatchService : AccessibilityService() {
         @Volatile var lastEventAt: Long = 0L
         @Volatile var lastClipAt: Long = 0L
         @Volatile var lastOverlayAt: Long = 0L
+        @Volatile var lastCopySignalAt: Long = 0L
         @Volatile var lastPkg: String = ""
         @Volatile var err: String = ""
+        // 上次提示到底走通了哪条通道：activity / notification / overlay / none
+        @Volatile var promptVia: String = ""
+
+        private var clipListener: ClipboardManager.OnPrimaryClipChangedListener? = null
 
         // 当前活着的服务实例，App 里点「试一下」时用它弹一条测试。
         @Volatile private var instance: ClipWatchService? = null
@@ -336,7 +584,7 @@ class ClipWatchService : AccessibilityService() {
             if (instance === s) instance = null
         }
 
-        /// App 里点「试一下」：立刻弹一条示例，验证悬浮条能不能显示。
+        /// App 里点「试一下」：立刻弹一条示例，验证提示卡能不能显示。
         fun test(): Boolean {
             val s = instance ?: return false
             s.handler.post { s.showPrompt("B站 · 这是一条测试，点「整理」看看能不能进来") }
@@ -366,6 +614,15 @@ class ClipWatchService : AccessibilityService() {
             }
         }
 
+        fun canNotify(ctx: Context): Boolean {
+            return try {
+                val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) nm.areNotificationsEnabled() else true
+            } catch (e: Exception) {
+                false
+            }
+        }
+
         /// 诊断信息：App 里点开「复制即弹」卡片就能看到，出问题时一眼定位。
         fun status(ctx: Context): Map<String, Any> {
             val now = System.currentTimeMillis()
@@ -374,10 +631,13 @@ class ClipWatchService : AccessibilityService() {
             m["enabled"] = isEnabled(ctx)
             m["connected"] = connected
             m["overlayPermission"] = canDrawOverlay(ctx)
+            m["notifyPermission"] = canNotify(ctx)
             m["lastEventAgo"] = ago(lastEventAt)
             m["lastClipAgo"] = ago(lastClipAt)
             m["lastOverlayAgo"] = ago(lastOverlayAt)
+            m["lastCopySignalAgo"] = ago(lastCopySignalAt)
             m["lastPkg"] = lastPkg
+            m["promptVia"] = promptVia
             m["error"] = err
             return m
         }

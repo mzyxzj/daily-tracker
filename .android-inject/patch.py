@@ -173,6 +173,8 @@ def main():
         "android.permission.SYSTEM_ALERT_WINDOW",
         # 复制到链接时抖一下，视觉被系统吞了也知道有反应。
         "android.permission.VIBRATE",
+        # ColorOS 拦「后台弹出界面」时，改为发通知提醒——没这个权限通知会被静默丢弃。
+        "android.permission.POST_NOTIFICATIONS",
         # App 内检查更新后直接装新包（还要用户在系统里开「安装未知应用」）。
         "android.permission.REQUEST_INSTALL_PACKAGES",
     ]
@@ -204,13 +206,14 @@ def main():
         print("added ClipWatchService")
 
     if 'android:name=".ClipPromptActivity"' not in mf:
+        # 不要 taskAffinity=""：空 affinity + NEW_TASK 会让系统在后台新建任务，
+        # ColorOS 直接把这个任务丢掉（不报错也不显示）。留在本任务里更稳。
+        # 也不要 noHistory：部分 ROM 会在窗口真正上屏前就把它回收。
         prompt = """        <activity
             android:name=".ClipPromptActivity"
             android:exported="false"
             android:excludeFromRecents="true"
-            android:noHistory="true"
             android:launchMode="singleTop"
-            android:taskAffinity=""
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 """
         if "</application>" not in mf:

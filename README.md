@@ -2,6 +2,62 @@
 
 本仓库只放源码（lib / pubspec / CI），Android 工程由 CI 里的 `flutter create` 生成。
 
+## 4.3.0 · 复制即弹真正修通了 + 清晰度调节 + 穿透 shadow DOM（Empire-V4.3）
+
+### 1. 「复制链接没反应」：找到根因了
+
+前面两版都在改「怎么弹」（悬浮窗 → 透明 Activity），但真正的问题在**根本不该被触发**：
+
+```kotlin
+// V4.2 的逻辑
+if (clipApiOk) return            // 剪贴板回调一旦"成功"过，事件就全被丢掉
+...
+if (reason != "click" && reason != "clip") return   // 事件路径永远走不进盲弹
+```
+
+`addPrimaryClipChangedListener` 在 Android 10+ **只在应用有焦点时派发**。无障碍服务在后台，
+回调根本不来，于是 `clipApiOk` 一直是 false；而事件路径读剪贴板又被系统拒绝（返回空），
+空内容 + `reason="event"` 直接 return —— 结果就是**点了复制，代码一行都没执行到弹窗**。
+这不是 ColorOS 的问题，是所有 Android 10+ 都会这样。
+
+现在改成三条**不依赖读取剪贴板权限**的信号：
+
+| 信号 | 来源 | 为什么可靠 |
+|---|---|---|
+| 点到了「复制链接 / 复制 / Copy」控件 | `TYPE_VIEW_CLICKED` + `node.text/contentDescription` | B站、抖音分享面板都是标准按钮 |
+| 系统 Toast「已复制 / 复制成功」 | `TYPE_NOTIFICATION_STATE_CHANGED` | 复制成功的自绘气泡多数 ROM 只回这个 |
+| 窗口内容变化 | `TYPE_WINDOW_CONTENT_CHANGED` | 兜底，延迟 300ms 再读一次 |
+
+读到内容就带预览弹；读不到（被 ROM 拦）也照弹，点「整理」App 到前台再读。
+
+### 2. 弹窗三条通道，谁通谁上
+
+ColorOS 的「后台弹出界面」关着时，`startActivity` **不抛异常也不显示**，光靠 try/catch 永远发现不了。
+现在 Activity 启动后 700ms 检查 `onResume` 回执：
+
+- 回执到了 → 提示卡显示成功，结束；
+- 没回执 → 改发**通知**（不需要后台弹窗权限），通知也没权限 → 退**无障碍悬浮窗**；
+- 三条全失败 → 自检面板直接写「提示通道全被拦」。
+
+通知需要 `POST_NOTIFICATIONS`（Android 13+ 运行时权限），所以打开自检面板时会自动申请一次。
+
+### 3. 清晰度调节
+
+B站 播放器左下角新增清晰度按钮（自动 / 4K / 1080P60 / 1080P / 720P / 480P / 360P），
+直接调播放器实例的 `setQuality()`，切换后自动接着播。
+
+- 档位是 B站 自己给的：未登录通常只有 480P / 360P，登录后才到 1080P；
+- 抖音官方播放页由平台决定码率，没有可调档位，这个按钮不显示。
+
+### 4. 播放：穿透 shadow DOM
+
+B站 新版播放器是 `<bwp-video>` 自定义元素，真正的 `<video>` 在它的 `shadowRoot` 里。
+`document.querySelector('video')` 返回 null，于是「滑到即播」实际什么都没做。现在改成递归遍历
+shadow root 找 video，播放 / 暂停 / 探测全部走同一条路径。
+
+另外补了黑屏探测：3.5s / 7.5s 各看一次 `videoWidth`，连续两次为 0 就自动换下一个源
+（黑屏不会触发 `onWebResourceError`，这是唯一能识别出来的办法）。
+
 ## 4.2.0 · 复制即弹换了实现 + 滑到即播 + 应用内升级（Empire-V4.2）
 
 ### 1. 复制了没反应：不再用悬浮窗，改成透明 Activity
