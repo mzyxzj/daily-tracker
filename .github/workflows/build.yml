@@ -142,13 +142,21 @@ jobs:
 
       # 签名必须和上一版一致，否则用户覆盖安装会失败、数据全丢。
       # 只「配置了密钥」不够：模板写法一变，替换就可能静默落空，所以这里直接验指纹。
+      # 签名必须和上一版一致，否则用户覆盖安装会失败、数据全丢。
+      # 只「配置了密钥」不够：模板写法一变，替换就可能静默落空，所以这里直接验指纹。
+      # 用 apksigner 而不是 keytool：现在的 APK 只有 v2/v3 签名，keytool 读 JAR 签名会读不到。
       - name: Verify release signature
         run: |
           APK=build/app/outputs/flutter-apk/app-release.apk
-          FP=$(keytool -printcert -jarfile "$APK" | grep -m1 'SHA256:' | sed 's/.*SHA256: *//')
+          APKSIGNER=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          if [ -z "$APKSIGNER" ]; then
+            APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          fi
+          echo "apksigner: $APKSIGNER"
+          FP=$("$APKSIGNER" verify --print-certs "$APK" | grep -m1 'SHA-256 digest' | sed 's/.*digest: *//' | tr 'A-Z' 'a-z')
           echo "APK cert SHA256: $FP"
           echo "::notice title=APK 签名指纹::$FP"
-          EXPECT="4B:FB:37:8A:E8:58:B5:20:E6:F3:0B:85:50:D4:EB:66:FA:45:4A:12:1D:0B:AC:F4:AD:AD:BB:7C:21:F0:18:68"
+          EXPECT=4bfb378ae858b520e6f30b8550d4eb66fa454a121d0bacf4adadbb7c21f01868
           if [ "$FP" != "$EXPECT" ]; then
             echo "::error::APK 没用固定密钥签名（$FP），覆盖升级会失败"
             exit 1

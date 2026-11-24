@@ -28,7 +28,7 @@
 |---|---|---|
 | `pubspec.yaml` | 426 | `d8b6fe69742893bda97111b059abc3c5` |
 | `README.md` | 25,677 | `fedb1e43fe0a93bfea8e6d42cbbfb4ef` |
-| `.github/workflows/build.yml` | 7,963 | `80bcd12988eb2365a32802ec96f14671` |
+| `.github/workflows/build.yml` | 8,585 | `bca289061c61cc18e5a191032c3e1265` |
 | `lib/main.dart` | 138,272 | `9aca3c8de3857fb7e2d5b61ca74740d0` |
 | `lib/culture_page.dart` | 51,430 | `fe3166f67eb69afd8ea792a02828ae82` |
 | `lib/culture_feed.dart` | 98,801 | `e17c13098e5e465463fc5a63a00e205f` |
