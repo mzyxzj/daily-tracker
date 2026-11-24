@@ -3,6 +3,8 @@ on: [push, workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 需要写 Release 才能把 APK 挂上去
     steps:
       - uses: actions/checkout@v4
 
@@ -161,6 +163,19 @@ jobs:
             echo "::error::APK 没用固定密钥签名（$FP），覆盖升级会失败"
             exit 1
           fi
+
+      # 把 APK 直接挂到 Release 上：Actions 产物要登录才能下，Release 是公开直链。
+      # 只在 Empire-V4.1 分支上做，避免别的分支乱发版。
+      - name: Attach APK to release
+        if: github.ref_name == 'Empire-V4.1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=V4.1.0
+          gh release view "$TAG" > /dev/null 2>&1 \
+            || gh release create "$TAG" --target "$GITHUB_SHA" --title "帝国 V4.1.0 · 站内播放 + 复制即弹"
+          gh release upload "$TAG" build/app/outputs/flutter-apk/app-release.apk --clobber
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size) \(.browserDownloadUrl)"'
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
