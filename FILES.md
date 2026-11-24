@@ -7,7 +7,7 @@
 > 1. **站内播放真的在站内**。4.0 把 `m.bilibili.com/video/BV…` 塞进 WebView，那是
 >    手机浏览器落地页，满屏「打开App，流畅又高清」，点一下就跳出去。
 >    现在先翻译成平台自己的播放器页（`lib/player_target.dart`）：
->    B站走 `blackboard/html5mobileplayer.html`，备用 `player.bilibili.com`；
+>    B站走 `blackboard/html5mobileplayer.html` → `player.bilibili.com` → 桌面版三级兜底；
 >    抖音走 `open.douyin.com/player/video`。短链先跟 302 拿 BV / aweme id。
 >    加载完探 DOM 有没有 `<video>`，没有自动换源；跳 App 的 scheme 全部拦下。
 >
@@ -27,16 +27,16 @@
 | 文件 | 字节 | MD5 |
 |---|---|---|
 | `pubspec.yaml` | 426 | `d8b6fe69742893bda97111b059abc3c5` |
-| `README.md` | 24,793 | `e221f73a68d6aa6446336115b8eeddbb` |
+| `README.md` | 24,969 | `221b24990315199b7d4e71729d2c8c2a` |
 | `.github/workflows/build.yml` | 5,968 | `d93149eb806ffdb1383547d14650ac71` |
 | `lib/main.dart` | 138,272 | `9aca3c8de3857fb7e2d5b61ca74740d0` |
 | `lib/culture_page.dart` | 51,430 | `fe3166f67eb69afd8ea792a02828ae82` |
-| `lib/culture_feed.dart` | 97,432 | `658d8368626ab703e614b33fb821d17c` |
+| `lib/culture_feed.dart` | 98,801 | `e17c13098e5e465463fc5a63a00e205f` |
 | `lib/content_fetch.dart` | 23,847 | `d4d49bbb91d7c81f4fcd25dfa38d32e0` |
 | `lib/content_feed.dart` | 14,941 | `c477ce3b9f98a85a1099be539f3337a1` |
 | `lib/content_intake.dart` | 23,270 | `e1546f54fcd91d758601a4b4701710b2` |
 | `lib/native_clip.dart` | 5,896 | `add40db1975d0b306a1801d6a2ade950` |
-| `lib/player_target.dart` | 6,083 | `8bde67ba88f71f882e48bc0ba8c9c8ee` |
+| `lib/player_target.dart` | 6,481 | `bbfbb1328e00507d5e1d6aec0bcead12` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
 | `lib/deepseek_sheet.dart` | 72,621 | `ccd3d91379d101cfbbc0ada026a813e3` |
 | `lib/empire_page.dart` | 71,718 | `9bab00fac714fa2db5694fe15d00041d` |

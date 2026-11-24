@@ -1630,6 +1630,11 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
       'Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36';
 
+  // 兜底源（桌面版）要用桌面 UA：用移动 UA 打开 www.bilibili.com 会被跳到 m 站。
+  static const String _kDesktopUa =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
   WebViewController? _ctrl;
   int _progress = 0;
   bool _failed = false;
@@ -1640,12 +1645,21 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
   String _grabMsg = '';
 
   PlayTarget? _target;
-  int _tryIdx = 0; // 0 主地址 / 1 备用地址
+  int _tryIdx = 0; // 0 主地址 / 1 备用地址 / 2 桌面版兜底
   bool _probing = false;
   bool _loginMode = false;
   String _failHint = '';
 
   String get _url => cultureNormalizeUrl('${widget.item['url'] ?? ''}');
+
+  /// 依次尝试的地址：平台播放器 → 官方 iframe → 桌面版页面。
+  List<String> get _sources {
+    final t = _target;
+    if (t == null) return [_url];
+    return [t.primary, t.fallback, t.desktop]
+        .where((e) => e.isNotEmpty)
+        .toList();
+  }
 
   @override
   void initState() {
@@ -1712,7 +1726,25 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
       ));
     if (!mounted) return;
     setState(() => _ctrl = c);
-    await _loadUrl(_target?.primary ?? _url);
+    await _loadSource(0);
+  }
+
+  /// 切到第 i 个源。桌面版兜底要同时把 UA 换掉。
+  Future<void> _loadSource(int i) async {
+    final list = _sources;
+    if (list.isEmpty) return;
+    final idx = i.clamp(0, list.length - 1);
+    _tryIdx = idx;
+    final c = _ctrl;
+    if (c == null) {
+      await _bindController();
+      return;
+    }
+    final desktop = _target?.kind == 'bili' && idx == 2;
+    try {
+      await c.setUserAgent(desktop ? _kDesktopUa : _kPlayerUa);
+    } catch (_) {}
+    await _loadUrl(list[idx]);
   }
 
   Future<void> _loadUrl(String u) async {
@@ -1763,9 +1795,8 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
       }
       if (!mounted) return;
       final t = _target;
-      if (t != null && t.fallback.isNotEmpty && _tryIdx == 0) {
-        _tryIdx = 1;
-        await _loadUrl(t.fallback);
+      if (_tryIdx + 1 < _sources.length) {
+        await _loadSource(_tryIdx + 1);
         return;
       }
       if (!mounted) return;
@@ -1784,8 +1815,11 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
     final c = _ctrl;
     if (c == null) return false;
     try {
+      // B站用的是 bwp-video 自定义元素（video 在 shadow DOM 里），
+      // 只查 'video' 会误判成「没画面」。
       final r = await c.runJavaScriptReturningResult(
-          "(function(){var v=document.querySelector('video');"
+          "(function(){var v=document.querySelector("
+          "'video, bwp-video, .mplayer-video-wrap, .bpx-player-video-wrap');"
           "if(!v) return 'no';"
           "return 'yes';})()");
       final s = '$r';
@@ -1797,8 +1831,13 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
   }
 
   void _retryFromPrimary() {
-    _tryIdx = 0;
-    _loadUrl(_target?.primary ?? _url);
+    final c = _ctrl;
+    if (c == null) {
+      // 控制器还没建好（解析播放地址失败过），重走一遍绑定。
+      _bindController();
+      return;
+    }
+    _loadSource(0);
   }
 
   /// 沉浸模式：把平台自带的「推荐流 / 下一个视频 / 侧栏」藏掉。

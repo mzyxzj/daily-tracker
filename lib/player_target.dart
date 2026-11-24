@@ -20,6 +20,9 @@ class PlayTarget {
   /// 首选出不来画面时的第二选择。
   final String fallback;
 
+  /// 最后兜底：桌面版页面（新版播放器，兼容性最好，但布局不适合手机）。
+  final String desktop;
+
   /// 'bili' / 'douyin' / 'web'
   final String kind;
 
@@ -29,6 +32,7 @@ class PlayTarget {
   const PlayTarget({
     required this.primary,
     this.fallback = '',
+    this.desktop = '',
     this.kind = 'web',
     this.note = '',
   });
@@ -86,6 +90,10 @@ String biliEmbedUrl(String bvid, {bool autoplay = true}) {
   ].join('&');
   return 'https://player.bilibili.com/player.html?$q';
 }
+
+/// B站桌面版视频页：新版播放器（bpx）走带签名的取流接口，
+/// 前两个源都被挡时用它兜底。
+String biliDesktopUrl(String bvid) => 'https://www.bilibili.com/video/$bvid';
 
 /// 抖音开放平台播放器页。
 String douyinPlayerUrl(String vid, {bool autoplay = true}) {
@@ -146,6 +154,7 @@ Future<PlayTarget> buildPlayTarget({
       return PlayTarget(
         primary: biliPlayerUrl(bv),
         fallback: biliEmbedUrl(bv),
+        desktop: biliDesktopUrl(bv),
         kind: 'bili',
         note: 'B站站内播放器 · 未登录最高 480P',
       );

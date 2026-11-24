@@ -15,13 +15,14 @@
 | --- | --- | --- |
 | B站 | `bilibili.com/blackboard/html5mobileplayer.html?bvid=…` | B站自己的移动版 HTML5 播放器页，只有播放器，没有任何 App 引导 |
 | B站（备用） | `player.bilibili.com/player.html?bvid=…` | 官方 iframe 播放器，主地址没出画面时自动切 |
+| B站（兜底） | `www.bilibili.com/video/BV…`（桌面 UA） | 新版播放器取流最稳，两个移动源都被挡时才用 |
 | 抖音 | `open.douyin.com/player/video?vid=…` | 开放平台播放器；不行再退分享页 |
 | 其它 | 原链接 | 不动 |
 
 - `b23.tv` / `v.douyin.com` 短链会先跟一次 302 拿到 BV / aweme id 再拼地址。
 - UA 去掉 `wv` 标记（带这个标记会被一些站点直接判成内嵌浏览器并强制跳 App）。
 - `bilibili://`、`snssdk1123://`、`intent://` 这类跳 App 的 scheme 一律拦下并提示已拦。
-- 加载完会探一次 DOM 有没有 `<video>`：没有就换备用源，换完还没有才显示兜底卡
+- 加载完会探一次 DOM 有没有 `video / bwp-video`（B站放在 shadow DOM 里）：没有就逐级换源，三级都不行才显示兜底卡
   （兜底卡给「换个源再试 / 登录 / 生成工具包 / 复制链接」，不再直接把你踢出去）。
 - 登录页跳回站内后**自动回到这条视频**，不用手动退。
 
