@@ -19,13 +19,13 @@
 | 文件 | 字节 | MD5 |
 |---|---|---|
 | `pubspec.yaml` | 558 | `5cf71c4ca614c02618cf95c0669afd5b` |
-| `README.md` | 32,838 | `147e87bb0eb96f697c185180f6d516bf` |
+| `README.md` | 33,284 | `30e0d9f5f0338721b8ff5c7da43420c4` |
 | `.github/workflows/build.yml` | 9,510 | `8bf57bcb3475baac480584878f35875b` |
 | `lib/app_update.dart` | 14,455 | `a931e3cabb03f54bf7d81073af50427b` |
 | `lib/content_feed.dart` | 14,941 | `c477ce3b9f98a85a1099be539f3337a1` |
 | `lib/content_fetch.dart` | 23,847 | `d4d49bbb91d7c81f4fcd25dfa38d32e0` |
 | `lib/content_intake.dart` | 23,270 | `e1546f54fcd91d758601a4b4701710b2` |
-| `lib/culture_feed.dart` | 122,808 | `2bb0b8fa5c62427d93f16c7e46105fdc` |
+| `lib/culture_feed.dart` | 126,104 | `18479401dae185d96fcceac522c41e36` |
 | `lib/culture_page.dart` | 51,430 | `fe3166f67eb69afd8ea792a02828ae82` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
 | `lib/deepseek_sheet.dart` | 72,621 | `ccd3d91379d101cfbbc0ada026a813e3` |
@@ -36,7 +36,7 @@
 | `lib/medical_page.dart` | 66,637 | `cac60111718de4e5939b357a29719d6c` |
 | `lib/native_clip.dart` | 7,430 | `0b36583f1fd34fff83a2e5020db0f2fa` |
 | `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
-| `lib/player_target.dart` | 6,481 | `bbfbb1328e00507d5e1d6aec0bcead12` |
+| `lib/player_target.dart` | 6,822 | `89994578d532502da9d6ceac81320087` |
 | `.android-inject/MainActivity.kt` | 11,262 | `2ace607c46c4d9626f52fe3a3c96e472` |
 | `.android-inject/ClipWatchService.kt` | 30,140 | `6d26333b7226dbbb0e3813907f79cc18` |
 | `.android-inject/ClipPromptActivity.kt` | 7,346 | `7bb2d5f83cbfafeb33ccab85619b3e22` |

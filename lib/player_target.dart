@@ -66,13 +66,18 @@ String? extractAwemeId(String text) {
 }
 
 /// B站移动端 HTML5 播放器（无 App 引导，可直接在 WebView 里播）。
-String biliPlayerUrl(String bvid, {bool autoplay = true}) {
+///
+/// [quality] 是 B站 的 quality 码（80=1080P、64=720P、32=480P、16=360P），
+/// 0 表示不指定。页面自己会读 URL 里的 `quality` / `qn` 作为初始档位，
+/// 所以在播放器 API 调不动时，重新加载带这个参数的地址是更稳的兜底。
+String biliPlayerUrl(String bvid, {bool autoplay = true, int quality = 0}) {
   final q = <String>[
     'bvid=$bvid',
     'page=1',
     'as_wide=1',
     'high_quality=1',
     'danmaku=1',
+    if (quality > 0) 'quality=$quality',
     if (autoplay) 'autoplay=1',
   ].join('&');
   return 'https://www.bilibili.com/blackboard/html5mobileplayer.html?$q';

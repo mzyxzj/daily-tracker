@@ -1855,6 +1855,11 @@ class _InlineVideoState extends State<_InlineVideo> {
   int _quality = 0;
   bool _qBusy = false;
   int _probeFails = 0;
+  // 换清晰度要重载页面时，先记下进度，加载完再跳回去。
+  double _resumeAt = 0;
+  // 同一次切换只允许重载一次：否则 onPageFinished 会再调一次 _applyQuality，
+  // API 如果仍失败就无限重载。
+  bool _reloadedForQuality = false;
 
   /// 只对 B站 显示清晰度按钮：抖音官方播放页由平台自己决定码率，没有可调的档位。
   bool get _canPickQuality => _target?.kind == 'bili';
@@ -1921,6 +1926,13 @@ class _InlineVideoState extends State<_InlineVideo> {
           await _fitCss();
           // 播放器是异步初始化的：立刻 play 往往打在空对象上，所以 0.4s / 2.6s 各踢一次。
           await _kickPlay();
+          final resume = _resumeAt;
+          if (resume > 1) {
+            _resumeAt = 0;
+            Future.delayed(const Duration(milliseconds: 1600), () {
+              if (mounted && !_failed) _seekTo(resume);
+            });
+          }
           for (final ms in [400, 2600]) {
             Future.delayed(Duration(milliseconds: ms), () {
               if (mounted && !_failed) _kickPlay();
@@ -2111,6 +2123,8 @@ $_kDeepQuery
   static String qualityLabel(int q) => clipQualityLabel(q);
 
   Future<void> _pickQuality() async {
+    // 每次手动选都允许再走一次 URL 重载（上次可能是别的档位）。
+    _reloadedForQuality = false;
     final picked = await showQualitySheet(context, _quality);
     if (picked != null) await _applyQuality(picked);
   }
@@ -2120,7 +2134,13 @@ $_kDeepQuery
     final c = _ctrl;
     if (c == null) return false;
     setState(() => _qBusy = true);
-    final ok = await clipApplyQuality(c, q);
+    var ok = await clipApplyQuality(c, q);
+    // API 调不动（老播放器 / 对象没暴露）时，用 URL 的 quality 参数重载，
+    // 页面初始化时就会按这个档位取流。会丢一点播放位置，所以先记下来。
+    if (!ok && q != 0 && !_reloadedForQuality) {
+      _reloadedForQuality = true;
+      ok = await _reloadWithQuality(q);
+    }
     if (!mounted) return false;
     setState(() {
       _qBusy = false;
@@ -2131,6 +2151,40 @@ $_kDeepQuery
       if (ok) await _kickPlay();
     }
     return ok;
+  }
+
+  Future<bool> _reloadWithQuality(int q) async {
+    final c = _ctrl;
+    if (c == null) return false;
+    final t = _target;
+    final bv = extractBvId(t?.primary ?? '') ?? extractBvId(_url) ?? '';
+    if (bv.isEmpty) return false;
+    _resumeAt = await _currentTime();
+    try {
+      await c.loadRequest(Uri.parse(biliPlayerUrl(bv, quality: q)));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<double> _currentTime() async {
+    try {
+      final r = await _ctrl?.runJavaScriptReturningResult(
+          "(function(){var v=document.querySelector('video');return v?(v.currentTime||0):0;})()");
+      return double.tryParse('$r'.replaceAll('"', '').trim()) ?? 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  Future<void> _seekTo(double sec) async {
+    if (sec <= 1) return;
+    try {
+      await _ctrl?.runJavaScript(
+          "(function(){var v=document.querySelector('video');"
+          "if(v){try{v.currentTime=${sec.toStringAsFixed(2)};}catch(e){}}})()");
+    } catch (_) {}
   }
 
   void _snack(String msg) {
@@ -2295,6 +2349,8 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
   // 清晰度：0 = 跟随 B站 默认。只对 kind == 'bili' 生效。
   int _quality = 0;
   bool _qBusy = false;
+  double _resumeAt = 0;
+  bool _reloadedForQuality = false;
 
   bool get _canPickQuality => _target?.kind == 'bili';
 
@@ -2424,6 +2480,19 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
     }
     final t = _target;
     if (t != null && t.isPlatformPlayer) _probeVideo();
+    // 换清晰度重载过：进度跳回去，别让用户从头看。
+    if (_resumeAt > 1) {
+      final at = _resumeAt;
+      _resumeAt = 0;
+      Future.delayed(const Duration(milliseconds: 1800), () async {
+        if (!mounted) return;
+        try {
+          await _ctrl?.runJavaScript(
+              "(function(){var v=document.querySelector('video');"
+              "if(v){try{v.currentTime=${at.toStringAsFixed(2)};}catch(e){}}})()");
+        } catch (_) {}
+      });
+    }
     // 播放器初始化要时间，等 1.2s 再套用用户选过的清晰度。
     if (_quality != 0 && t?.kind == 'bili') {
       Future.delayed(const Duration(milliseconds: 1200), () {
@@ -2433,6 +2502,7 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
   }
 
   Future<void> _pickQuality() async {
+    _reloadedForQuality = false;
     final picked = await showQualitySheet(context, _quality);
     if (picked != null) await _applyQuality(picked);
   }
@@ -2441,7 +2511,19 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
     final c = _ctrl;
     if (c == null) return false;
     setState(() => _qBusy = true);
-    final ok = await clipApplyQuality(c, q);
+    var ok = await clipApplyQuality(c, q);
+    if (!ok && q != 0 && !_reloadedForQuality) {
+      _reloadedForQuality = true;
+      final t = _target;
+      final bv = extractBvId(t?.primary ?? '') ?? extractBvId(_url) ?? '';
+      if (bv.isNotEmpty) {
+        _resumeAt = await _currentTime();
+        try {
+          await c.loadRequest(Uri.parse(biliPlayerUrl(bv, quality: q)));
+          ok = true;
+        } catch (_) {}
+      }
+    }
     if (!mounted) return false;
     setState(() {
       _qBusy = false;
@@ -2451,6 +2533,16 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
       _snack(ok ? '已切到 ${clipQualityLabel(q)}' : '这个视频没有 ${clipQualityLabel(q)} 这一档');
     }
     return ok;
+  }
+
+  Future<double> _currentTime() async {
+    try {
+      final r = await _ctrl?.runJavaScriptReturningResult(
+          "(function(){var v=document.querySelector('video');return v?(v.currentTime||0):0;})()");
+      return double.tryParse('$r'.replaceAll('"', '').trim()) ?? 0;
+    } catch (_) {
+      return 0;
+    }
   }
 
   /// 平台播放器页加载完不代表真的出画面：
