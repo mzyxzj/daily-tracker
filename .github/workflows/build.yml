@@ -140,6 +140,20 @@ jobs:
           print('::error::' + chunk.replace('\n', '%0A'))
           PY
 
+      # 签名必须和上一版一致，否则用户覆盖安装会失败、数据全丢。
+      # 只「配置了密钥」不够：模板写法一变，替换就可能静默落空，所以这里直接验指纹。
+      - name: Verify release signature
+        run: |
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          FP=$(keytool -printcert -jarfile "$APK" | grep -m1 'SHA256:' | sed 's/.*SHA256: *//')
+          echo "APK cert SHA256: $FP"
+          echo "::notice title=APK 签名指纹::$FP"
+          EXPECT="4B:FB:37:8A:E8:58:B5:20:E6:F3:0B:85:50:D4:EB:66:FA:45:4A:12:1D:0B:AC:F4:AD:AD:BB:7C:21:F0:18:68"
+          if [ "$FP" != "$EXPECT" ]; then
+            echo "::error::APK 没用固定密钥签名（$FP），覆盖升级会失败"
+            exit 1
+          fi
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:

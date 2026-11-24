@@ -81,60 +81,81 @@ def main():
     # 模板默认 release 用 debug keystore，而 CI 每次 runner 的 debug 都是新生成的，
     # 结果就是「每个版本的签名都不一样」——覆盖安装必失败，卸掉重装就丢数据。
     # 这里放一把固定密钥，以后所有版本同签名，可以直接覆盖升级。
+    #
+    # 注意：不同 Flutter 版本的模板写法不一样（Groovy 是 `signingConfig signingConfigs.debug`，
+    # Kotlin DSL 是 `signingConfig = signingConfigs.getByName("debug")`），
+    # 只认一种就会静默落空——上一版在 CI 上其实仍然用 debug key 签名。
     ks_src = os.path.join(HERE, "dt-release.jks")
     ks_dst = os.path.join(ROOT, "android/app/dt-release.jks")
     if os.path.exists(ks_src):
         shutil.copyfile(ks_src, ks_dst)
         print("wrote app/dt-release.jks")
 
-        gradles = glob.glob(os.path.join(ROOT, "android/app/build.gradle*"))
-        gradles = [g for g in gradles if not g.endswith(".kts")] or gradles
-        if gradles:
-            gp = gradles[0]
-            g = read(gp)
-            kts = gp.endswith(".kts")
-            if "signingConfigs {" not in g:
-                if kts:
-                    sig = """
-    signingConfigs {
-        create("rel") {
-            storeFile = file("dt-release.jks")
-            storePassword = "dt-release-2026"
-            keyAlias = "dt"
-            keyPassword = "dt-release-2026"
-        }
-    }
-"""
-                else:
-                    sig = """
-    signingConfigs {
-        rel {
-            storeFile file("dt-release.jks")
-            storePassword "dt-release-2026"
-            keyAlias "dt"
-            keyPassword "dt-release-2026"
-        }
-    }
-"""
-                m = re.search(r"android\s*\{\n", g)
-                if not m:
-                    fail("android { 块没找到，无法注入签名配置")
-                g = g[:m.end()] + sig + g[m.end():]
-                print("added signingConfigs")
+        gp = None
+        for cand in ("android/app/build.gradle.kts", "android/app/build.gradle"):
+            f = os.path.join(ROOT, cand)
+            if os.path.exists(f):
+                gp = f
+                break
+        if gp is None:
+            fail("android/app/build.gradle(.kts) 都不存在")
+        g = read(gp)
+        kts = gp.endswith(".kts")
 
-            if kts:
-                g = g.replace("signingConfig = signingConfigs.debug",
-                              'signingConfig = signingConfigs.getByName("rel")')
+        if kts:
+            rel_block = (
+                '        create("rel") {\n'
+                '            storeFile = file("dt-release.jks")\n'
+                '            storePassword = "dt-release-2026"\n'
+                '            keyAlias = "dt"\n'
+                '            keyPassword = "dt-release-2026"\n'
+                '        }\n'
+            )
+        else:
+            rel_block = (
+                '        rel {\n'
+                '            storeFile file("dt-release.jks")\n'
+                '            storePassword "dt-release-2026"\n'
+                '            keyAlias "dt"\n'
+                '            keyPassword "dt-release-2026"\n'
+                '        }\n'
+            )
+
+        has_rel = ('create("rel")' in g) or re.search(r"(?m)^[ \t]*rel[ \t]*\{", g)
+        if not has_rel:
+            m = re.search(r"(?m)^[ \t]*signingConfigs[ \t]*\{[ \t]*\n", g)
+            if m:
+                # 新版模板自带 signingConfigs（里面给 debug 配了一个），把 rel 塞进去
+                g = g[:m.end()] + rel_block + g[m.end():]
+                print("injected rel into existing signingConfigs")
             else:
-                g = g.replace("signingConfig = signingConfigs.debug",
-                              "signingConfig = signingConfigs.rel")
-                g = g.replace("signingConfig signingConfigs.debug",
-                              "signingConfig signingConfigs.rel")
-            write(gp, g)
-            if "signingConfigs.rel" not in g and 'signingConfigs.getByName("rel")' not in g:
-                print("WARN: build.gradle 里没找到 debug 签名行，release 可能仍用 debug key")
-            else:
-                print("release signing -> dt-release.jks")
+                block = "    signingConfigs {\n" + rel_block + "    }\n"
+                m2 = re.search(r"android\s*\{\n", g)
+                if not m2:
+                    fail("android { 块没找到，无法注入签名配置")
+                g = g[:m2.end()] + block + g[m2.end():]
+                print("added signingConfigs block")
+
+        # 把模板里指向 debug 的三种写法都换掉
+        before = g
+        g = g.replace('signingConfig = signingConfigs.getByName("debug")',
+                      'signingConfig = signingConfigs.getByName("rel")')
+        if kts:
+            g = g.replace('signingConfig = signingConfigs.debug',
+                          'signingConfig = signingConfigs.getByName("rel")')
+        else:
+            g = g.replace('signingConfig = signingConfigs.debug',
+                          'signingConfig = signingConfigs.rel')
+            g = g.replace('signingConfig signingConfigs.debug',
+                          'signingConfig signingConfigs.rel')
+        if g != before:
+            print("release buildType -> rel")
+
+        write(gp, g)
+        wired = ('getByName("rel")' in g) or ('signingConfigs.rel' in g)
+        if not wired:
+            fail("build.gradle 里没接上 rel 签名（模板写法又变了？），否则每个版本签名都不同")
+        print("release signing -> dt-release.jks")
     else:
         print("no dt-release.jks, keep template signing")
 
