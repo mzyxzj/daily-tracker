@@ -221,7 +221,8 @@ class ClipWatchService : AccessibilityService() {
     }
 
     private fun platformOf(text: String): String {
-        val t = text.toLowerCase()
+        // Kotlin 2.x 把 toLowerCase() 的弃用提升成编译错误，用 lowercase()。
+        val t = text.lowercase()
         return when {
             t.contains("bilibili") || t.contains("b23.tv") -> "B站"
             t.contains("douyin") || t.contains("iesdouyin") -> "抖音"
