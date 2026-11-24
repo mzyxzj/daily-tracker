@@ -20,6 +20,7 @@ import 'content_intake.dart';
 import 'culture_page.dart';
 import 'deepseek_service.dart';
 import 'native_clip.dart';
+import 'player_target.dart';
 
 const Color kFeedBg = Color(0xFF0B0F17);
 const Color kFeedInk = Color(0xFFF8FAFC);
@@ -45,7 +46,7 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
   List _kits = [];
   int? _battery;
   bool _onlyCurrentTier = true;
-  bool _nativeClip = false; // 系统无障碍服务有没有开（决定「复制即弹」是否生效）
+  ClipStatus _clipStatus = const ClipStatus(); // 「复制即弹」的真实状态
   bool _loading = true;
   int _page = 0;
 
@@ -119,9 +120,9 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
         await CultureDb.refreshSignals(db);
       } catch (_) {}
 
-      var nativeOn = false;
+      var clip = const ClipStatus();
       try {
-        nativeOn = await NativeClip.isEnabled();
+        clip = await NativeClip.status();
       } catch (_) {}
       final battery = int.tryParse('${batteryRaw ?? ''}'.trim());
       final feed = buildCultureFeed(
@@ -139,7 +140,7 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
         _grades = grades;
         _kits = kits;
         _battery = battery;
-        _nativeClip = nativeOn;
+        _clipStatus = clip;
         _feed = feed;
         _loading = false;
         if (_page >= feed.entries.length) {
@@ -632,41 +633,130 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
     await _load();
   }
 
-  /// 「复制就弹」要用户自己开一次系统无障碍权限，这里把话说清楚再跳设置。
-  Future<void> _enableNativeClip() async {
-    final go = await showDialog<bool>(
+  /// 「复制就弹」自检面板。
+  ///
+  /// 用户报「复制了没弹」时，光看一个「已开启」的勾是没用的——真正要确认的是
+  /// 服务进程还活着、能不能读剪贴板、悬浮条能不能加上去。这三件事分开显示。
+  Future<void> _showClipDiag() async {
+    var st = _clipStatus;
+    await showDialog<void>(
       context: context,
-      builder: (dctx) => AlertDialog(
-        title: const Text('开启「复制就弹」', style: TextStyle(fontSize: 15.5)),
-        content: const Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Android 从 10 开始不允许普通 App 在后台读剪贴板，所以需要一个系统级服务：',
-              style: TextStyle(fontSize: 12.5, height: 1.7),
+      builder: (dctx) => StatefulBuilder(builder: (dctx, setSt) {
+        Future<void> refresh() async {
+          final s = await NativeClip.status();
+          if (!dctx.mounted) return;
+          setSt(() => st = s);
+        }
+
+        String ago(int v) {
+          if (v < 0) return '还没有过';
+          if (v < 60) return '$v 秒前';
+          if (v < 3600) return '${v ~/ 60} 分钟前';
+          return '${v ~/ 3600} 小时前';
+        }
+
+        Widget row(String label, String value, {bool good = false, bool bad = false}) {
+          final color = good
+              ? const Color(0xFF4ADE80)
+              : (bad ? const Color(0xFFF87171) : Colors.white70);
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 5),
+            child: Row(children: [
+              Expanded(
+                  child: Text(label,
+                      style: const TextStyle(fontSize: 11.5, color: Colors.white54))),
+              Text(value,
+                  style: TextStyle(
+                      fontSize: 11.5, fontWeight: FontWeight.w600, color: color)),
+            ]),
+          );
+        }
+
+        final noOverlay = !st.overlayPermission;
+        return AlertDialog(
+          backgroundColor: const Color(0xFF141A26),
+          title: const Text('复制即弹 · 自检',
+              style: TextStyle(fontSize: 15.5, color: kFeedInk)),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                row('无障碍开关', st.enabled ? '已开启' : '未开启',
+                    good: st.enabled, bad: !st.enabled),
+                row('服务是否在跑', st.connected ? '在跑' : '没连上',
+                    good: st.connected, bad: !st.connected),
+                row('悬浮条权限', st.overlayPermission ? '已授权' : '未授权',
+                    good: st.overlayPermission, bad: false),
+                const Divider(color: Colors.white10, height: 16),
+                row('最近一次系统事件', ago(st.lastEventAgo)),
+                row('最近读到剪贴板', ago(st.lastClipAgo),
+                    bad: st.lastClipAgo < 0 && st.enabled),
+                row('最近弹过悬浮条', ago(st.lastOverlayAgo)),
+                if (st.lastPkg.isNotEmpty) row('最近前台 App', st.lastPkg),
+                if (st.error.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text('底层报错：${st.error}',
+                        style: const TextStyle(
+                            fontSize: 10, height: 1.5, color: Color(0xFFFCA5A5))),
+                  ),
+                const SizedBox(height: 10),
+                Container(
+                  padding: const EdgeInsets.fromLTRB(10, 9, 10, 9),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.04),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    st.enabled && !st.connected
+                        ? '系统把它停了（小米/OPPO 常见）：去设置里关掉再打开一次，然后回来点「刷新」。'
+                        : (!st.enabled
+                            ? '还没开启。点下面「去开启」，在系统列表里找到「文化 · 复制即整理」打开。'
+                            : (noOverlay
+                                ? '已经能用。再给一个「显示在其他应用上层」权限，悬浮条在部分机型上更稳。'
+                                : '一切正常。复制一条抖音/B站分享链接试试，屏幕上方会立刻出现「整理 / 略过」。')),
+                    style: const TextStyle(
+                        fontSize: 10.5, height: 1.65, color: Colors.white60),
+                  ),
+                ),
+              ],
             ),
-            SizedBox(height: 8),
-            Text('1. 点下面按钮跳到系统的「无障碍」设置\n'
-                '2. 找到「文化 · 复制即整理」并打开\n'
-                '3. 以后在抖音/B站复制分享链接，屏幕上方会直接问你要不要整理',
-                style: TextStyle(fontSize: 12.5, height: 1.8)),
-            SizedBox(height: 10),
-            Text('这个服务只读剪贴板里的链接，不读别的，也不联网。',
-                style: TextStyle(fontSize: 11, color: Color(0xFF64748B))),
+          ),
+          actionsOverflowDirection: VerticalDirection.down,
+          actions: [
+            TextButton(onPressed: refresh, child: const Text('刷新')),
+            if (noOverlay)
+              TextButton(
+                onPressed: () async {
+                  await NativeClip.openOverlaySettings();
+                },
+                child: const Text('悬浮条权限'),
+              ),
+            if (st.connected)
+              TextButton(
+                onPressed: () async {
+                  final ok = await NativeClip.test();
+                  if (!dctx.mounted) return;
+                  ScaffoldMessenger.of(dctx).showSnackBar(SnackBar(
+                    content: Text(ok ? '已弹一条到屏幕上方，看到了吗' : '服务没响应，去重开一次无障碍',
+                        style: const TextStyle(fontSize: 12)),
+                    behavior: SnackBarBehavior.floating,
+                  ));
+                },
+                child: const Text('试一下'),
+              ),
+            FilledButton(
+              onPressed: () async {
+                await NativeClip.openSettings();
+              },
+              child: Text(st.enabled ? '重开权限' : '去开启'),
+            ),
           ],
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(dctx, false), child: const Text('再说')),
-          FilledButton(
-              onPressed: () => Navigator.pop(dctx, true), child: const Text('去开启')),
-        ],
-      ),
+        );
+      }),
     );
-    if (go != true) return;
-    await NativeClip.openSettings();
-    _toast('打开「文化 · 复制即整理」后返回，这里会变成已开启');
+    await _load();
   }
 
   Future<void> _openKits() async {
@@ -710,10 +800,10 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
           Navigator.pop(context);
           _addItem();
         },
-        nativeClip: _nativeClip,
-        onEnableNativeClip: () {
+        clipStatus: _clipStatus,
+        onOpenClipDiag: () {
           Navigator.pop(context);
-          _enableNativeClip();
+          _showClipDiag();
         },
         onNewLib: () {
           Navigator.pop(context);
@@ -1213,8 +1303,8 @@ class _SidePanel extends StatelessWidget {
   final int? battery;
   final Map<String, dynamic>? tier;
   final bool onlyCurrentTier;
-  final bool nativeClip;
-  final VoidCallback onEnableNativeClip;
+  final ClipStatus clipStatus;
+  final VoidCallback onOpenClipDiag;
   final VoidCallback onToggleTier;
   final VoidCallback onIntakeClip;
   final VoidCallback onManualAdd;
@@ -1232,8 +1322,8 @@ class _SidePanel extends StatelessWidget {
     required this.battery,
     required this.tier,
     required this.onlyCurrentTier,
-    required this.nativeClip,
-    required this.onEnableNativeClip,
+    required this.clipStatus,
+    required this.onOpenClipDiag,
     required this.onToggleTier,
     required this.onIntakeClip,
     required this.onManualAdd,
@@ -1270,32 +1360,41 @@ class _SidePanel extends StatelessWidget {
               ),
             ]),
             const SizedBox(height: 4),
-            // 「复制就弹」状态：没开就先引导，开了就只剩一行确认
+            // 「复制就弹」状态：三态——没开 / 开了但服务被停 / 正常。
+            // 点一下进自检，能看到「服务在不在跑」「最近读到剪贴板是多久前」。
             InkWell(
-              onTap: nativeClip ? null : onEnableNativeClip,
+              onTap: onOpenClipDiag,
               borderRadius: BorderRadius.circular(9),
               child: Container(
                 margin: const EdgeInsets.only(bottom: 10),
                 padding: const EdgeInsets.fromLTRB(11, 9, 9, 9),
                 decoration: BoxDecoration(
-                  color: nativeClip
+                  color: clipStatus.working
                       ? const Color(0xFF0F2A22)
-                      : const Color(0xFF1B2333),
+                      : (clipStatus.enabled
+                          ? const Color(0xFF2A2113)
+                          : const Color(0xFF1B2333)),
                   borderRadius: BorderRadius.circular(9),
                   border: Border.all(
-                      color: nativeClip
+                      color: clipStatus.working
                           ? const Color(0xFF22C55E).withOpacity(0.35)
-                          : Colors.white12),
+                          : (clipStatus.enabled
+                              ? const Color(0xFFF59E0B).withOpacity(0.35)
+                              : Colors.white12)),
                 ),
                 child: Row(children: [
                   Icon(
-                    nativeClip
+                    clipStatus.working
                         ? Icons.check_circle
-                        : Icons.notifications_active_outlined,
+                        : (clipStatus.enabled
+                            ? Icons.error_outline
+                            : Icons.notifications_active_outlined),
                     size: 15,
-                    color: nativeClip
+                    color: clipStatus.working
                         ? const Color(0xFF4ADE80)
-                        : const Color(0xFF7DD3FC),
+                        : (clipStatus.enabled
+                            ? const Color(0xFFFBBF24)
+                            : const Color(0xFF7DD3FC)),
                   ),
                   const SizedBox(width: 8),
                   Expanded(
@@ -1303,20 +1402,20 @@ class _SidePanel extends StatelessWidget {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          nativeClip ? '复制即弹已开启' : '复制链接就弹窗（未开启）',
+                          clipStatus.headline,
                           style: TextStyle(
                             fontSize: 11.5,
                             fontWeight: FontWeight.w700,
-                            color: nativeClip
+                            color: clipStatus.working
                                 ? const Color(0xFF4ADE80)
-                                : Colors.white,
+                                : (clipStatus.enabled
+                                    ? const Color(0xFFFBBF24)
+                                    : Colors.white),
                           ),
                         ),
                         const SizedBox(height: 1),
                         Text(
-                          nativeClip
-                              ? '复制抖音/B站分享文案，屏幕上方会直接问你要不要整理'
-                              : '点一下，开一次无障碍权限就行',
+                          clipStatus.detail,
                           maxLines: 2,
                           style: const TextStyle(
                               fontSize: 9.5, height: 1.4, color: Colors.white38),
@@ -1324,9 +1423,7 @@ class _SidePanel extends StatelessWidget {
                       ],
                     ),
                   ),
-                  if (!nativeClip)
-                    const Icon(Icons.chevron_right,
-                        size: 16, color: Colors.white24),
+                  const Icon(Icons.chevron_right, size: 16, color: Colors.white24),
                 ]),
               ),
             ),
@@ -1529,6 +1626,10 @@ class CulturePlayerPage extends StatefulWidget {
 }
 
 class _CulturePlayerPageState extends State<CulturePlayerPage> {
+  static const String _kPlayerUa =
+      'Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36';
+
   WebViewController? _ctrl;
   int _progress = 0;
   bool _failed = false;
@@ -1537,6 +1638,12 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
   bool _done = false;
   bool _grabbing = false;
   String _grabMsg = '';
+
+  PlayTarget? _target;
+  int _tryIdx = 0; // 0 主地址 / 1 备用地址
+  bool _probing = false;
+  bool _loginMode = false;
+  String _failHint = '';
 
   String get _url => cultureNormalizeUrl('${widget.item['url'] ?? ''}');
 
@@ -1548,43 +1655,150 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
     _init();
   }
 
+  /// 先把链接翻译成「平台自己的播放器页」，再喂给 WebView。
+  ///
+  /// 关键差别：m.bilibili.com 那种落地页满屏「打开App」，点了就跳出；
+  /// blackboard/html5mobileplayer 只有播放器，才叫站内播放。
   Future<void> _init() async {
     if (_url.isEmpty) {
       setState(() => _failed = true);
       return;
     }
+    PlayTarget t;
     try {
-      final c = WebViewController()
-        ..setJavaScriptMode(JavaScriptMode.unrestricted)
-        ..setBackgroundColor(Colors.black)
-        // 用桌面 UA 能少掉一些「打开App」的拦截页；抖音/B站都还能播。
-        ..setUserAgent(
-            'Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 '
-            '(KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36')
-        ..setNavigationDelegate(NavigationDelegate(
-          onProgress: (p) {
-            if (mounted) setState(() => _progress = p);
-          },
-          onPageFinished: (_) => _applyImmersive(),
-          onWebResourceError: (e) {
-            if (e.isForMainFrame == true && mounted) {
-              setState(() => _failed = true);
-            }
-          },
-          onNavigationRequest: (req) {
-            final u = req.url;
-            if (!u.startsWith('http')) {
-              // 自定义 scheme（bytedance:// / bilibili://）留给系统，不在我们这打开。
-              return NavigationDecision.prevent;
-            }
-            return NavigationDecision.navigate;
-          },
-        ))
-        ..loadRequest(Uri.parse(_url));
-      if (mounted) setState(() => _ctrl = c);
+      t = await buildPlayTarget(
+        url: _url,
+        platform: '${widget.item['platform'] ?? ''}',
+        knownExtId: '${widget.item['ext_id'] ?? ''}',
+      );
+    } catch (_) {
+      t = PlayTarget(primary: _url);
+    }
+    if (!mounted) return;
+    setState(() => _target = t);
+    await _bindController();
+  }
+
+  Future<void> _bindController() async {
+    final c = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(Colors.black)
+      // 不带 "wv" 标记的移动 Chrome UA：带 wv 会被一些站点直接判为「内嵌浏览器」
+      // 并强制跳 App。
+      ..setUserAgent(_kPlayerUa)
+      ..setNavigationDelegate(NavigationDelegate(
+        onProgress: (p) {
+          if (mounted) setState(() => _progress = p);
+        },
+        onPageFinished: _afterLoad,
+        onWebResourceError: (e) {
+          if (e.isForMainFrame == true && mounted) {
+            setState(() {
+              _failed = true;
+              _failHint = '页面打不开：${e.description}';
+            });
+          }
+        },
+        onNavigationRequest: (req) {
+          final u = req.url;
+          // bilibili:// bytedance:// snssdk1128:// intent:// market://
+          // 这类都是「把我踢到别的 App」，一律拦下，然后告诉用户已拦。
+          if (!u.startsWith('http')) {
+            _snack('已拦下「跳到其它 App」，这条留在这里看');
+            return NavigationDecision.prevent;
+          }
+          return NavigationDecision.navigate;
+        },
+      ));
+    if (!mounted) return;
+    setState(() => _ctrl = c);
+    await _loadUrl(_target?.primary ?? _url);
+  }
+
+  Future<void> _loadUrl(String u) async {
+    if (u.isEmpty) {
+      setState(() => _failed = true);
+      return;
+    }
+    setState(() {
+      _progress = 0;
+      _failed = false;
+    });
+    try {
+      await _ctrl?.loadRequest(Uri.parse(u));
     } catch (_) {
       if (mounted) setState(() => _failed = true);
     }
+  }
+
+  void _afterLoad(String url) {
+    _applyImmersive();
+    // 登录页自己跳回站内 = 登录完成，自动回到这条视频。
+    if (_loginMode) {
+      final lower = url.toLowerCase();
+      if (!lower.contains('passport') && !lower.contains('login')) {
+        _loginMode = false;
+        _retryFromPrimary();
+      }
+      return;
+    }
+    final t = _target;
+    if (t != null && t.isPlatformPlayer) _probeVideo();
+  }
+
+  /// 平台播放器页加载完不代表真的出画面：
+  /// 页面可能只是白底 + 一句「该视频无法播放」。这里探一次 DOM，
+  /// 没有 <video> 就换备用源，换完还没有才认输。
+  Future<void> _probeVideo() async {
+    if (_probing) return;
+    _probing = true;
+    try {
+      for (final ms in [2200, 4200]) {
+        await Future.delayed(Duration(milliseconds: ms));
+        if (!mounted || _loginMode) return;
+        if (await _hasPlayer()) {
+          if (mounted) setState(() => _failed = false);
+          return;
+        }
+      }
+      if (!mounted) return;
+      final t = _target;
+      if (t != null && t.fallback.isNotEmpty && _tryIdx == 0) {
+        _tryIdx = 1;
+        await _loadUrl(t.fallback);
+        return;
+      }
+      if (!mounted) return;
+      setState(() {
+        _failed = true;
+        _failHint = t != null && t.kind == 'douyin'
+            ? '抖音这个视频没开放站内播放（多数要作者授权或登录）'
+            : 'B站没给画面，可能是这个视频限制了外链播放';
+      });
+    } finally {
+      _probing = false;
+    }
+  }
+
+  Future<bool> _hasPlayer() async {
+    final c = _ctrl;
+    if (c == null) return false;
+    try {
+      final r = await c.runJavaScriptReturningResult(
+          "(function(){var v=document.querySelector('video');"
+          "if(!v) return 'no';"
+          "return 'yes';})()");
+      final s = '$r';
+      // 有 video 元素就算播起来了（src 可能还在协商）。
+      return !s.contains('no');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  void _retryFromPrimary() {
+    _tryIdx = 0;
+    _loadUrl(_target?.primary ?? _url);
   }
 
   /// 沉浸模式：把平台自带的「推荐流 / 下一个视频 / 侧栏」藏掉。
@@ -1701,6 +1915,7 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
   }
 
   /// 平台登录：在同一个 WebView 里打开登录页，cookie 由系统 WebView 持久化。
+  /// 登录页跳回站内后会自动回到这条视频（见 _afterLoad）。
   Future<void> _login() async {
     final p = '${widget.item['platform'] ?? ''}';
     final String url;
@@ -1716,9 +1931,11 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
       url = '${widget.item['url'] ?? ''}';
     }
     try {
-      await _ctrl?.loadRequest(Uri.parse(url));
-      _snack('登录完点返回这条就能看了，cookie 会留着');
+      setState(() => _loginMode = true);
+      await _loadUrl(url);
+      _snack('登录完会自动回到这条');
     } catch (_) {
+      setState(() => _loginMode = false);
       _snack('打不开登录页');
     }
   }
@@ -1779,14 +1996,20 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
                         style: const TextStyle(fontSize: 12.5, color: Colors.white)),
                   ),
                   TextButton(
-                    onPressed: _login,
+                    onPressed: _loginMode
+                        ? () {
+                            setState(() => _loginMode = false);
+                            _retryFromPrimary();
+                          }
+                        : _login,
                     style: TextButton.styleFrom(
                         foregroundColor: Colors.white, minimumSize: Size.zero),
-                    child: const Text('登录', style: TextStyle(fontSize: 11.5)),
+                    child: Text(_loginMode ? '回到视频' : '登录',
+                        style: const TextStyle(fontSize: 11.5)),
                   ),
                   IconButton(
-                    tooltip: '刷新',
-                    onPressed: () => _ctrl?.reload(),
+                    tooltip: '重播',
+                    onPressed: _retryFromPrimary,
                     icon: const Icon(Icons.refresh, size: 19, color: Colors.white70),
                   ),
                 ]),
@@ -1913,33 +2136,54 @@ class _CulturePlayerPageState extends State<CulturePlayerPage> {
   }
 
   Widget _fallback() {
+    final t = _target;
+    final hint = _failHint.isNotEmpty
+        ? _failHint
+        : '这个页面不让站内播放';
+    final why = t != null && t.kind == 'bili'
+        ? 'B站播放器要求登录或限制外链时会这样。登录一次就好，之后会记住。'
+        : (t != null && t.kind == 'douyin'
+            ? '抖音大部分视频只在自己的 App 里播，站内播放器要作者授权。\n链接不会丢，正文仍可取，工具包照样能生成。'
+            : '可以登录后重试，或者先把正文取下来生成工具包。');
     return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(26),
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(26, 90, 26, 110),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Icon(Icons.public_off, size: 46, color: Colors.white24),
+          const Icon(Icons.play_disabled_rounded, size: 44, color: Colors.white24),
           const SizedBox(height: 12),
-          const Text('这一页不让内嵌打开',
-              style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Colors.white)),
-          const SizedBox(height: 6),
-          const Text(
-            '先试试右上角「登录」：这类页面大多登录后才放行。\n'
-            '还是不行的话，链接不会丢，可以复制走。',
-            textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 12, height: 1.7, color: Colors.white54),
-          ),
-          const SizedBox(height: 16),
-          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Text(hint,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                  fontSize: 14, fontWeight: FontWeight.w700, color: Colors.white)),
+          const SizedBox(height: 8),
+          Text(why,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 11.5, height: 1.7, color: Colors.white54)),
+          const SizedBox(height: 18),
+          Wrap(spacing: 8, runSpacing: 8, alignment: WrapAlignment.center, children: [
             FilledButton(
               style: FilledButton.styleFrom(
                   backgroundColor: Colors.white, foregroundColor: Colors.black),
-              onPressed: _login,
-              child: const Text('去登录', style: TextStyle(fontSize: 12.5)),
+              onPressed: _retryFromPrimary,
+              child: const Text('换个源再试', style: TextStyle(fontSize: 12.5)),
             ),
-            const SizedBox(width: 8),
             OutlinedButton(
               style: OutlinedButton.styleFrom(
                   foregroundColor: Colors.white,
+                  side: const BorderSide(color: Colors.white24)),
+              onPressed: _login,
+              child: const Text('登录', style: TextStyle(fontSize: 12.5)),
+            ),
+            OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFF7DD3FC),
+                  side: const BorderSide(color: Color(0x557DD3FC))),
+              onPressed: _openKitStudio,
+              child: const Text('生成工具包', style: TextStyle(fontSize: 12.5)),
+            ),
+            OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.white70,
                   side: const BorderSide(color: Colors.white24)),
               onPressed: () {
                 Clipboard.setData(ClipboardData(text: _url));

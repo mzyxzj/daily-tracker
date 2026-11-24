@@ -55,13 +55,15 @@ def main():
         print("wrote " + name)
 
     res_xml = os.path.join(ROOT, "android/app/src/main/res/xml/clip_service.xml")
+    # 事件类型给全：很多 ROM 复制时只回 typeWindowContentChanged 甚至只回点击事件，
+    # 只监听 typeWindowStateChanged 会整片漏掉。服务启动后还会用代码再设一遍。
     write(res_xml, """<?xml version="1.0" encoding="utf-8"?>
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityEventTypes="typeAllMask"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagDefault"
+    android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
     android:canRetrieveWindowContent="true"
-    android:notificationTimeout="300"
+    android:notificationTimeout="80"
     android:description="@string/dt_clip_service_desc" />
 """)
     print("wrote res/xml/clip_service.xml")
@@ -82,6 +84,9 @@ def main():
 
     perms = [
         "android.permission.INTERNET",
+        # 悬浮条优先用「显示在其他应用上层」窗口类型，MIUI/HyperOS 上比
+        # 无障碍专属窗口更不容易被拦。没授权时自动退回无障碍窗口，不影响使用。
+        "android.permission.SYSTEM_ALERT_WINDOW",
     ]
     for perm in perms:
         if perm not in mf:

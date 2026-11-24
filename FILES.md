@@ -1,39 +1,42 @@
-# Empire-V4.0 覆盖清单（4.0.0）
+# Empire-V4.1 覆盖清单（4.1.0）
 
 整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml` + `.android-inject/`。
 
-> 这一版把「内容引进 / 流量算法 / 分级」三件合成一件：
-> 1. **首页就是流**：竖向全屏一屏一条，上下滑；没有 tab、没有宫格、不用先选库。
->    顶部电量胶囊点一下切换「只看这一档 / 看全部」。
-> 2. **侧边栏**（右上角滑块或右边缘滑出）：复制即弹状态、电量、引进、分级、库、
->    工具包、最近存的，一屏全在。**优质源已删掉。**
-> 3. **内置播放器**：全屏 WebView + 沉浸模式（注入 CSS 隐藏推荐流/评论/侧栏）+
->    登录入口（同 WebView 打开平台登录页，cookie 持久）。
-> 4. **再创作 = DeepSeek**：正文 + 我的笔记 → 步骤 / 模板 / 清单 / 别照搬的部分，
->    流式输出，可存成工具包。
-> 5. **复制即弹**：`.android-inject/` 里的无障碍服务在屏幕上方弹「整理 / 略过」，
->    点整理直接带链接进 App。没开权限时有分享面板 / 前台读取两条兜底。
+> 这一版只修两个「明明做了却没生效」，结构不动：
 >
-> 数据库 14 → **15**：`culture_items` 增 `content_text`，老库 ALTER，不丢数据。
-> 无新增依赖，`url_launcher` 已移除。69 个测试全绿。
+> 1. **站内播放真的在站内**。4.0 把 `m.bilibili.com/video/BV…` 塞进 WebView，那是
+>    手机浏览器落地页，满屏「打开App，流畅又高清」，点一下就跳出去。
+>    现在先翻译成平台自己的播放器页（`lib/player_target.dart`）：
+>    B站走 `blackboard/html5mobileplayer.html`，备用 `player.bilibili.com`；
+>    抖音走 `open.douyin.com/player/video`。短链先跟 302 拿 BV / aweme id。
+>    加载完探 DOM 有没有 `<video>`，没有自动换源；跳 App 的 scheme 全部拦下。
 >
-> 覆盖文件：`lib/culture_feed.dart`（新）、`lib/content_feed.dart`（新）、
-> `lib/native_clip.dart`（新）、`lib/culture_page.dart`、`lib/main.dart`、
-> `lib/content_intake.dart`、`pubspec.yaml`、`README.md`、`FILES.md`、
-> `.github/workflows/build.yml`、`.android-inject/`（3 个文件）。
+> 2. **复制即弹真的会弹**。三个原因都堵了：
+>    ① 服务被 ROM 停了但开关还是「开」→ 分开看 enabled / connected，三态显示；
+>    ② 只监听窗口切换，漏掉 content-changed / 剪贴板回调 → `typeAllMask` + 双路；
+>    ③ 系统不让后台读剪贴板 → 读不到内容也照弹，点「整理」App 到前台再读。
+>    侧边栏状态卡点进去是**自检面板**（服务在不在跑、最近读到剪贴板是多久前、
+>    底层报错、「试一下」立刻弹条验证）。
+>
+> 数据库不动（仍是 15），无新增依赖。79 个测试全绿。
+>
+> 覆盖文件：`lib/player_target.dart`（新）、`lib/culture_feed.dart`、
+> `lib/native_clip.dart`、`lib/main.dart`、`pubspec.yaml`、`README.md`、`FILES.md`、
+> `.android-inject/`（3 个文件）。其余文件未改，可沿用旧包。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
-| `pubspec.yaml` | 426 | `f915efe7e3731cfbb8eea2eeafbb234f` |
-| `README.md` | 20,875 | `19568333922700cca3c7e0c9c06e52fe` |
+| `pubspec.yaml` | 426 | `d8b6fe69742893bda97111b059abc3c5` |
+| `README.md` | 24,793 | `e221f73a68d6aa6446336115b8eeddbb` |
 | `.github/workflows/build.yml` | 5,968 | `d93149eb806ffdb1383547d14650ac71` |
-| `lib/main.dart` | 137,818 | `6c38f5a63dc21b5485a6011254edc0f7` |
+| `lib/main.dart` | 138,272 | `9aca3c8de3857fb7e2d5b61ca74740d0` |
 | `lib/culture_page.dart` | 51,430 | `fe3166f67eb69afd8ea792a02828ae82` |
-| `lib/culture_feed.dart` | 88,090 | `d1c0c872c5f2bc7f7a70c5ceeee3c87b` |
+| `lib/culture_feed.dart` | 97,432 | `658d8368626ab703e614b33fb821d17c` |
 | `lib/content_fetch.dart` | 23,847 | `d4d49bbb91d7c81f4fcd25dfa38d32e0` |
 | `lib/content_feed.dart` | 14,941 | `c477ce3b9f98a85a1099be539f3337a1` |
 | `lib/content_intake.dart` | 23,270 | `e1546f54fcd91d758601a4b4701710b2` |
-| `lib/native_clip.dart` | 2,304 | `83c6053c0ad7da02b2d2fdd135e46f1c` |
+| `lib/native_clip.dart` | 5,896 | `add40db1975d0b306a1801d6a2ade950` |
+| `lib/player_target.dart` | 6,083 | `8bde67ba88f71f882e48bc0ba8c9c8ee` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
 | `lib/deepseek_sheet.dart` | 72,621 | `ccd3d91379d101cfbbc0ada026a813e3` |
 | `lib/empire_page.dart` | 71,718 | `9bab00fac714fa2db5694fe15d00041d` |
@@ -41,9 +44,9 @@
 | `lib/empire_assets.dart` | 897,977 | `61e06d9173a85e0dc101524597d8acc6` |
 | `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
 | `lib/medical_page.dart` | 66,637 | `cac60111718de4e5939b357a29719d6c` |
-| `.android-inject/MainActivity.kt` | 4,453 | `950782a1728c6157be7117dfbaa7bda2` |
-| `.android-inject/ClipWatchService.kt` | 8,089 | `5cb8413b224ac5b1b49bd9e8d4ba7c0a` |
-| `.android-inject/patch.py` | 4,936 | `df5f39d2c8463bfa01763e0df964f46d` |
+| `.android-inject/MainActivity.kt` | 6,156 | `37058ef1dc05f625d14edd9edb223bb3` |
+| `.android-inject/ClipWatchService.kt` | 18,322 | `ddd846aeb0c6c967eefe11ac6d767a31` |
+| `.android-inject/patch.py` | 5,428 | `5d0539fcfcdad9cb4ec05741d61e4bf3` |
 
 
 ## 领地渲染图（L01→L09）

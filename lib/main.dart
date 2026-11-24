@@ -432,6 +432,15 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         if (!share.isEmpty) _onShareFound(share);
       });
     } catch (_) {}
+    // 盲弹（系统不让服务读剪贴板）时，正文要等 Activity 拿到焦点才读到，
+    // 这个时间点可能晚于上面的 getInitial，所以补取一次。
+    Future.delayed(const Duration(milliseconds: 700), () async {
+      if (!mounted) return;
+      final late = await NativeClip.getInitial();
+      if (late.isEmpty) return;
+      final share = parseShareText(late);
+      if (!share.isEmpty) _onShareFound(share);
+    });
   }
 
   @override
