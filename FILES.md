@@ -44,10 +44,9 @@
 | `lib/empire_assets.dart` | 897,977 | `61e06d9173a85e0dc101524597d8acc6` |
 | `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
 | `lib/medical_page.dart` | 66,637 | `cac60111718de4e5939b357a29719d6c` |
-| `.android-inject/MainActivity.kt` | 6,156 | `37058ef1dc05f625d14edd9edb223bb3` |
+| `.android-inject/MainActivity.kt` | 6,547 | `91a263608d1cb2f4220860019ee83e17` |
 | `.android-inject/ClipWatchService.kt` | 18,322 | `ddd846aeb0c6c967eefe11ac6d767a31` |
 | `.android-inject/patch.py` | 5,428 | `5d0539fcfcdad9cb4ec05741d61e4bf3` |
-
 
 ## 领地渲染图（L01→L09）
 

@@ -45,6 +45,16 @@ class MainActivity : FlutterActivity() {
         consumeIntent(intent)
     }
 
+    override fun onResume() {
+        super.onResume()
+        // 盲弹进来时读剪贴板。放在 onResume（Activity 已可见）最稳，
+        // 比 onWindowFocusChanged 早一步，冷启动也能在 Flutter 起来前读到。
+        if (!pendingReadClip) return
+        pendingReadClip = false
+        val text = readClipSafe()
+        if (text.isNotEmpty()) emit(text)
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (!hasFocus || !pendingReadClip) return
