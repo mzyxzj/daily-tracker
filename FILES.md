@@ -22,12 +22,12 @@
 >
 > 覆盖文件：`lib/player_target.dart`（新）、`lib/culture_feed.dart`、
 > `lib/native_clip.dart`、`lib/main.dart`、`pubspec.yaml`、`README.md`、`FILES.md`、
-> `.android-inject/`（3 个文件）。其余文件未改，可沿用旧包。
+> `.android-inject/`（4 个文件，含固定签名密钥）。其余文件未改，可沿用旧包。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
 | `pubspec.yaml` | 426 | `d8b6fe69742893bda97111b059abc3c5` |
-| `README.md` | 24,969 | `221b24990315199b7d4e71729d2c8c2a` |
+| `README.md` | 25,677 | `fedb1e43fe0a93bfea8e6d42cbbfb4ef` |
 | `.github/workflows/build.yml` | 5,968 | `d93149eb806ffdb1383547d14650ac71` |
 | `lib/main.dart` | 138,272 | `9aca3c8de3857fb7e2d5b61ca74740d0` |
 | `lib/culture_page.dart` | 51,430 | `fe3166f67eb69afd8ea792a02828ae82` |
@@ -46,7 +46,8 @@
 | `lib/medical_page.dart` | 66,637 | `cac60111718de4e5939b357a29719d6c` |
 | `.android-inject/MainActivity.kt` | 6,547 | `91a263608d1cb2f4220860019ee83e17` |
 | `.android-inject/ClipWatchService.kt` | 18,322 | `ddd846aeb0c6c967eefe11ac6d767a31` |
-| `.android-inject/patch.py` | 5,428 | `5d0539fcfcdad9cb4ec05741d61e4bf3` |
+| `.android-inject/patch.py` | 7,949 | `52a23e41bd8c09e8455d4c404d15ce89` |
+| `.android-inject/dt-release.jks` | 2,704 | `4ad915351096720f929147c9554d725a` |
 
 ## 领地渲染图（L01→L09）
 
