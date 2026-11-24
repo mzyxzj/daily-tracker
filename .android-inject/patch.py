@@ -9,6 +9,7 @@
 import glob
 import os
 import re
+import shutil
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -75,6 +76,67 @@ def main():
 </resources>
 """)
     print("wrote res/values/dt_strings.xml")
+
+    # ---- 固定签名 ----
+    # 模板默认 release 用 debug keystore，而 CI 每次 runner 的 debug 都是新生成的，
+    # 结果就是「每个版本的签名都不一样」——覆盖安装必失败，卸掉重装就丢数据。
+    # 这里放一把固定密钥，以后所有版本同签名，可以直接覆盖升级。
+    ks_src = os.path.join(HERE, "dt-release.jks")
+    ks_dst = os.path.join(ROOT, "android/app/dt-release.jks")
+    if os.path.exists(ks_src):
+        shutil.copyfile(ks_src, ks_dst)
+        print("wrote app/dt-release.jks")
+
+        gradles = glob.glob(os.path.join(ROOT, "android/app/build.gradle*"))
+        gradles = [g for g in gradles if not g.endswith(".kts")] or gradles
+        if gradles:
+            gp = gradles[0]
+            g = read(gp)
+            kts = gp.endswith(".kts")
+            if "signingConfigs {" not in g:
+                if kts:
+                    sig = """
+    signingConfigs {
+        create("rel") {
+            storeFile = file("dt-release.jks")
+            storePassword = "dt-release-2026"
+            keyAlias = "dt"
+            keyPassword = "dt-release-2026"
+        }
+    }
+"""
+                else:
+                    sig = """
+    signingConfigs {
+        rel {
+            storeFile file("dt-release.jks")
+            storePassword "dt-release-2026"
+            keyAlias "dt"
+            keyPassword "dt-release-2026"
+        }
+    }
+"""
+                m = re.search(r"android\s*\{\n", g)
+                if not m:
+                    fail("android { 块没找到，无法注入签名配置")
+                g = g[:m.end()] + sig + g[m.end():]
+                print("added signingConfigs")
+
+            if kts:
+                g = g.replace("signingConfig = signingConfigs.debug",
+                              'signingConfig = signingConfigs.getByName("rel")')
+            else:
+                g = g.replace("signingConfig = signingConfigs.debug",
+                              "signingConfig = signingConfigs.rel")
+                g = g.replace("signingConfig signingConfigs.debug",
+                              "signingConfig signingConfigs.rel")
+            write(gp, g)
+            if "signingConfigs.rel" not in g and 'signingConfigs.getByName("rel")' not in g:
+                print("WARN: build.gradle 里没找到 debug 签名行，release 可能仍用 debug key")
+            else:
+                print("release signing -> dt-release.jks")
+    else:
+        print("no dt-release.jks, keep template signing")
 
     manifest = os.path.join(ROOT, "android/app/src/main/AndroidManifest.xml")
     if not os.path.exists(manifest):

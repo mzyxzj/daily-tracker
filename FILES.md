@@ -18,7 +18,7 @@
 >    侧边栏状态卡点进去是**自检面板**（服务在不在跑、最近读到剪贴板是多久前、
 >    底层报错、「试一下」立刻弹条验证）。
 >
-> 数据库不动（仍是 15），无新增依赖。79 个测试全绿。
+> 数据库不动（仍是 15），无新增依赖。80 个测试全绿。
 >
 > 覆盖文件：`lib/player_target.dart`（新）、`lib/culture_feed.dart`、
 > `lib/native_clip.dart`、`lib/main.dart`、`pubspec.yaml`、`README.md`、`FILES.md`、
