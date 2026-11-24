@@ -2,6 +2,49 @@
 
 本仓库只放源码（lib / pubspec / CI），Android 工程由 CI 里的 `flutter create` 生成。
 
+## 4.2.0 · 复制即弹换了实现 + 滑到即播 + 应用内升级（Empire-V4.2）
+
+### 1. 复制了没反应：不再用悬浮窗，改成透明 Activity
+
+4.1 的自检面板在一加 13T 上显示「弹过悬浮条 25 秒前」，但屏幕上什么都没有。
+原因：`TYPE_APPLICATION_OVERLAY` / `TYPE_ACCESSIBILITY_OVERLAY` 在 ColorOS / 氧OS 上
+`addView` 会成功返回、窗口却不可见，日志一切正常。
+
+现在换成 `ClipPromptActivity`（透明主题的真实窗口）：
+
+- 拿「显示在其他应用上层」权限后，Android 10+ 允许它从后台起界面，盖在 B站/抖音 上面；
+- 12 秒自动消失，点空白处消失，「整理」直接把链接交回 App；
+- 复制到链接时**先振动一下**，视觉被吞也能感知；
+- 启动失败（ColorOS「后台弹出界面」关着）会把原因写进自检面板的「底层报错」，不再静默。
+
+### 2. 滑到哪就播哪，不用点两下
+
+流里的视频条目现在直接在卡片里挂 WebView：滑到这一页自动播放，滑走就暂停、页面销毁一起回收。
+关键一步是关掉 WebView 的「必须用户手势」限制（`setMediaPlaybackRequiresUserGesture(false)`），
+否则自动播放会被静默拦掉，表现为「画面在、就是不动」。
+播放器页做三级换源，加载完把 `video` 拉满全屏并补一次 `play()`（失败再静音重试）。
+
+### 3. 全屏按钮真的能全屏了
+
+B站播放器自带的那个全屏按钮在 WebView 里无效（JS fullscreen 需要宿主实现 `onShowCustomView`，
+webview_flutter 没暴露）。所以在播放器右下角放了**自己的全屏按钮**：
+横屏 + 沉浸式 + 收起所有浮层，返回键先退全屏。
+
+### 4. 应用内升级：不用再卸载重装导数据
+
+侧栏 →「检查更新」：
+
+- 读 GitHub Release 最新版，比版本号；
+- 就地下载 APK（带进度），交给系统安装器覆盖安装（签名固定，数据不丢）；
+- 第一次需要允许「安装未知应用」，点一下会直接跳到那个开关；
+- 连不上 GitHub 时给出「去网页看」，不会卡死在转圈。
+
+### 构建
+
+`.android-inject/` 里新增 `ClipPromptActivity.kt` / `ApkProvider.kt`，
+`patch.py` 会连 Activity、ContentProvider、`VIBRATE`、`REQUEST_INSTALL_PACKAGES` 一起注进去。
+CI 出包后按 pubspec 版本自动发 Release（`V4.2.0`）。
+
 ## 4.1.0 · 修两个「明明做了却没生效」（Empire-V4.1）
 
 ### 1. 播放器：不再加载「打开App」的落地页

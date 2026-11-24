@@ -1,42 +1,44 @@
-# Empire-V4.1 覆盖清单（4.1.0）
+# Empire-V4.2 覆盖清单（4.2.0）
 
 整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml` + `.android-inject/`。
 
-> 这一版只修两个「明明做了却没生效」，结构不动：
+> 这一版修三件「点了没用 / 根本没有」的事，另外补了应用内升级：
 >
-> 1. **站内播放真的在站内**。4.0 把 `m.bilibili.com/video/BV…` 塞进 WebView，那是
->    手机浏览器落地页，满屏「打开App，流畅又高清」，点一下就跳出去。
->    现在先翻译成平台自己的播放器页（`lib/player_target.dart`）：
->    B站走 `blackboard/html5mobileplayer.html` → `player.bilibili.com` → 桌面版三级兜底；
->    抖音走 `open.douyin.com/player/video`。短链先跟 302 拿 BV / aweme id。
->    加载完探 DOM 有没有 `<video>`，没有自动换源；跳 App 的 scheme 全部拦下。
+> 1. **复制即弹：悬浮窗改用透明 Activity**。一加 13T 上自检显示「弹过悬浮条 25 秒前」，
+>    但屏幕什么都没有——ColorOS/氧OS 上 `addView` 成功、窗口不可见。
+>    现在改 `ClipPromptActivity`（真实窗口，12 秒自动消失，复制时先振动），
+>    起不来会把原因写进自检的「底层报错」。
 >
-> 2. **复制即弹真的会弹**。三个原因都堵了：
->    ① 服务被 ROM 停了但开关还是「开」→ 分开看 enabled / connected，三态显示；
->    ② 只监听窗口切换，漏掉 content-changed / 剪贴板回调 → `typeAllMask` + 双路；
->    ③ 系统不让后台读剪贴板 → 读不到内容也照弹，点「整理」App 到前台再读。
->    侧边栏状态卡点进去是**自检面板**（服务在不在跑、最近读到剪贴板是多久前、
->    底层报错、「试一下」立刻弹条验证）。
+> 2. **滑到就播**。视频条目在流里直接挂 WebView，划到即自动播放、划走暂停回收；
+>    关键是不让 WebView 要求用户手势，否则自动播放被静默拦掉。
 >
-> 数据库不动（仍是 15），无新增依赖。80 个测试全绿。
+> 3. **全屏真的能全屏**。B站自带的全屏按钮在 WebView 里无效（缺少 onShowCustomView 宿主实现），
+>    换成播放器右下角的 Flutter 全屏：横屏 + 沉浸 + 收起浮层，返回键先退全屏。
 >
-> 覆盖文件：`lib/player_target.dart`（新）、`lib/culture_feed.dart`、
-> `lib/native_clip.dart`、`lib/main.dart`、`pubspec.yaml`、`README.md`、`FILES.md`、
-> `.android-inject/`（4 个文件，含固定签名密钥）。其余文件未改，可沿用旧包。
+> 4. **应用内升级**。侧栏「检查更新」→ 读 Release → 就地下载 → 系统安装器覆盖安装，
+>    不用再卸载重装导数据。
+>
+> 数据库不动（仍是 15）；新增依赖 `webview_flutter_android`（为了关掉手势限制）。
+> 80 个测试全绿。
+>
+> 覆盖文件：`lib/app_update.dart`（新）、`lib/culture_feed.dart`、`lib/native_clip.dart`、
+> `pubspec.yaml`、`README.md`、`FILES.md`、`.android-inject/`（6 个文件，
+> 新增 `ClipPromptActivity.kt` / `ApkProvider.kt`）。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
-| `pubspec.yaml` | 426 | `d8b6fe69742893bda97111b059abc3c5` |
-| `README.md` | 25,677 | `fedb1e43fe0a93bfea8e6d42cbbfb4ef` |
-| `.github/workflows/build.yml` | 9,397 | `b0f49ce538ead060411ecf762bb5d2c6` |
+| `pubspec.yaml` | 558 | `5fc1d51289906cc6d9134445dbff80e1` |
+| `README.md` | 28,064 | `c69995ec854ac711f4087f49767c9d9c` |
+| `.github/workflows/build.yml` | 9,510 | `8bf57bcb3475baac480584878f35875b` |
 | `lib/main.dart` | 138,272 | `9aca3c8de3857fb7e2d5b61ca74740d0` |
 | `lib/culture_page.dart` | 51,430 | `fe3166f67eb69afd8ea792a02828ae82` |
-| `lib/culture_feed.dart` | 98,801 | `e17c13098e5e465463fc5a63a00e205f` |
+| `lib/culture_feed.dart` | 109,665 | `a25018f75f890d5b4ac1013bbd5d783a` |
 | `lib/content_fetch.dart` | 23,847 | `d4d49bbb91d7c81f4fcd25dfa38d32e0` |
 | `lib/content_feed.dart` | 14,941 | `c477ce3b9f98a85a1099be539f3337a1` |
 | `lib/content_intake.dart` | 23,270 | `e1546f54fcd91d758601a4b4701710b2` |
-| `lib/native_clip.dart` | 5,896 | `add40db1975d0b306a1801d6a2ade950` |
+| `lib/native_clip.dart` | 5,921 | `df17a3904bf6195a7bc50340b026bf28` |
 | `lib/player_target.dart` | 6,481 | `bbfbb1328e00507d5e1d6aec0bcead12` |
+| `lib/app_update.dart` | 14,455 | `a931e3cabb03f54bf7d81073af50427b` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
 | `lib/deepseek_sheet.dart` | 72,621 | `ccd3d91379d101cfbbc0ada026a813e3` |
 | `lib/empire_page.dart` | 71,718 | `9bab00fac714fa2db5694fe15d00041d` |
@@ -44,9 +46,11 @@
 | `lib/empire_assets.dart` | 897,977 | `61e06d9173a85e0dc101524597d8acc6` |
 | `lib/pages_extra.dart` | 138,365 | `b0f000e5b91e1c8b3575c3cefb5712e6` |
 | `lib/medical_page.dart` | 66,637 | `cac60111718de4e5939b357a29719d6c` |
-| `.android-inject/MainActivity.kt` | 6,547 | `91a263608d1cb2f4220860019ee83e17` |
-| `.android-inject/ClipWatchService.kt` | 18,412 | `947c5af56e0c913a1747d6b645bdc9af` |
-| `.android-inject/patch.py` | 9,273 | `3cc8e95bc4acb5da7be5fb72be0c9118` |
+| `.android-inject/MainActivity.kt` | 9,945 | `8c64574d15106326d703fa389f51a881` |
+| `.android-inject/ClipWatchService.kt` | 15,968 | `7384ba7330204a0a613c07c814ab76f8` |
+| `.android-inject/ClipPromptActivity.kt` | 6,307 | `c6095c4dce6736b8be9ca84300dedfc2` |
+| `.android-inject/ApkProvider.kt` | 1,937 | `7c62fa727307282c4ac3b31494cd6b2b` |
+| `.android-inject/patch.py` | 10,757 | `e9e6fcd46518f66385d2d76c87206083` |
 | `.android-inject/dt-release.jks` | 2,704 | `4ad915351096720f929147c9554d725a` |
 
 ## 领地渲染图（L01→L09）

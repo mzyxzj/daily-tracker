@@ -165,17 +165,18 @@ jobs:
           fi
 
       # 把 APK 直接挂到 Release 上：Actions 产物要登录才能下，Release 是公开直链。
-      # 只在 Empire-V4.1 分支上做，避免别的分支乱发版。
+      # 标签从 pubspec 的 version 取（4.2.0 -> V4.2.0），只在 Empire-V* 分支上发版。
       - name: Attach APK to release
-        if: github.ref_name == 'Empire-V4.1'
+        if: startsWith(github.ref_name, 'Empire-V')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG=V4.1.0
+          TAG=$(sed -n 's/^version: *\([0-9][0-9.]*\).*/V\1/p' pubspec.yaml | head -1)
+          echo "tag=$TAG"
           gh release view "$TAG" > /dev/null 2>&1 \
-            || gh release create "$TAG" --target "$GITHUB_SHA" --title "帝国 V4.1.0 · 站内播放 + 复制即弹"
+            || gh release create "$TAG" --target "$GITHUB_SHA" --title "帝国 $TAG" --notes "更新说明见仓库 README。"
           gh release upload "$TAG" build/app/outputs/flutter-apk/app-release.apk --clobber
-          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size) \(.browserDownloadUrl)"'
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"'
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

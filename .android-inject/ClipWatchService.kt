@@ -9,6 +9,8 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
@@ -40,7 +42,7 @@ import android.widget.TextView
  */
 class ClipWatchService : AccessibilityService() {
 
-    private var overlay: View? = null
+    private var promptShowing: Boolean = false
     private var wm: WindowManager? = null
     private var listener: ClipboardManager.OnPrimaryClipChangedListener? = null
     private val handler = Handler(Looper.getMainLooper())
@@ -129,7 +131,7 @@ class ClipWatchService : AccessibilityService() {
             listener?.let { cm.removePrimaryClipChangedListener(it) }
         } catch (e: Exception) {
         }
-        hideOverlay()
+        promptShowing = false
     }
 
     private fun readClipText(): String {
@@ -146,7 +148,7 @@ class ClipWatchService : AccessibilityService() {
     }
 
     private fun checkClip(force: Boolean, reason: String) {
-        if (overlay != null) return
+        if (promptShowing) return
         val now = System.currentTimeMillis()
         if (!force && now - lastCheckAt < 150) return
         lastCheckAt = now
@@ -163,7 +165,7 @@ class ClipWatchService : AccessibilityService() {
             if (text == lastText && now - lastAt < 20000) return
             lastText = text
             lastAt = now
-            showOverlay(text)
+            showPrompt(text)
             return
         }
 
@@ -176,7 +178,7 @@ class ClipWatchService : AccessibilityService() {
         blindPkg = lastPkg
         lastBlindAt = now
         err = "clipboard may be blocked by system"
-        showOverlay("")
+        showPrompt("")
     }
 
     private fun looksLikeShare(text: String): Boolean {
@@ -235,119 +237,50 @@ class ClipWatchService : AccessibilityService() {
         }
     }
 
-    private fun showOverlay(text: String) {
-        if (overlay != null) return
-        val blind = text.isEmpty()
-        val plat = if (blind) "" else platformOf(text)
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(13), dp(9), dp(8), dp(9))
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#F21E293B"))
-                cornerRadius = dp(16).toFloat()
-                setStroke(dp(1), Color.parseColor("#33FFFFFF"))
-            }
-        }
-        val col = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
-            )
-        }
-        val head = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            textSize = 13f
-            setText(if (blind) "复制了内容 · 要整理进文化吗？" else "这条要整理进「文化」吗？")
-        }
-        val sub = TextView(this).apply {
-            setTextColor(Color.parseColor("#94A3B8"))
-            textSize = 10f
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-            setPadding(0, dp(2), 0, 0)
-            if (blind) {
-                setText("系统不让后台读剪贴板 · 点整理后自动接上")
-            } else {
-                val brief = text.replace("\n", " ").trim()
-                val cut = if (brief.length > 28) brief.substring(0, 28) + "…" else brief
-                setText(if (plat.isEmpty()) cut else plat + " · " + cut)
-            }
-        }
-        col.addView(head)
-        col.addView(sub)
-
-        val go = TextView(this).apply {
-            setTextColor(Color.parseColor("#0B0F17"))
-            textSize = 12.5f
-            setText("整理")
-            isClickable = true
-            setPadding(dp(14), dp(7), dp(14), dp(7))
-            background = GradientDrawable().apply {
-                setColor(Color.WHITE)
-                cornerRadius = dp(13).toFloat()
-            }
-        }
-        val no = TextView(this).apply {
-            setTextColor(Color.parseColor("#94A3B8"))
-            textSize = 12f
-            setText("略过")
-            isClickable = true
-            setPadding(dp(9), dp(7), dp(9), dp(7))
-        }
-        go.setOnClickListener { openApp(text, blind); hideOverlay() }
-        no.setOnClickListener { hideOverlay() }
-
-        root.addView(col)
-        root.addView(go)
-        root.addView(no)
-
-        if (!addOverlayView(root)) return
-        overlay = root
-        handler.postDelayed({ hideOverlay() }, 10000)
-    }
-
-    /// 两种窗口类型都试一遍：
-    /// 有「显示在其他应用上层」权限就优先用 APPLICATION_OVERLAY（MIUI 上更稳），
-    /// 没有就退回无障碍专属的 ACCESSIBILITY_OVERLAY（不需要额外授权）。
-    private fun addOverlayView(v: View): Boolean {
-        val types = ArrayList<Int>()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && canOverlay()) {
-            types.add(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
-            types.add(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-        }
-        if (types.isEmpty()) types.add(WindowManager.LayoutParams.TYPE_PHONE)
-        for (type in types) {
-            val lp = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                type,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                PixelFormat.TRANSLUCENT
-            )
-            lp.gravity = Gravity.TOP
-            lp.x = dp(10)
-            lp.y = statusBarHeight() + dp(6)
-            try {
-                wm?.addView(v, lp)
-                lastOverlayAt = System.currentTimeMillis()
-                return true
-            } catch (e: Exception) {
-                err = "addView(type=" + type + "): " + e.message
-            }
-        }
-        return false
-    }
-
-    private fun hideOverlay() {
-        val v = overlay ?: return
-        overlay = null
+    /// 弹提示卡。
+    ///
+    /// 不用悬浮窗：一加/ColorOS 上 addView 会「成功」但窗口不可见，
+    /// 日志一切正常、用户什么也看不到。这里改成启动一个透明 Activity，
+    /// 那是真窗口，只要有「显示在其他应用上层」权限就能盖住 B站/抖音。
+    private fun showPrompt(text: String) {
+        if (promptShowing) return
+        promptShowing = true
+        lastOverlayAt = System.currentTimeMillis()
+        buzz()
         try {
-            wm?.removeView(v)
+            val i = Intent(this, ClipPromptActivity::class.java)
+            i.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_NO_ANIMATION
+            )
+            if (text.isNotEmpty()) {
+                i.putExtra(MainActivity.EXTRA_TEXT, text)
+                val p = platformOf(text)
+                if (p.isNotEmpty()) i.putExtra(ClipPromptActivity.EXTRA_PLATFORM, p)
+            } else {
+                i.putExtra(MainActivity.EXTRA_READ_CLIP, true)
+            }
+            startActivity(i)
+            err = ""
+        } catch (e: Exception) {
+            // 后台启动 Activity 被拦（ColorOS「后台弹出界面」关着）时，
+            // 至少把原因写进自检面板，别静默。
+            err = "startPrompt: " + (e.message ?: e.javaClass.simpleName)
+        }
+        handler.postDelayed({ promptShowing = false }, 13000)
+    }
+
+    /// 抖一下：即使视觉被系统吞了，手上也有反馈。
+    private fun buzz() {
+        try {
+            val v = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                v.vibrate(VibrationEffect.createOneShot(45, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                v.vibrate(45)
+            }
         } catch (e: Exception) {
         }
     }
@@ -406,7 +339,7 @@ class ClipWatchService : AccessibilityService() {
         /// App 里点「试一下」：立刻弹一条示例，验证悬浮条能不能显示。
         fun test(): Boolean {
             val s = instance ?: return false
-            s.handler.post { s.showOverlay("B站 · 这是一条测试，点「整理」看看能不能进来") }
+            s.handler.post { s.showPrompt("B站 · 这是一条测试，点「整理」看看能不能进来") }
             return true
         }
 

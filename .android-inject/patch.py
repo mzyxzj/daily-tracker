@@ -50,7 +50,8 @@ def main():
     print("package = " + pkg)
     print("dir     = " + pkg_dir)
 
-    for name in ("MainActivity.kt", "ClipWatchService.kt"):
+    for name in ("MainActivity.kt", "ClipWatchService.kt",
+                 "ClipPromptActivity.kt", "ApkProvider.kt"):
         body = read(os.path.join(HERE, name)).replace("__PKG__", pkg)
         write(os.path.join(pkg_dir, name), body)
         print("wrote " + name)
@@ -170,6 +171,10 @@ def main():
         # 悬浮条优先用「显示在其他应用上层」窗口类型，MIUI/HyperOS 上比
         # 无障碍专属窗口更不容易被拦。没授权时自动退回无障碍窗口，不影响使用。
         "android.permission.SYSTEM_ALERT_WINDOW",
+        # 复制到链接时抖一下，视觉被系统吞了也知道有反应。
+        "android.permission.VIBRATE",
+        # App 内检查更新后直接装新包（还要用户在系统里开「安装未知应用」）。
+        "android.permission.REQUEST_INSTALL_PACKAGES",
     ]
     for perm in perms:
         if perm not in mf:
@@ -197,6 +202,36 @@ def main():
         mf = mf.replace("</application>", service + "    </application>", 1)
         changed = True
         print("added ClipWatchService")
+
+    if 'android:name=".ClipPromptActivity"' not in mf:
+        prompt = """        <activity
+            android:name=".ClipPromptActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+"""
+        if "</application>" not in mf:
+            fail("</application> 没找到")
+        mf = mf.replace("</application>", prompt + "    </application>", 1)
+        changed = True
+        print("added ClipPromptActivity")
+
+    if 'android:name=".ApkProvider"' not in mf:
+        provider = """        <provider
+            android:name=".ApkProvider"
+            android:authorities="${applicationId}.apk"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+"""
+        if "</application>" not in mf:
+            fail("</application> 没找到")
+        mf = mf.replace("</application>", provider + "    </application>", 1)
+        changed = True
+        print("added ApkProvider")
+
 
     if "android.intent.action.SEND" not in mf:
         send_filter = """            <intent-filter>

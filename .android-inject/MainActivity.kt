@@ -11,6 +11,7 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 
 /**
  * 和 Flutter 的桥：
@@ -133,6 +134,35 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // App 自身的事：版本号、装新包、开外链。
+        MethodChannel(messenger, "daily_tracker/app").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "version" -> {
+                    val pi = packageManager.getPackageInfo(packageName, 0)
+                    val m = HashMap<String, Any>()
+                    m["name"] = pi.versionName ?: ""
+                    m["code"] = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        pi.longVersionCode
+                    } else {
+                        @Suppress("DEPRECATION")
+                        pi.versionCode.toLong()
+                    }
+                    result.success(m)
+                }
+                "canInstall" -> result.success(canInstallApk())
+                "openInstallSettings" -> result.success(openInstallSettings())
+                "installApk" -> {
+                    val name = call.argument<String>("name") ?: ""
+                    result.success(installApk(name))
+                }
+                "openUrl" -> {
+                    val u = call.argument<String>("url") ?: ""
+                    result.success(openUrl(u))
+                }
+                else -> result.notImplemented()
+            }
+        }
+
         EventChannel(messenger, "daily_tracker/clip_events").setStreamHandler(
             object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
@@ -148,6 +178,65 @@ class MainActivity : FlutterActivity() {
                 }
             }
         )
+    }
+
+    /// 装新包：系统安装器只认 content://，且要「安装未知应用」权限。
+    private fun installApk(name: String): Boolean {
+        return try {
+            if (name.isEmpty() || name.contains('/') || name.contains("..")) return false
+            val f = File(cacheDir, name)
+            if (!f.exists()) return false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+                // 没授权就先带用户去开，回来再点一次即可。
+                openInstallSettings()
+                return false
+            }
+            val i = Intent(Intent.ACTION_VIEW)
+            i.setDataAndType(ApkProvider.uriFor(packageName, name),
+                "application/vnd.android.package-archive")
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(i)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun canInstallApk(): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                packageManager.canRequestPackageInstalls()
+            } else {
+                true
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun openInstallSettings(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
+        return try {
+            val i = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                Uri.parse("package:" + packageName))
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(i)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun openUrl(url: String): Boolean {
+        if (!url.startsWith("http")) return false
+        return try {
+            val i = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(i)
+            true
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun openAccessibilitySettings(): Boolean {

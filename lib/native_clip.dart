@@ -4,7 +4,7 @@
 // Android 10 起，普通 App 在后台读剪贴板会被系统拦掉（还会弹「已粘贴」提示）。
 // 所以「复制链接的那一刻就问我」只能由系统级组件来做：
 //   - AccessibilityService（无障碍）在任意 App 里监听剪贴板变化，
-//   - 再用悬浮条（无障碍窗口，或 SYSTEM_ALERT_WINDOW）在屏幕上方弹一个小条，
+//   - 再起一个透明 Activity（需要 SYSTEM_ALERT_WINDOW 才能后台起）在屏幕上方弹提示卡，
 //   - 点「整理」才启动 App，并把链接作为 Intent extra 传进来。
 //
 // 这个文件只是 Flutter 侧的薄封装：
@@ -12,7 +12,7 @@
 //   events        运行中服务读到链接时推过来
 //   isEnabled     无障碍服务有没有被用户打开
 //   status()      自检：开没开、服务连没连上、最近一次读到剪贴板是多久前
-//   test()        立刻弹一条示例悬浮条，验证桌面能不能显示
+//   test()        立刻弹一条示例提示卡，验证到底能不能显示
 //   openSettings  跳到系统的无障碍设置页
 //
 // 原生没注入（iOS / 桌面 / 单元测试）时全部静默失败，不抛异常。
@@ -31,7 +31,7 @@ class ClipStatus {
   final bool connected;
   final bool overlayPermission;
 
-  /// 距离上次事件 / 读到剪贴板 / 弹出悬浮条过了多少秒；-1 表示从未。
+  /// 距离上次事件 / 读到剪贴板 / 弹出提示卡过了多少秒；-1 表示从未。
   final int lastEventAgo;
   final int lastClipAgo;
   final int lastOverlayAgo;
@@ -127,7 +127,7 @@ class NativeClip {
     }
   }
 
-  /// 让服务立刻弹一条示例，用来确认悬浮条真的能显示。
+  /// 让服务立刻弹一条示例，用来确认提示卡真的能显示。
   /// 返回 false 说明服务没在跑。
   static Future<bool> test() async {
     try {
@@ -158,7 +158,7 @@ class NativeClip {
     }
   }
 
-  /// 跳「显示在其他应用上层」授权页（可选，给了悬浮条更稳）。
+  /// 跳「显示在其他应用上层」授权页（可选，给了之后后台才能起提示卡）。
   static Future<bool> openOverlaySettings() async {
     try {
       final v = await _m.invokeMethod<bool>('openOverlaySettings');

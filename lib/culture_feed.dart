@@ -13,7 +13,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_android/webview_flutter_android.dart';
 
+import 'app_update.dart';
 import 'content_feed.dart';
 import 'content_fetch.dart';
 import 'content_intake.dart';
@@ -49,6 +51,8 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
   ClipStatus _clipStatus = const ClipStatus(); // 「复制即弹」的真实状态
   bool _loading = true;
   int _page = 0;
+  // 全屏：只留视频，横屏 + 沉浸，其他 UI 全收起来
+  bool _full = false;
 
   CultureFeedResult _feed = const CultureFeedResult();
 
@@ -636,7 +640,7 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
   /// 「复制就弹」自检面板。
   ///
   /// 用户报「复制了没弹」时，光看一个「已开启」的勾是没用的——真正要确认的是
-  /// 服务进程还活着、能不能读剪贴板、悬浮条能不能加上去。这三件事分开显示。
+  /// 服务进程还活着、能不能读剪贴板、浮层权限给没给。这三件事分开显示。
   Future<void> _showClipDiag() async {
     var st = _clipStatus;
     await showDialog<void>(
@@ -686,13 +690,13 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
                     good: st.enabled, bad: !st.enabled),
                 row('服务是否在跑', st.connected ? '在跑' : '没连上',
                     good: st.connected, bad: !st.connected),
-                row('悬浮条权限', st.overlayPermission ? '已授权' : '未授权',
+                row('浮层权限', st.overlayPermission ? '已授权' : '未授权',
                     good: st.overlayPermission, bad: false),
                 const Divider(color: Colors.white10, height: 16),
                 row('最近一次系统事件', ago(st.lastEventAgo)),
                 row('最近读到剪贴板', ago(st.lastClipAgo),
                     bad: st.lastClipAgo < 0 && st.enabled),
-                row('最近弹过悬浮条', ago(st.lastOverlayAgo)),
+                row('最近弹过提示卡', ago(st.lastOverlayAgo)),
                 if (st.lastPkg.isNotEmpty) row('最近前台 App', st.lastPkg),
                 if (st.error.isNotEmpty)
                   Padding(
@@ -714,7 +718,7 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
                         : (!st.enabled
                             ? '还没开启。点下面「去开启」，在系统列表里找到「文化 · 复制即整理」打开。'
                             : (noOverlay
-                                ? '已经能用。再给一个「显示在其他应用上层」权限，悬浮条在部分机型上更稳。'
+                                ? '已经能用。再给一个「显示在其他应用上层」权限，提示卡能从后台弹出来（安卓 10 起后台起界面的前提）。'
                                 : '一切正常。复制一条抖音/B站分享链接试试，屏幕上方会立刻出现「整理 / 略过」。')),
                     style: const TextStyle(
                         fontSize: 10.5, height: 1.65, color: Colors.white60),
@@ -731,7 +735,7 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
                 onPressed: () async {
                   await NativeClip.openOverlaySettings();
                 },
-                child: const Text('悬浮条权限'),
+                child: const Text('浮层权限'),
               ),
             if (st.connected)
               TextButton(
@@ -780,7 +784,12 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
   @override
   Widget build(BuildContext context) {
     final feed = _feed;
-    return Scaffold(
+    return PopScope(
+      canPop: !_full,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _full) _setFull(false);
+      },
+      child: Scaffold(
       key: _scaffold,
       backgroundColor: kFeedBg,
       endDrawer: _SidePanel(
@@ -825,6 +834,10 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
           Navigator.pop(context);
           _editItem(item);
         },
+        onCheckUpdate: () {
+          Navigator.pop(context);
+          showUpdateDialog(context);
+        },
       ),
       body: _loading
           ? const Center(
@@ -840,8 +853,41 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
                   onPageChanged: (i) => setState(() => _page = i),
                   itemBuilder: (ctx, i) => _feedCard(feed.entries[i], i),
                 ),
-              _topBar(),
+              if (!_full) _topBar(),
+              if (_full) _exitFullButton(),
             ]),
+      ),
+    );
+  }
+
+  /// 全屏：横屏 + 沉浸，只留画面；返回键/右上角都能退出。
+  Future<void> _setFull(bool on) async {
+    if (!mounted) return;
+    setState(() => _full = on);
+    try {
+      if (on) {
+        await SystemChrome.setPreferredOrientations(
+            [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
+        await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      } else {
+        await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+        await SystemChrome.setPreferredOrientations(
+            [DeviceOrientation.portraitUp]);
+      }
+    } catch (_) {}
+  }
+
+  Widget _exitFullButton() {
+    return Positioned(
+      right: 10,
+      top: 10,
+      child: SafeArea(
+        child: IconButton(
+          tooltip: '退出全屏',
+          onPressed: () => _setFull(false),
+          icon: const Icon(Icons.fullscreen_exit, size: 22, color: Colors.white70),
+        ),
+      ),
     );
   }
 
@@ -922,10 +968,21 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
     final isVideo = looksLikeVideo(item);
     final dur = '${item['duration'] ?? ''}'.trim();
     final size = MediaQuery.of(context).size;
+    // 只有当前这一页才真的挂 WebView：滑走就销毁，10 条也不会同时播 10 个。
+    final inline = isVideo && index == _page;
 
     return Stack(fit: StackFit.expand, children: [
+      if (inline)
+        _InlineVideo(
+          key: ValueKey('pv-${item['id']}-$index'),
+          item: Map<String, dynamic>.from(item as Map),
+          active: true,
+          full: _full,
+          onFull: () => _setFull(!_full),
+          onFallback: () => _openPlayer(e),
+        )
       // 背景：有封面就铺满并压暗；没封面用平台渐变。
-      if (cover.isNotEmpty)
+      else if (cover.isNotEmpty)
         Image.network(
           cover,
           fit: BoxFit.cover,
@@ -935,23 +992,32 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
         )
       else
         _gradientBg(pColor),
-      // 上下压暗，保证白字可读。
-      const DecoratedBox(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            stops: [0, 0.28, 0.58, 1],
-            colors: [
-              Color(0x99000000),
-              Color(0x22000000),
-              Color(0xAA000000),
-              Color(0xF20B0F17),
-            ],
+      // 上下压暗，保证白字可读；内嵌播放时只留底部一条，别糊住画面。
+      if (!_full)
+        DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              stops: inline ? const [0, 0.55, 0.75, 1] : const [0, 0.28, 0.58, 1],
+              colors: inline
+                  ? const [
+                      Color(0x55000000),
+                      Color(0x00000000),
+                      Color(0x99000000),
+                      Color(0xF20B0F17),
+                    ]
+                  : const [
+                      Color(0x99000000),
+                      Color(0x22000000),
+                      Color(0xAA000000),
+                      Color(0xF20B0F17),
+                    ],
+            ),
           ),
         ),
-      ),
-      // 中间：播放/阅读按钮
+      // 中间：播放/阅读按钮（内嵌播放器在跑时不需要）
+      if (!inline)
       Center(
         child: GestureDetector(
           onTap: () => _openPlayer(e),
@@ -969,6 +1035,7 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
         ),
       ),
       // 底部信息
+      if (!_full)
       Positioned(
         left: 0,
         right: 0,
@@ -1058,6 +1125,7 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
         ),
       ),
       // 右侧竖排操作（抖音式）
+      if (!_full)
       Positioned(
         right: 8,
         bottom: 196,
@@ -1313,6 +1381,7 @@ class _SidePanel extends StatelessWidget {
   final void Function(Map g) onEditGrade;
   final VoidCallback onOpenKits;
   final void Function(Map item) onEditItem;
+  final VoidCallback onCheckUpdate;
 
   const _SidePanel({
     required this.libs,
@@ -1332,6 +1401,7 @@ class _SidePanel extends StatelessWidget {
     required this.onEditGrade,
     required this.onOpenKits,
     required this.onEditItem,
+    required this.onCheckUpdate,
   });
 
   @override
@@ -1544,6 +1614,8 @@ class _SidePanel extends StatelessWidget {
             _sectionTitle('再创作'),
             _row(Icons.build_outlined, '工具包 ${kits.length} 个',
                 'DeepSeek 把内容和你的笔记变成能执行的东西', onOpenKits),
+            _row(Icons.system_update_alt, '检查更新',
+                '有新版就地下载覆盖安装，不用卸载重装', onCheckUpdate),
             const SizedBox(height: 16),
             _sectionTitle('最近存的'),
             for (final it in items.take(6))
@@ -1602,6 +1674,277 @@ class _SidePanel extends StatelessWidget {
             ]),
           ),
           const Icon(Icons.chevron_right, size: 16, color: Colors.white24),
+        ]),
+      ),
+    );
+  }
+}
+
+// ==================== 内嵌自动播放 ====================
+
+/// 流里就地播放：滑到这一页就自动播，滑走就暂停，页面销毁时一起回收。
+///
+/// 和「点开播放器页」的区别：不再需要点两下。抖音的做法是滑到即播，
+/// 这里用同一套 WebView 播放器页 + 关闭手势限制实现真实自动播放。
+class _InlineVideo extends StatefulWidget {
+  final Map<String, dynamic> item;
+  final bool active;
+  final bool full;
+  final VoidCallback onFull;
+  final VoidCallback onFallback;
+
+  const _InlineVideo({
+    super.key,
+    required this.item,
+    required this.active,
+    required this.full,
+    required this.onFull,
+    required this.onFallback,
+  });
+
+  @override
+  State<_InlineVideo> createState() => _InlineVideoState();
+}
+
+class _InlineVideoState extends State<_InlineVideo> {
+  static const String _ua =
+      'Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36';
+  static const String _desktopUa =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
+  WebViewController? _ctrl;
+  PlayTarget? _target;
+  int _tryIdx = 0;
+  bool _failed = false;
+  bool _ready = false;
+  bool _started = false;
+
+  String get _url => cultureNormalizeUrl('${widget.item['url'] ?? ''}');
+
+  List<String> get _sources {
+    final t = _target;
+    if (t == null) return [_url];
+    return [t.primary, t.fallback, t.desktop].where((e) => e.isNotEmpty).toList();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.active) _boot();
+  }
+
+  @override
+  void didUpdateWidget(covariant _InlineVideo old) {
+    super.didUpdateWidget(old);
+    if (widget.active && !old.active) _kickPlay();
+    if (!widget.active && old.active) _pause();
+  }
+
+  @override
+  void dispose() {
+    _pause();
+    super.dispose();
+  }
+
+  Future<void> _boot() async {
+    if (_started) return;
+    _started = true;
+    if (_url.isEmpty) {
+      setState(() => _failed = true);
+      return;
+    }
+    PlayTarget t;
+    try {
+      t = await buildPlayTarget(
+        url: _url,
+        platform: '${widget.item['platform'] ?? ''}',
+        knownExtId: '${widget.item['ext_id'] ?? ''}',
+      );
+    } catch (_) {
+      t = PlayTarget(primary: _url);
+    }
+    if (!mounted) return;
+    _target = t;
+
+    // 组件测试里没有 WebView 实现，构造会直接抛断言；当成「播不了」处理，
+    // 这样 UI 还能正常渲染、测试也能跑。
+    late final WebViewController c;
+    try {
+      c = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(Colors.black)
+      ..setUserAgent(_ua)
+      ..setNavigationDelegate(NavigationDelegate(
+        onPageFinished: (_) async {
+          if (!mounted) return;
+          setState(() => _ready = true);
+          await _fitCss();
+          await _kickPlay();
+        },
+        onWebResourceError: (e) {
+          if (e.isForMainFrame == true) _nextSource();
+        },
+        onNavigationRequest: (req) {
+          // 跳 App 的 scheme 一律拦下，留在站内看。
+          return req.url.startsWith('http')
+              ? NavigationDecision.navigate
+              : NavigationDecision.prevent;
+        },
+      ));
+    } catch (_) {
+      if (mounted) setState(() => _failed = true);
+      return;
+    }
+
+    // 关键一步：不要求用户手势。少了这句，自动播放会被 WebView 直接拦掉，
+    // 表现就是「画面在、就是不动」。
+    try {
+      final p = c.platform;
+      if (p is AndroidWebViewController) {
+        await p.setMediaPlaybackRequiresUserGesture(false);
+      }
+    } catch (_) {}
+
+    if (!mounted) return;
+    setState(() => _ctrl = c);
+    await c.loadRequest(Uri.parse(_sources.first));
+  }
+
+  Future<void> _nextSource() async {
+    if (_failed) return;
+    final list = _sources;
+    if (_tryIdx + 1 >= list.length) {
+      if (mounted) setState(() => _failed = true);
+      return;
+    }
+    _tryIdx++;
+    final c = _ctrl;
+    if (c == null) return;
+    final desktop = _target?.kind == 'bili' && _tryIdx == 2;
+    try {
+      await c.setUserAgent(desktop ? _desktopUa : _ua);
+    } catch (_) {}
+    try {
+      await c.loadRequest(Uri.parse(list[_tryIdx]));
+    } catch (_) {
+      if (mounted) setState(() => _failed = true);
+    }
+  }
+
+  Future<void> _fitCss() async {
+    final c = _ctrl;
+    if (c == null) return;
+    try {
+      await c.runJavaScript("""
+(function(){
+  var s=document.getElementById('dt-fit');
+  if(!s){s=document.createElement('style');s.id='dt-fit';
+    (document.head||document.documentElement).appendChild(s);}
+  s.textContent='html,body{margin:0!important;padding:0!important;overflow:hidden!important;background:#000!important;}'
+   +'video{width:100%!important;height:100%!important;object-fit:contain!important;background:#000!important;}';
+})();
+""");
+    } catch (_) {}
+  }
+
+  Future<void> _kickPlay() async {
+    final c = _ctrl;
+    if (c == null) return;
+    try {
+      await c.runJavaScript("""
+(function(){
+  var v=document.querySelector('video');
+  if(!v) return 'no';
+  try{v.muted=false;}catch(e){}
+  var p=v.play();
+  if(p&&p.catch){p.catch(function(){try{v.muted=true;v.play();}catch(e){}});}
+  return 'ok';
+})();
+""");
+    } catch (_) {}
+  }
+
+  Future<void> _pause() async {
+    final c = _ctrl;
+    if (c == null) return;
+    try {
+      await c.runJavaScript(
+          "document.querySelectorAll('video').forEach(function(v){try{v.pause();}catch(e){}})");
+    } catch (_) {}
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = _ctrl;
+    return Stack(fit: StackFit.expand, children: [
+      ColoredBox(color: Colors.black, child: c == null ? const SizedBox() : WebViewWidget(controller: c)),
+      if (!_ready && !_failed)
+        const Center(
+          child: SizedBox(
+              width: 22,
+              height: 22,
+              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white38)),
+        ),
+      if (_failed) _failedCard(),
+      // 全屏：自己实现，B站播放器里的全屏按钮在 WebView 里是无效的
+      Positioned(
+        right: 6,
+        bottom: widget.full ? 12 : 190,
+        child: Material(
+          color: Colors.black.withOpacity(0.42),
+          shape: const CircleBorder(),
+          child: IconButton(
+            tooltip: widget.full ? '退出全屏' : '全屏',
+            iconSize: 20,
+            onPressed: widget.onFull,
+            icon: Icon(
+              widget.full ? Icons.fullscreen_exit : Icons.fullscreen,
+              color: Colors.white,
+            ),
+          ),
+        ),
+      ),
+    ]);
+  }
+
+  Widget _failedCard() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.play_disabled, size: 34, color: Colors.white24),
+          const SizedBox(height: 10),
+          const Text('这条没法内嵌播放',
+              style: TextStyle(fontSize: 13, color: Colors.white70)),
+          const SizedBox(height: 4),
+          const Text('可能是平台风控或需要登录',
+              style: TextStyle(fontSize: 10.5, color: Colors.white38)),
+          const SizedBox(height: 12),
+          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            TextButton(
+              onPressed: widget.onFallback,
+              child: const Text('用播放器打开', style: TextStyle(fontSize: 12)),
+            ),
+            TextButton(
+              onPressed: () {
+                setState(() {
+                  _failed = false;
+                  _ready = false;
+                  _tryIdx = 0;
+                });
+                final c = _ctrl;
+                if (c != null) {
+                  c.loadRequest(Uri.parse(_sources.first));
+                } else {
+                  _started = false;
+                  _boot();
+                }
+              },
+              child: const Text('重试', style: TextStyle(fontSize: 12)),
+            ),
+          ]),
         ]),
       ),
     );
