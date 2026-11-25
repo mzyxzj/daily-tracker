@@ -5,8 +5,11 @@
 //   - 这个页面回答「这个方向我到底收了什么」——包括已经看完的、
 //     半年没点开的，全都在这，点开就能看。
 //
-// 布局照 B站 索引页：顶部排序，往下几行维度筛选，最后是封面网格。
-// 维度换成本地数据真有的东西：平台 / 分级 / 类型 / 状态。
+// 布局照 B站 索引页：顶部排序，往下几行维度筛选 + 标签索引，最后是封面网格。
+// 维度换成本地数据真有的东西：平台 / 分级 / 类型 / 状态 / 标签。
+//
+// 排序即分组：选「最近收录」就按天切段并插分隔线，「打开次数」每 5 次一档，
+// 「按分级」按每个分级一档，「按工具包」按是否已整理成工具包分两档。
 
 import 'package:flutter/material.dart';
 import 'package:sqflite/sqflite.dart';
@@ -27,6 +30,9 @@ class CultureLibraryPage extends StatefulWidget {
   /// 有任何写操作后通知外层重载。
   final Future Function()? onChanged;
 
+  /// 只读预览时可以先把「哪些条目已有工具包」传进来，省一次查询。
+  final Set<int>? kitIds;
+
   const CultureLibraryPage({
     super.key,
     this.db,
@@ -34,6 +40,7 @@ class CultureLibraryPage extends StatefulWidget {
     this.grades = const [],
     this.items,
     this.onChanged,
+    this.kitIds,
   });
 
   @override
@@ -46,11 +53,19 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
   List<Map<String, dynamic>> _items = [];
   bool _loading = true;
 
-  String _sort = 'recent'; // recent / opened / hot / tier
+  /// 已经生成过工具包的条目 id。用来做「按工具包」分组，不用每张卡再查一次库。
+  Set<int> _kitIds = <int>{};
+
+  String _sort = 'recent'; // recent / opened / hot / tier / kit
   String? _plat;
   int? _tier;
   String? _kind;
   String _state = 'all'; // all / unread / opened / done / fav
+
+  /// 标签索引里选中的标签；`#none` 表示「无标签」。
+  String? _tag;
+  bool _tagOpen = true;
+
   String _q = '';
   bool _search = false;
   bool _filtersOpen = true;
@@ -73,6 +88,9 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
   }
 
   Future<void> _load() async {
+    // 预览/外部传入的工具包 id，省掉一次查询。
+    final preKits = widget.kitIds;
+    if (preKits != null) _kitIds = preKits;
     // 先把外层传来的条目渲染出来，别让用户对着转圈等一次查询。
     final pre = widget.items;
     if (pre != null && pre.isNotEmpty) {
@@ -97,11 +115,21 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
     try {
       final rows = await db.query('culture_items',
           where: 'lib_id = ?', whereArgs: [_libId], orderBy: 'id DESC');
+      // 工具包只要 item_id 一列：「按工具包」分组靠它判断是/否。
+      Set<int> kits = <int>{};
+      try {
+        final kr = await db.query('culture_kits', columns: ['item_id']);
+        kits = kr
+            .map((e) => _n(e['item_id']))
+            .where((i) => i > 0)
+            .toSet();
+      } catch (_) {}
       if (!mounted) return;
       setState(() {
         _items = rows
             .map((e) => Map<String, dynamic>.from(e))
             .toList(growable: false);
+        _kitIds = kits;
         _loading = false;
       });
     } catch (_) {
@@ -147,6 +175,62 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
     return have.toList();
   }
 
+  // ---------------- 标签 ----------------
+
+  /// 整理面板写的是「标签（空格分隔）」，但用户实际会混用逗号、顿号、
+  /// 斜杠，所以一起当分隔符——否则会出现「ai，模型」这种整串假标签。
+  static final RegExp _tagSplit = RegExp(r'[\s,，、;；/|+]+');
+
+  /// 一条视频可能有多个标签；去重（忽略大小写），保留首次出现的写法。
+  static List<String> _tagsOf(Map it) {
+    final raw = '${it['tags'] ?? ''}'.trim();
+    if (raw.isEmpty) return const [];
+    final seen = <String>{};
+    final out = <String>[];
+    for (final s in raw.split(_tagSplit)) {
+      final t = s.trim();
+      if (t.isEmpty) continue;
+      // 整段备注被填进标签栏时（超过 14 个字），不当标签，免得索引里出现一整句话。
+      if (t.length > 14) continue;
+      if (seen.add(t.toLowerCase())) out.add(t);
+    }
+    return out;
+  }
+
+  bool _hasTag(Map it, String tag) {
+    final mine = _tagsOf(it);
+    if (tag == '#none') return mine.isEmpty;
+    final want = tag.toLowerCase();
+    for (final t in mine) {
+      if (t.toLowerCase() == want) return true;
+    }
+    return false;
+  }
+
+  /// 标签索引：按出现条数从多到少，同数量按名称。全部从现有条目里现算，
+  /// 不额外建表——整理时改了标签，回到这一页立刻就是新的。
+  List<MapEntry<String, int>> get _tagOpts {
+    final count = <String, int>{};
+    final label = <String, String>{};
+    for (final it in _items) {
+      for (final t in _tagsOf(it)) {
+        final k = t.toLowerCase();
+        count[k] = (count[k] ?? 0) + 1;
+        label.putIfAbsent(k, () => t);
+      }
+    }
+    final out = count.entries
+        .map((e) => MapEntry(label[e.key]!, e.value))
+        .toList()
+      ..sort((a, b) {
+        final d = b.value.compareTo(a.value);
+        return d != 0 ? d : a.key.compareTo(b.key);
+      });
+    return out;
+  }
+
+  int get _noTagCount => _items.where((e) => _tagsOf(e).isEmpty).length;
+
   /// 有分级数据才显示这一行，免得空库上来一排「0 条」。
   List<Map> get _tierOpts {
     final out = <Map>[];
@@ -166,6 +250,7 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
       if (_plat != null && '${it['platform'] ?? ''}'.trim() != _plat) continue;
       if (_tier != null && _n(it['grade_tier']) != _tier) continue;
       if (_kind != null && '${it['kind'] ?? ''}'.trim() != _kind) continue;
+      if (_tag != null && !_hasTag(it, _tag!)) continue;
       switch (_state) {
         case 'unread':
           if (_n(it['state']) != 0) continue;
@@ -212,6 +297,16 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
           return d != 0 ? d : _n(b['id']).compareTo(_n(a['id']));
         });
         break;
+      case 'kit':
+        // 已整理成工具包的在前；组内仍按最近收录排，找起来有线索。
+        list.sort((a, b) {
+          final ka = _kitIds.contains(_n(a['id'])) ? 1 : 0;
+          final kb = _kitIds.contains(_n(b['id'])) ? 1 : 0;
+          if (ka != kb) return kb.compareTo(ka);
+          final d = _ts(b['created_at']).compareTo(_ts(a['created_at']));
+          return d != 0 ? d : _n(b['id']).compareTo(_n(a['id']));
+        });
+        break;
       default: // recent
         list.sort((a, b) {
           final d = _ts(b['created_at']).compareTo(_ts(a['created_at']));
@@ -219,6 +314,115 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
         });
     }
     return list;
+  }
+
+  // ---------------- 分组（排序即分组） ----------------
+  //
+  // 排序不只是一串排序结果，还要在中间插分隔线：
+  //   最近收录 / 最近打开 → 按天分；打开次数 → 每 5 次一档；
+  //   按分级 → 每个分级一档；按工具包 → 是 / 否两档。
+  // 因为 _view 已经按这个维度排好序，顺着切段就行，不用再排一次。
+
+  static String _2(int v) => v.toString().padLeft(2, '0');
+
+  static String _dayKey(String iso) {
+    final d = DateTime.tryParse(iso);
+    if (d == null) return '';
+    final l = d.toLocal();
+    return '${l.year}-${_2(l.month)}-${_2(l.day)}';
+  }
+
+  String _gradeName(int tier) {
+    for (final g in widget.grades) {
+      if (g is! Map) continue;
+      if (_n(g['tier']) == tier) return '${g['name'] ?? ''}'.trim();
+    }
+    return '';
+  }
+
+  String _groupKey(Map it) {
+    switch (_sort) {
+      case 'opened':
+        return 'd:${_dayKey('${it['last_open_at'] ?? ''}')}';
+      case 'hot':
+        final n = _n(it['open_count']);
+        return 'h:${n <= 0 ? -1 : (n - 1) ~/ 5}';
+      case 'tier':
+        return 't:${_n(it['grade_tier'])}';
+      case 'kit':
+        return 'k:${_kitIds.contains(_n(it['id'])) ? 1 : 0}';
+      default:
+        final at = '${it['created_at'] ?? ''}';
+        return 'd:${_dayKey(at)}';
+    }
+  }
+
+  String _groupTitle(String key) {
+    if (key.startsWith('h:')) {
+      final i = int.tryParse(key.substring(2)) ?? -1;
+      if (i < 0) return '还没打开过';
+      final start = i * 5 + 1;
+      return '$start–${start + 4} 次';
+    }
+    if (key.startsWith('t:')) {
+      final t = int.tryParse(key.substring(2)) ?? 0;
+      if (t == 0) return '未分级';
+      final name = _gradeName(t);
+      return name.isEmpty ? '$t 级' : name;
+    }
+    if (key.startsWith('k:')) {
+      return key == 'k:1' ? '已整理为工具包' : '还没整理';
+    }
+    final raw = key.substring(2);
+    // 老数据可能没有时间戳：收录维度叫「日期未知」，打开维度才是「还没打开过」。
+    if (raw.isEmpty) return _sort == 'opened' ? '还没打开过' : '日期未知';
+    final d = DateTime.tryParse(raw);
+    if (d == null) return raw;
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final diff = today.difference(DateTime(d.year, d.month, d.day)).inDays;
+    if (diff == 0) return '今天';
+    if (diff == 1) return '昨天';
+    if (diff == 2) return '前天';
+    if (diff > 2 && diff <= 6) return '$diff 天前';
+    return d.year == now.year ? '${d.month}月${d.day}日' : '${d.year}年${d.month}月${d.day}日';
+  }
+
+  /// 组头的第二行：具体日期 + 星期，让「今天」这种相对写法有绝对参照。
+  String _groupSub(String key) {
+    if (!key.startsWith('d:')) return '';
+    final raw = key.substring(2);
+    if (raw.isEmpty) return '';
+    final d = DateTime.tryParse(raw);
+    if (d == null) return '';
+    const wd = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+    final now = DateTime.now();
+    final date = d.year == now.year
+        ? '${d.month}月${d.day}日'
+        : '${d.year}年${d.month}月${d.day}日';
+    // 标题已经是日期时不重复，只留星期。
+    final title = _groupTitle(key);
+    return title.contains('月') ? wd[d.weekday - 1] : '$date · ${wd[d.weekday - 1]}';
+  }
+
+  List<_Group> _grouped(List<Map<String, dynamic>> view) {
+    final out = <_Group>[];
+    var bucket = <Map<String, dynamic>>[];
+    String? last;
+    void flush() {
+      if (bucket.isEmpty || last == null) return;
+      out.add(_Group(_groupTitle(last), _groupSub(last), bucket));
+      bucket = <Map<String, dynamic>>[];
+    }
+
+    for (final it in view) {
+      final k = _groupKey(it);
+      if (last != null && k != last) flush();
+      last = k;
+      bucket.add(it);
+    }
+    flush();
+    return out;
   }
 
   // ---------------- 动作 ----------------
@@ -463,24 +667,26 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 6, 8, 0),
       child: Column(children: [
-        Row(children: [
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Expanded(
             child: _chipRow(
               label: '排序',
               opts: const {
                 'recent': '最近收录',
                 'opened': '最近打开',
-                'hot': '打开最多',
+                'hot': '打开次数',
                 'tier': '按分级',
+                'kit': '按工具包',
               },
               sel: _sort,
+              wrap: true,
               onPick: (v) => setState(() => _sort = v),
             ),
           ),
           GestureDetector(
             onTap: () => setState(() => _filtersOpen = !_filtersOpen),
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(6, 0, 2, 8),
+              padding: const EdgeInsets.fromLTRB(6, 4, 2, 8),
               child: Row(children: [
                 Text(_filtersOpen ? '收起' : '筛选',
                     style: const TextStyle(fontSize: 10, color: Colors.white38)),
@@ -533,6 +739,7 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
             sel: _state,
             onPick: (v) => setState(() => _state = v),
           ),
+          _tagIndex(),
         ],
       ]),
     );
@@ -543,51 +750,137 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
     required Map<String, String> opts,
     required String sel,
     required ValueChanged<String> onPick,
+    bool wrap = false,
   }) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 7),
-      child: Row(children: [
-        SizedBox(
-          width: 32,
-          child: Text(label,
-              style: const TextStyle(fontSize: 10, color: Colors.white30)),
-        ),
-        Expanded(
-          child: SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: opts.entries.map((o) {
-                final on = o.key == sel;
-                return GestureDetector(
-                  onTap: () => onPick(o.key),
-                  child: Container(
-                    margin: const EdgeInsets.only(right: 6),
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 9, vertical: 4.5),
-                    decoration: BoxDecoration(
-                      color: on ? _accent.withOpacity(0.14) : Colors.transparent,
-                      borderRadius: BorderRadius.circular(6),
-                      border: Border.all(
-                          color: on
-                              ? _accent.withOpacity(0.42)
-                              : Colors.white.withOpacity(0.08)),
-                    ),
-                    child: Text(
-                      o.value,
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        height: 1.1,
-                        fontWeight: on ? FontWeight.w700 : FontWeight.w400,
-                        color: on ? _accent : Colors.white54,
-                      ),
-                    ),
-                  ),
-                );
-              }).toList(),
+    final chips = opts.entries.map((o) {
+      final on = o.key == sel;
+      return GestureDetector(
+        onTap: () => onPick(o.key),
+        child: Container(
+          margin: EdgeInsets.only(right: wrap ? 0 : 6),
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4.5),
+          decoration: BoxDecoration(
+            color: on ? _accent.withOpacity(0.14) : Colors.transparent,
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(
+                color: on
+                    ? _accent.withOpacity(0.42)
+                    : Colors.white.withOpacity(0.08)),
+          ),
+          child: Text(
+            o.value,
+            style: TextStyle(
+              fontSize: 11.5,
+              height: 1.1,
+              fontWeight: on ? FontWeight.w700 : FontWeight.w400,
+              color: on ? _accent : Colors.white54,
             ),
           ),
         ),
+      );
+    }).toList();
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 7),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        SizedBox(
+          width: 32,
+          child: Padding(
+            padding: EdgeInsets.only(top: wrap ? 5 : 0),
+            child: Text(label,
+                style: const TextStyle(fontSize: 10, color: Colors.white30)),
+          ),
+        ),
+        Expanded(
+          // 排序有 5 项，390 宽一行放不下；横滑会把最后一项藏起来，
+          // 而它本身就是「按什么分组」的开关，看不见等于没有。这一行改换行。
+          child: wrap
+              ? Wrap(spacing: 6, runSpacing: 7, children: chips)
+              : SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(children: chips),
+                ),
+        ),
       ]),
+    );
+  }
+
+  /// 标签索引：不给标签单独建表，直接从每条自己的 tags 字段现算。
+  /// 一条视频有多个标签就会出现在多个标签下面；没填的归到「无标签」。
+  /// 用 Wrap 排，一行放不下自动换行（标签多的库会是好几行）。
+  Widget _tagIndex() {
+    final tags = _tagOpts;
+    final noTag = _noTagCount;
+    if (tags.isEmpty && noTag == 0) return const SizedBox.shrink();
+    final total = tags.length + (noTag > 0 ? 1 : 0);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 2),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => setState(() => _tagOpen = !_tagOpen),
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Row(children: [
+              const SizedBox(
+                width: 32,
+                child: Text('标签',
+                    style: TextStyle(fontSize: 10, color: Colors.white30)),
+              ),
+              Text('$total 个索引',
+                  style: const TextStyle(fontSize: 10, color: Colors.white38)),
+              if (_tag != null) ...[
+                const SizedBox(width: 8),
+                GestureDetector(
+                  onTap: () => setState(() => _tag = null),
+                  child: Text('清除',
+                      style: TextStyle(fontSize: 10, color: _accent)),
+                ),
+              ],
+              const Spacer(),
+              Icon(_tagOpen ? Icons.expand_less : Icons.expand_more,
+                  size: 15, color: Colors.white30),
+            ]),
+          ),
+        ),
+        if (_tagOpen)
+          Wrap(spacing: 6, runSpacing: 6, children: [
+            if (noTag > 0) _tagChip('无标签', noTag, '#none'),
+            for (final t in tags) _tagChip(t.key, t.value, t.key),
+          ]),
+      ]),
+    );
+  }
+
+  Widget _tagChip(String label, int n, String key) {
+    final on = _tag == key;
+    return GestureDetector(
+      onTap: () => setState(() => _tag = on ? null : key),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3.5),
+        decoration: BoxDecoration(
+          color:
+              on ? _accent.withOpacity(0.16) : Colors.white.withOpacity(0.035),
+          borderRadius: BorderRadius.circular(11),
+          border: Border.all(
+              color: on
+                  ? _accent.withOpacity(0.45)
+                  : Colors.white.withOpacity(0.07)),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Text(label,
+              style: TextStyle(
+                  fontSize: 11,
+                  height: 1.15,
+                  fontWeight: on ? FontWeight.w700 : FontWeight.w400,
+                  color: on ? _accent : Colors.white60)),
+          const SizedBox(width: 4),
+          Text('$n',
+              style: TextStyle(
+                  fontSize: 9,
+                  color: on ? _accent.withOpacity(0.85) : Colors.white24)),
+        ]),
+      ),
     );
   }
 
@@ -625,6 +918,7 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
               child: CircularProgressIndicator(strokeWidth: 2)));
     }
     if (view.isEmpty) return _empty();
+    final groups = _grouped(view);
     return LayoutBuilder(builder: (ctx, c) {
       const pad = 12.0;
       const gap = 10.0;
@@ -632,18 +926,63 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
       final w = (c.maxWidth - pad * 2 - gap * (cols - 1)) / cols;
       // 封面按 1.6:1 定高，下面留 ~56 给两行标题 + 一行副标题。
       final h = w / 1.6 + 58;
-      return GridView.builder(
-        padding: const EdgeInsets.fromLTRB(pad, 4, pad, 26),
-        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: cols,
-          crossAxisSpacing: gap,
-          mainAxisSpacing: 16,
-          mainAxisExtent: h,
-        ),
-        itemCount: view.length,
-        itemBuilder: (_, i) => _card(view[i]),
+      final delegate = SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: cols,
+        crossAxisSpacing: gap,
+        mainAxisSpacing: 16,
+        mainAxisExtent: h,
+      );
+      return CustomScrollView(
+        slivers: [
+          for (var gi = 0; gi < groups.length; gi++) ...[
+            SliverToBoxAdapter(
+                child: _groupHeader(groups[gi], first: gi == 0)),
+            SliverPadding(
+              padding: const EdgeInsets.symmetric(horizontal: pad),
+              sliver: SliverGrid(
+                gridDelegate: delegate,
+                delegate: SliverChildBuilderDelegate(
+                  (_, i) => _card(groups[gi].items[i]),
+                  childCount: groups[gi].items.length,
+                ),
+              ),
+            ),
+          ],
+          const SliverToBoxAdapter(child: SizedBox(height: 26)),
+        ],
       );
     });
+  }
+
+  /// 分组头就是那条「分隔线」：左边是这一档的名字，中间一条细线延伸到右边条数。
+  /// 时间档还带具体日期和星期，避免「今天」这种相对写法过两天就看不懂。
+  Widget _groupHeader(_Group g, {required bool first}) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(12, first ? 2 : 16, 12, 8),
+      child: Row(children: [
+        Text(g.title,
+            style: const TextStyle(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w800,
+                color: Colors.white70)),
+        if (g.sub.isNotEmpty) ...[
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(g.sub,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 9.5, color: Colors.white30)),
+          ),
+        ],
+        const SizedBox(width: 8),
+        Expanded(
+          child: Container(height: 0.5, color: Colors.white.withOpacity(0.10)),
+        ),
+        const SizedBox(width: 8),
+        Text('${g.items.length}',
+            style: const TextStyle(fontSize: 9.5, color: Colors.white30)),
+      ]),
+    );
   }
 
   Widget _empty() {
@@ -680,6 +1019,7 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
                   _plat = null;
                   _tier = null;
                   _kind = null;
+                  _tag = null;
                   _state = 'all';
                   _q = '';
                   _qCtrl.clear();
@@ -867,4 +1207,13 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
       ),
     );
   }
+}
+
+/// 一个分组：分隔线上的一档 + 这一档里的条目（已经排好序）。
+class _Group {
+  final String title;
+  final String sub;
+  final List<Map<String, dynamic>> items;
+
+  const _Group(this.title, this.sub, this.items);
 }

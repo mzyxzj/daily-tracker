@@ -1,30 +1,32 @@
-# Empire-V4.4 覆盖清单（4.4.0）
+# Empire-V4.5 覆盖清单（4.5.0）
 
 整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml` + `.android-inject/`。
 
-> 这一版只加了一个页面和一个入口，原生部分没有改动：
+> 这一版只动库索引页，原生部分没有改动：
 >
-> 1. **新增 `lib/culture_library.dart`**：库索引页。侧栏点库名进得去，
->    顶部排序 + 平台/分级/类型/状态四行筛选 + 封面网格，包含**所有**收录条目（含已看完）。
->    点卡片进站内播放器；长按可标记看完/收藏。
-> 2. **侧栏的库改成可点**（`culture_feed.dart` 的 `_SidePanel` 增加 `onOpenLib`，
->    行尾加了 `>`）。原来只是一行计数，现在点一下进索引页。
-> 3. 版本号 4.3.1+14 → 4.4.0+15。
+> 1. **标签索引**（`lib/culture_library.dart`）：从每条自己的 `tags` 字段现算，
+>    不建表。一条视频多个标签就出现在多个索引下面；没填的归「无标签」。
+>    `Wrap` 排布，一行放不下自动换行；点标签即筛选，可与其它筛选叠加。
+> 2. **排序即分组**：最近收录 / 最近打开按天切段（今天、昨天、前天、N 天前、日期），
+>    打开次数每 5 次一档，按分级一个分级一段，新增「按工具包」（是 / 否）。
+>    组头 = 档名 + 具体日期·星期 + 横线 + 条数。
+> 3. 排序从 4 项变 5 项后一行放不下，改成 `Wrap` 换行，避免最后一项被横滑藏起来。
+> 4. 版本号 4.4.0+15 → 4.5.0+16。
 >
-> 数据库不动（仍是 15）；依赖不变；`.android-inject/` 与 4.3.1 完全一致。
+> 数据库不动（仍是 15）；依赖不变；`.android-inject/` 与 4.4.0 完全一致。
 > `flutter analyze` 无 error（只剩两条既有的 info）。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
-| `pubspec.yaml` | 558 | `b0bb695742383cf564a137936e9a024a` |
-| `README.md` | 36,188 | `ddc69b23b49e21597b9f1d3307e4f66e` |
+| `pubspec.yaml` | 558 | `50ead6b0daf462d026ccb7036705c08c` |
+| `README.md` | 38,956 | `8982c7fefafa7e2c06dee950af806630` |
 | `.github/workflows/build.yml` | 9,510 | `8bf57bcb3475baac480584878f35875b` |
 | `lib/app_update.dart` | 14,455 | `a931e3cabb03f54bf7d81073af50427b` |
 | `lib/content_feed.dart` | 14,941 | `c477ce3b9f98a85a1099be539f3337a1` |
 | `lib/content_fetch.dart` | 23,847 | `d4d49bbb91d7c81f4fcd25dfa38d32e0` |
 | `lib/content_intake.dart` | 23,270 | `e1546f54fcd91d758601a4b4701710b2` |
 | `lib/culture_feed.dart` | 127,428 | `c517c1e4fbe21a3da82bdb430623f72f` |
-| `lib/culture_library.dart` | 29,624 | `f0b4d0058a442c94bfea4d53e0757d47` |
+| `lib/culture_library.dart` | 42,648 | `81430f5088d4c3717c8eb5d394fe16c6` |
 | `lib/culture_page.dart` | 51,430 | `fe3166f67eb69afd8ea792a02828ae82` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
 | `lib/deepseek_sheet.dart` | 72,621 | `ccd3d91379d101cfbbc0ada026a813e3` |
