@@ -14,6 +14,7 @@ import 'pages_extra.dart';
 import 'deepseek_sheet.dart';
 import 'empire_page.dart';
 import 'culture_page.dart';
+import 'culture_techtree.dart';
 import 'medical_page.dart';
 import 'content_fetch.dart';
 import 'content_intake.dart';
@@ -64,7 +65,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     return openDatabase(
       p.join(dir.path, 'daily_tracker.db'),
-      version: 15,
+      version: 16,
       onCreate: (db, v) async {
         await db.execute('CREATE TABLE status_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, allow_inherit INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0)');
         await db.execute('CREATE TABLE status_records (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, value TEXT DEFAULT "", UNIQUE(item_id, date))');
@@ -82,6 +83,10 @@ class AppDatabase {
         await MedicalDb.ensureTables(db);
       },
       onUpgrade: (db, oldV, newV) async {
+        if (oldV.compareTo(16) == -1) {
+          // v16：库要挂到「科技树」上——补 hidden / tree_key 两列。
+          try { await CultureDb.ensureTables(db); } catch (_) {}
+        }
         if (oldV.compareTo(15) == -1) {
           // v15：内置播放器「取正文」要落一列 content_text。
           try { await CultureDb.ensureTables(db); } catch (_) {}
@@ -500,8 +505,22 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     setState(() => _pending = null);
     try {
       final db = await AppDatabase.instance.database;
+      // 导入只认科技树上的库：先收敛一次，别再让内容落进「其他」。
+      try {
+        await syncLibrariesToTechTree(db);
+      } catch (_) {}
       final libs = await db.query('culture_libraries',
-          orderBy: 'sort_order ASC, id ASC');
+          where: 'hidden = 0', orderBy: 'sort_order ASC, id ASC');
+      if (libs.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('规划里还没有「科技树」节点，先建好再引进',
+                style: TextStyle(fontSize: 12.5)),
+            duration: Duration(seconds: 3),
+          ));
+        }
+        return;
+      }
       final grades = await db.query('culture_grades',
           orderBy: 'sort_order ASC, tier ASC, id ASC');
       final batteryRaw =

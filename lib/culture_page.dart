@@ -345,6 +345,9 @@ class CultureDb {
     await _ensureColumn(db, 'culture_items', 'from_share', 'INTEGER DEFAULT 0');
     // v15：内置播放器「取正文」抓到的文字存这里，生成工具包时直接复用。
     await _ensureColumn(db, 'culture_items', 'content_text', "TEXT DEFAULT ''");
+    // v16：库必须挂在「科技树」节点上。hidden=1 先藏起来，等节点出现再放出来。
+    await _ensureColumn(db, 'culture_libraries', 'hidden', 'INTEGER DEFAULT 0');
+    await _ensureColumn(db, 'culture_libraries', 'tree_key', "TEXT DEFAULT ''");
     await db.execute(
         'CREATE INDEX IF NOT EXISTS idx_culture_items_lib ON culture_items(lib_id)');
     await db.execute(
@@ -471,8 +474,10 @@ class CultureDb {
     return added;
   }
 
-  /// 首次进入：把内置库落库；之后从「战略聚焦」里出现过的维度补库。
-  /// 用户手动删掉的维度会写进 culture_hidden_dims，不再自动复活。
+  /// 老逻辑：从「战略聚焦」里补库。
+  ///
+  /// V4.6 起页面不再调用它——库只能从「规划 → 科技树」长出来，
+  /// 否则又会出现一堆没人管的库。留着只给老数据迁移/测试用。
   static Future<int> syncLibrariesFromFocus(Database db) async {
     var added = 0;
     final seededRaw = await _getState(db, 'culture_seeded');
@@ -774,11 +779,10 @@ class _CultureItemSheetState extends State<CultureItemSheet> {
     _kind = '${it?['kind'] ?? '视频'}';
     _libId = widget.libId != 0
         ? widget.libId
-        : (it?['lib_id'] as int?) ??
-            (widget.libs.isNotEmpty ? widget.libs.first['id'] as int : 0);
-    if (!widget.libs.any((l) => l['id'] == _libId) && widget.libs.isNotEmpty) {
-      _libId = widget.libs.first['id'] as int;
-    }
+        : (it?['lib_id'] as int?) ?? 0;
+    // 编辑老条目时，它原来的库可能已经被藏起来了：不退回第一个库，
+    // 让用户明确选一个科技树节点，避免又把内容塞回「其他」。
+    if (!widget.libs.any((l) => l['id'] == _libId)) _libId = 0;
   }
 
   @override
@@ -812,7 +816,9 @@ class _CultureItemSheetState extends State<CultureItemSheet> {
 
   Future _save() async {
     if (_libId == 0) {
-      setState(() => _err = '先选一个库');
+      setState(() => _err = widget.libs.isEmpty
+          ? '科技树里还没有节点，先去「规划」里加'
+          : '先选一个库（只能是科技树里的节点）');
       return;
     }
     final url = cultureNormalizeUrl(_url.text);
@@ -878,6 +884,37 @@ class _CultureItemSheetState extends State<CultureItemSheet> {
             ),
           ]),
           const SizedBox(height: 10),
+          if (widget.libs.isEmpty)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFEF2F2),
+                borderRadius: BorderRadius.circular(7),
+                border: Border.all(color: const Color(0xFFFECACA)),
+              ),
+              child: const Text(
+                '科技树里还没有节点。先去「规划」→ 最上层导图 → 在「科技树」下面加一节，再回来存。',
+                style: TextStyle(fontSize: 11.5, height: 1.5, color: Color(0xFFB91C1C)),
+              ),
+            )
+          else if (widget.item != null &&
+              !widget.libs.any((l) => l['id'] == widget.item!['lib_id']))
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFFFBEB),
+                borderRadius: BorderRadius.circular(7),
+                border: Border.all(color: const Color(0xFFFDE68A)),
+              ),
+              child: const Text(
+                '这条原来的库不在科技树里。选一个节点再保存，它就归位了。',
+                style: TextStyle(fontSize: 11.5, height: 1.5, color: Color(0xFF92400E)),
+              ),
+            ),
           TextField(
             controller: _url,
             keyboardType: TextInputType.url,
@@ -910,8 +947,12 @@ class _CultureItemSheetState extends State<CultureItemSheet> {
               child: DropdownButtonFormField<int>(
                 value: _libId == 0 ? null : _libId,
                 isDense: true,
+                hint: const Text('选科技树节点',
+                    style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8))),
                 decoration: const InputDecoration(
-                    labelText: '归到哪个库', isDense: true, border: OutlineInputBorder()),
+                    labelText: '归到哪个库（科技树）',
+                    isDense: true,
+                    border: OutlineInputBorder()),
                 items: [
                   for (final l in widget.libs)
                     DropdownMenuItem(

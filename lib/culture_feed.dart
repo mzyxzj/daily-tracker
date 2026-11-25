@@ -19,8 +19,10 @@ import 'app_update.dart';
 import 'content_feed.dart';
 import 'content_fetch.dart';
 import 'content_intake.dart';
+import 'culture_focus.dart';
 import 'culture_library.dart';
 import 'culture_page.dart';
+import 'culture_techtree.dart';
 import 'deepseek_service.dart';
 import 'native_clip.dart';
 import 'player_target.dart';
@@ -45,8 +47,11 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
 
   List _libs = [];
   List _items = [];
+  List _hiddenLibs = [];
+  int _hiddenItems = 0;
   List _grades = [];
   List _kits = [];
+  TechSyncResult? _sync;
   int? _battery;
   bool _onlyCurrentTier = true;
   ClipStatus _clipStatus = const ClipStatus(); // 「复制即弹」的真实状态
@@ -101,12 +106,22 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
       final db = widget.db;
       if (syncLibs) {
         try {
-          await CultureDb.syncLibrariesFromFocus(db);
+          _sync = await syncLibrariesToTechTree(db);
         } catch (_) {}
       }
-      final libs =
-          await db.query('culture_libraries', orderBy: 'sort_order ASC, id ASC');
-      final items = await db.query('culture_items', orderBy: 'id DESC');
+      // 只读科技树上的库。不在树上的库（hidden=1）连内容一起挡在信息流外，
+      // 这样「专注一个方向」不是靠自制力，而是根本刷不到别的。
+      final libs = await db.query('culture_libraries',
+          where: 'hidden = 0', orderBy: 'sort_order ASC, id ASC');
+      final hiddenLibs = await db.query('culture_libraries',
+          where: 'hidden = 1', orderBy: 'sort_order ASC, id ASC');
+      final visibleIds = <int>{
+        for (final l in libs) (l['id'] as num?)?.toInt() ?? 0
+      };
+      final allItems = await db.query('culture_items', orderBy: 'id DESC');
+      final items = allItems
+          .where((e) => visibleIds.contains((e['lib_id'] as num?)?.toInt() ?? 0))
+          .toList();
       final grades = await db
           .query('culture_grades', orderBy: 'sort_order ASC, tier ASC, id ASC');
       final kits = await db.query('culture_kits', orderBy: 'updated_at DESC');
@@ -141,6 +156,8 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
       if (!mounted) return;
       setState(() {
         _libs = libs;
+        _hiddenLibs = hiddenLibs;
+        _hiddenItems = allItems.length - items.length;
         _items = items;
         _grades = grades;
         _kits = kits;
@@ -210,6 +227,20 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
       builder: (_) => KitStudioPage(db: widget.db, item: e.item),
     ));
     _load();
+  }
+
+  /// 不在科技树里、但还存着内容的库：藏在这里，等导图长出来或手动归位。
+  Future<void> _openHiddenLibs() async {
+    _scaffold.currentState?.closeEndDrawer();
+    await Future.delayed(const Duration(milliseconds: 220));
+    if (!mounted) return;
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => CultureHiddenLibsPage(
+        db: widget.db,
+        onChanged: _load,
+      ),
+    ));
+    await _load();
   }
 
   /// 点侧栏的库名 → 这个库的索引页（B站索引那种一页看完所有）。
@@ -421,14 +452,7 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
   }
 
   Future<void> _addItem({int? libId}) async {
-    if (_libs.isEmpty) {
-      await _newLib();
-      if (!mounted) return;
-    }
-    if (_libs.isEmpty) return;
-    final id = libId ??
-        (_libs.first['id'] as int?) ??
-        0;
+    if (!await _ensureTree()) return;
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -437,11 +461,57 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
         db: widget.db,
         libs: _libs,
         grades: _grades,
-        libId: id,
+        // 新条目不给默认库：必须自己指到科技树某一节上。
+        libId: libId ?? 0,
         onSaved: _load,
       ),
     );
     await _load();
+  }
+
+  /// 导入前的硬门槛：科技树没长出来就不收内容。
+  Future<bool> _ensureTree() async {
+    if (_libs.isNotEmpty) return true;
+    if (!mounted) return false;
+    final tree = _sync?.tree;
+    final where = tree != null && tree.ok
+        ? '「${tree.branch}」下面'
+        : '「科技树（复利）」下面';
+    await showDialog<void>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: const Text('先有科技树，再收内容', style: TextStyle(fontSize: 15)),
+        content: Text(
+          '现在只收科技树上的方向。去「规划」→ 最上层导图 → 在$where'
+          '加一节（比如 健身 / 家庭），回来点侧栏「同步科技树」。',
+          style: const TextStyle(fontSize: 12.5, height: 1.6),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dctx), child: const Text('知道了')),
+        ],
+      ),
+    );
+    return false;
+  }
+
+  /// 手动重扫导图：改完规划不用重启 App。
+  Future<void> _syncTree() async {
+    final r = await syncLibrariesToTechTree(widget.db);
+    await _load();
+    if (!mounted) return;
+    if (!r.hasTree) {
+      _toast('规划里还没找到「科技树」节点');
+      return;
+    }
+    final bits = <String>[];
+    if (r.created > 0) bits.add('新建 ${r.created}');
+    if (r.shown > 0) bits.add('放出 ${r.shown}');
+    if (r.hidden > 0) bits.add('藏起 ${r.hidden}');
+    if (r.removed > 0) bits.add('清掉空库 ${r.removed}');
+    _toast(bits.isEmpty
+        ? '已对齐：${r.tree.nodes.length} 个节点'
+        : '${bits.join(' · ')}');
   }
 
   Future<void> _intakeFromClipboard() async {
@@ -459,10 +529,7 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
   }
 
   Future<void> _openIntake(ParsedShare share) async {
-    if (_libs.isEmpty) {
-      await _newLib();
-      if (!mounted) return;
-    }
+    if (!await _ensureTree()) return;
     if (!mounted) return;
     final ok = await showModalBottomSheet<bool>(
       context: context,
@@ -483,45 +550,6 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
         if (_pc.hasClients) _pc.jumpToPage(0);
       }
     }
-  }
-
-  Future<void> _newLib() async {
-    final ctrl = TextEditingController();
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (dctx) => AlertDialog(
-        title: const Text('新建库', style: TextStyle(fontSize: 15)),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: '库名（建议就是你的聚焦维度）',
-            hintText: '例：AI / 健身 / 摄影',
-            isDense: true,
-          ),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(dctx, false), child: const Text('取消')),
-          FilledButton(
-            onPressed: () => Navigator.pop(dctx, true),
-            child: const Text('建'),
-          ),
-        ],
-      ),
-    );
-    final name = ctrl.text.trim();
-    ctrl.dispose();
-    if (ok != true || name.isEmpty) return;
-    await widget.db.insert('culture_libraries', {
-      'name': name,
-      'icon': '📚',
-      'note': '',
-      'source': 'manual',
-      'sort_order': _libs.length,
-      'created_at': DateTime.now().toIso8601String(),
-    });
-    await _load();
-    _toast('已建「$name」');
   }
 
   Future<void> _newGrade() async {
@@ -837,6 +865,9 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
       backgroundColor: kFeedBg,
       endDrawer: _SidePanel(
         libs: _libs,
+        hiddenLibs: _hiddenLibs,
+        hiddenItems: _hiddenItems,
+        tree: _sync?.tree,
         grades: _grades,
         items: _items,
         kits: _kits,
@@ -857,9 +888,13 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
           Navigator.pop(context);
           _showClipDiag();
         },
-        onNewLib: () {
+        onSyncTree: () {
           Navigator.pop(context);
-          _newLib();
+          _syncTree();
+        },
+        onOpenHidden: () {
+          Navigator.pop(context);
+          _openHiddenLibs();
         },
         onOpenLib: (l) => _openLibPage(Map<String, dynamic>.from(l)),
         onNewGrade: () {
@@ -1409,6 +1444,9 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
 
 class _SidePanel extends StatelessWidget {
   final List libs;
+  final List hiddenLibs;
+  final int hiddenItems;
+  final TechTree? tree;
   final List grades;
   final List items;
   final List kits;
@@ -1420,7 +1458,8 @@ class _SidePanel extends StatelessWidget {
   final VoidCallback onToggleTier;
   final VoidCallback onIntakeClip;
   final VoidCallback onManualAdd;
-  final VoidCallback onNewLib;
+  final VoidCallback onSyncTree;
+  final VoidCallback onOpenHidden;
   final void Function(Map lib) onOpenLib;
   final VoidCallback onNewGrade;
   final void Function(Map g) onEditGrade;
@@ -1430,6 +1469,9 @@ class _SidePanel extends StatelessWidget {
 
   const _SidePanel({
     required this.libs,
+    required this.hiddenLibs,
+    required this.hiddenItems,
+    required this.tree,
     required this.grades,
     required this.items,
     required this.kits,
@@ -1441,7 +1483,8 @@ class _SidePanel extends StatelessWidget {
     required this.onToggleTier,
     required this.onIntakeClip,
     required this.onManualAdd,
-    required this.onNewLib,
+    required this.onSyncTree,
+    required this.onOpenHidden,
     required this.onOpenLib,
     required this.onNewGrade,
     required this.onEditGrade,
@@ -1629,7 +1672,22 @@ class _SidePanel extends StatelessWidget {
                   style: TextStyle(fontSize: 11, color: Colors.white38)),
             ),
             const SizedBox(height: 14),
-            _sectionTitle('库 · ${libs.length} 个'),
+            _sectionTitle('科技树 · ${libs.length} 个'),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 2),
+              child: Text(
+                tree != null && tree!.ok
+                    ? '跟「${tree!.mapTitle} / ${tree!.branch}」走'
+                    : '规划里还没找到「科技树」节点',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    fontSize: 9.5,
+                    color: tree != null && tree!.ok
+                        ? Colors.white30
+                        : const Color(0xFFFBBF24)),
+              ),
+            ),
             for (final l in libs)
               InkWell(
                 borderRadius: BorderRadius.circular(8),
@@ -1658,13 +1716,44 @@ class _SidePanel extends StatelessWidget {
                   ]),
                 ),
               ),
+            if (hiddenLibs.isNotEmpty)
+              InkWell(
+                onTap: onOpenHidden,
+                borderRadius: BorderRadius.circular(8),
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(vertical: 8, horizontal: 2),
+                  child: Row(children: [
+                    const Icon(Icons.visibility_off_outlined,
+                        size: 14, color: Color(0xFFFBBF24)),
+                    const SizedBox(width: 7),
+                    Expanded(
+                      child: Text(
+                        '${hiddenLibs.length} 个库不在科技树里 · ${hiddenItems} 条',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                            fontSize: 11, color: Color(0xFFFBBF24)),
+                      ),
+                    ),
+                    const Icon(Icons.chevron_right,
+                        size: 14, color: Colors.white24),
+                  ]),
+                ),
+              ),
             TextButton.icon(
-              onPressed: onNewLib,
+              onPressed: onSyncTree,
               style: TextButton.styleFrom(
                   padding: EdgeInsets.zero, alignment: Alignment.centerLeft),
-              icon: const Icon(Icons.add, size: 15, color: Colors.white38),
-              label: const Text('新建库',
+              icon: const Icon(Icons.sync, size: 15, color: Colors.white38),
+              label: const Text('同步科技树',
                   style: TextStyle(fontSize: 11, color: Colors.white38)),
+            ),
+            const Padding(
+              padding: EdgeInsets.only(bottom: 2),
+              child: Text('库不在这里建：在「规划」的科技树里加一节，回来点同步',
+                  style: TextStyle(
+                      fontSize: 9, height: 1.5, color: Colors.white24)),
             ),
             const SizedBox(height: 16),
             _sectionTitle('再创作'),

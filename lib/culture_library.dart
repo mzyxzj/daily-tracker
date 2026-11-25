@@ -17,6 +17,8 @@ import 'package:sqflite/sqflite.dart';
 import 'culture_feed.dart';
 import 'culture_page.dart';
 
+import 'culture_techtree.dart';
+
 class CultureLibraryPage extends StatefulWidget {
   /// 写操作（打开 / 收藏 / 标看完）要用；只做只读预览时可以不给。
   final Database? db;
@@ -55,6 +57,9 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
 
   /// 已经生成过工具包的条目 id。用来做「按工具包」分组，不用每张卡再查一次库。
   Set<int> _kitIds = <int>{};
+
+  /// 科技树上的库，长按「换个库」「编辑」时只给这些。
+  List<Map<String, dynamic>> _libs = [];
 
   String _sort = 'recent'; // recent / opened / hot / tier / kit
   String? _plat;
@@ -115,6 +120,10 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
     try {
       final rows = await db.query('culture_items',
           where: 'lib_id = ?', whereArgs: [_libId], orderBy: 'id DESC');
+      List<Map<String, dynamic>> libs = [];
+      try {
+        libs = await visibleLibs(db);
+      } catch (_) {}
       // 工具包只要 item_id 一列：「按工具包」分组靠它判断是/否。
       Set<int> kits = <int>{};
       try {
@@ -130,6 +139,7 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
             .map((e) => Map<String, dynamic>.from(e))
             .toList(growable: false);
         _kitIds = kits;
+        _libs = libs;
         _loading = false;
       });
     } catch (_) {
@@ -444,7 +454,7 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
     final db = widget.db;
     final url = '${it['url'] ?? ''}'.trim();
     if (url.isEmpty) {
-      _snack('这条没有链接，长按可以标记看完或补备注');
+      _snack('这条没有链接，长按可以编辑、换个库或删掉');
       return;
     }
     if (db == null) return;
@@ -465,7 +475,7 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
     final id = _n(it['id']);
     final done = _n(it['state']) == 2;
     final fav = _n(it['fav']) == 1;
-    await showModalBottomSheet<void>(
+    final act = await showModalBottomSheet<String>(
       context: context,
       backgroundColor: kFeedBg,
       shape: const RoundedRectangleBorder(
@@ -494,50 +504,172 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
                     color: kFeedInk)),
           ),
           const SizedBox(height: 6),
-          ListTile(
-            dense: true,
-            leading: Icon(done ? Icons.replay_circle_filled : Icons.check_circle_outline,
-                size: 19, color: Colors.white70),
-            title: Text(done ? '标记为未看完' : '标记看完',
-                style: const TextStyle(fontSize: 13, color: kFeedInk)),
-            onTap: () async {
-              Navigator.pop(bctx);
-              final db = widget.db;
-              if (db == null) return;
-              await db.update(
-                  'culture_items',
-                  {
-                    'state': done ? 1 : 2,
-                    'updated_at': DateTime.now().toIso8601String(),
-                  },
-                  where: 'id = ?',
-                  whereArgs: [id]);
-              _snack(done ? '已恢复为未看完' : '看完的就留在这，不再进信息流');
-              await _load();
-              await widget.onChanged?.call();
-            },
-          ),
-          ListTile(
-            dense: true,
-            leading: Icon(fav ? Icons.star : Icons.star_border,
-                size: 19,
-                color: fav ? const Color(0xFFFBBF24) : Colors.white70),
-            title: Text(fav ? '取消收藏' : '收藏',
-                style: const TextStyle(fontSize: 13, color: kFeedInk)),
-            onTap: () async {
-              Navigator.pop(bctx);
-              final db = widget.db;
-              if (db == null) return;
-              await db.update('culture_items', {'fav': fav ? 0 : 1},
-                  where: 'id = ?', whereArgs: [id]);
-              await _load();
-              await widget.onChanged?.call();
-            },
-          ),
+          _menuTile(
+              done ? Icons.replay_circle_filled : Icons.check_circle_outline,
+              done ? '标记为未看完' : '标记看完',
+              'done'),
+          _menuTile(
+              fav ? Icons.star : Icons.star_border,
+              fav ? '取消收藏' : '收藏',
+              'fav',
+              tint: fav ? const Color(0xFFFBBF24) : null),
+          _menuTile(Icons.edit_outlined, '编辑标题 / 链接 / 标签', 'edit'),
+          _menuTile(Icons.swap_horiz, '换个库（归到科技树）', 'lib'),
+          _menuTile(Icons.delete_outline, '删掉这条', 'delete',
+              danger: true),
           const SizedBox(height: 8),
         ]),
       ),
     );
+    if (act == null || !mounted) return;
+    final db = widget.db;
+    if (act == 'done' || act == 'fav') {
+      if (db == null) return;
+      if (act == 'done') {
+        await db.update(
+            'culture_items',
+            {
+              'state': done ? 1 : 2,
+              'updated_at': DateTime.now().toIso8601String(),
+            },
+            where: 'id = ?',
+            whereArgs: [id]);
+        _snack(done ? '已恢复为未看完' : '看完的就留在这，不再进信息流');
+      } else {
+        await db.update('culture_items', {'fav': fav ? 0 : 1},
+            where: 'id = ?', whereArgs: [id]);
+      }
+      await _load();
+      await widget.onChanged?.call();
+      return;
+    }
+    if (act == 'edit') {
+      await _edit(it);
+      return;
+    }
+    if (act == 'lib') {
+      await _move(it);
+      return;
+    }
+    if (act == 'delete') await _delete(it);
+  }
+
+  Widget _menuTile(IconData icon, String label, String value,
+      {bool danger = false, Color? tint}) {
+    final color = danger ? const Color(0xFFF87171) : Colors.white70;
+    return ListTile(
+      dense: true,
+      leading: Icon(icon, size: 19, color: tint ?? color),
+      title: Text(label, style: TextStyle(fontSize: 13, color: color)),
+      onTap: () => Navigator.pop(context, value),
+    );
+  }
+
+  Future<void> _edit(Map<String, dynamic> it) async {
+    final db = widget.db;
+    if (db == null) return;
+    if (_libs.isEmpty) {
+      _snack('科技树里还没有节点，先去「规划」加一节');
+      return;
+    }
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => CultureItemSheet(
+        db: db,
+        libs: _libs,
+        grades: widget.grades,
+        libId: _n(it['lib_id']),
+        item: it,
+        onSaved: _load,
+      ),
+    );
+    await _load();
+    await widget.onChanged?.call();
+  }
+
+  Future<void> _move(Map<String, dynamic> it) async {
+    final db = widget.db;
+    if (db == null) return;
+    if (_libs.isEmpty) {
+      _snack('科技树里还没有节点，先去「规划」加一节');
+      return;
+    }
+    final cur = _n(it['lib_id']);
+    final picked = await showModalBottomSheet<int>(
+      context: context,
+      backgroundColor: kFeedBg,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (bctx) => SafeArea(
+        top: false,
+        child: ListView(shrinkWrap: true, children: [
+          const SizedBox(height: 14),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 16),
+            child: Text('归到哪个科技树节点？',
+                style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    color: kFeedInk)),
+          ),
+          const SizedBox(height: 6),
+          for (final l in _libs)
+            ListTile(
+              dense: true,
+              leading:
+                  Text('${l['icon'] ?? '📦'}', style: const TextStyle(fontSize: 16)),
+              title: Text('${l['name'] ?? ''}',
+                  style: const TextStyle(fontSize: 13, color: kFeedInk)),
+              trailing: _n(l['id']) == cur
+                  ? const Icon(Icons.check_circle, size: 18, color: Colors.white70)
+                  : null,
+              onTap: () => Navigator.pop(bctx, _n(l['id'])),
+            ),
+          const SizedBox(height: 10),
+        ]),
+      ),
+    );
+    if (picked == null || picked == cur) return;
+    await db.update(
+        'culture_items',
+        {'lib_id': picked, 'updated_at': DateTime.now().toIso8601String()},
+        where: 'id = ?',
+        whereArgs: [_n(it['id'])]);
+    _snack('已归位');
+    // 从这个库的索引页里挪走 → 列表要重刷；旧库空了会被下次同步删掉。
+    await _load();
+    await widget.onChanged?.call();
+  }
+
+  Future<void> _delete(Map<String, dynamic> it) async {
+    final db = widget.db;
+    if (db == null) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: const Text('删掉这条？', style: TextStyle(fontSize: 15)),
+        content: Text('「${it['title'] ?? ''}」会从库里移除，删了找不回。',
+            style: const TextStyle(fontSize: 12.5, height: 1.5)),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dctx, false),
+              child: const Text('算了')),
+          TextButton(
+            onPressed: () => Navigator.pop(dctx, true),
+            child: const Text('删除', style: TextStyle(color: Color(0xFFDC2626))),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await db.delete('culture_items',
+        where: 'id = ?', whereArgs: [_n(it['id'])]);
+    _snack('已删除');
+    await _load();
+    await widget.onChanged?.call();
   }
 
   // ---------------- UI ----------------
@@ -551,6 +683,7 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
         bottom: false,
         child: Column(children: [
           _header(),
+          if (_n(widget.lib['hidden']) == 1) _hiddenBanner(),
           if (_search) _searchField(),
           _filters(),
           _statLine(view),
@@ -616,6 +749,23 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
           tooltip: _search ? '关闭搜索' : '搜这个库',
         ),
       ]),
+    );
+  }
+
+  Widget _hiddenBanner() {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A160C),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xFFFBBF24).withOpacity(0.28)),
+      ),
+      child: const Text(
+        '这个库不在科技树里：内容不进信息流，也不会出现在侧栏。\n'
+        '长按任意一条可以「换个库」归位，或直接删掉。',
+        style: TextStyle(fontSize: 10.5, height: 1.6, color: Colors.white54),
+      ),
     );
   }
 
@@ -1007,7 +1157,7 @@ class _CultureLibraryPageState extends State<CultureLibraryPage> {
             Text(
               filtered
                   ? '把上面的筛选放宽一点，或者点「全部」。'
-                  : '复制一条 B站/抖音分享链接，回到 App 会自动问你\n要不要整理进来；也可以回侧栏手动填一条。',
+                  : '这个方向还没收东西。\n复制一条链接回来整理，就落在这一节下面。',
               textAlign: TextAlign.center,
               style: const TextStyle(
                   fontSize: 10.5, height: 1.7, color: Colors.white24),

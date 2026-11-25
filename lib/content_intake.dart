@@ -232,6 +232,8 @@ class _ContentIntakeSheetState extends State<ContentIntakeSheet> {
     super.dispose();
   }
 
+  /// 按标题/标签猜一个科技树节点；猜不到就留空，逼用户自己选。
+  /// 不再退到「其他」或第一个库——那正是内容越堆越乱的原因。
   int _guessLib() {
     if (widget.libs.isEmpty) return 0;
     final hay = '${widget.share.textTitle} ${widget.share.tags.join(' ')}'.toLowerCase();
@@ -248,13 +250,7 @@ class _ContentIntakeSheetState extends State<ContentIntakeSheet> {
         }
       }
     }
-    if (best != 0) return best;
-    for (final l in widget.libs) {
-      if (l is Map && '${l['name'] ?? ''}'.trim() == '其他') {
-        return (l['id'] as num?)?.toInt() ?? 0;
-      }
-    }
-    return (widget.libs.first as Map)['id'] as int? ?? 0;
+    return best;
   }
 
   Future<void> _fetch() async {
@@ -286,7 +282,9 @@ class _ContentIntakeSheetState extends State<ContentIntakeSheet> {
 
   Future<void> _save() async {
     if (_libId == 0) {
-      _snack('先选一个库');
+      _snack(widget.libs.isEmpty
+          ? '科技树里还没有节点，先去「规划」里加一节'
+          : '选一个科技树节点再存');
       return;
     }
     final title = _title.text.trim();
@@ -485,9 +483,23 @@ class _ContentIntakeSheetState extends State<ContentIntakeSheet> {
             Text('归到哪个库',
                 style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700, color: kCultureInk)),
             SizedBox(width: 6),
-            Text('按聚焦维度自动猜的，可改', style: TextStyle(fontSize: 10, color: kCultureSub)),
+            Text('科技树节点，必须选一个', style: TextStyle(fontSize: 10, color: kCultureSub)),
           ]),
           const SizedBox(height: 7),
+          if (widget.libs.isEmpty)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFEF2F2),
+                borderRadius: BorderRadius.circular(7),
+                border: Border.all(color: const Color(0xFFFECACA)),
+              ),
+              child: const Text(
+                '科技树里还没有节点。先去「规划」→ 最上层导图 → 在「科技树」下面加一节。',
+                style: TextStyle(fontSize: 11.5, height: 1.5, color: Color(0xFFB91C1C)),
+              ),
+            ),
           Wrap(spacing: 7, runSpacing: 7, children: [
             for (final l in widget.libs)
               GestureDetector(
