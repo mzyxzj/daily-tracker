@@ -29,6 +29,10 @@ class AppUpdate {
   final String apkUrl;
   final String fileName;
   final int size;
+
+  /// 从哪条通道拿到的：`api` / `redirect`。
+  /// 接口被限流时会退到网页跳转，这时拿不到更新说明和体积。
+  final String source;
   const AppUpdate({
     required this.version,
     required this.tag,
@@ -36,6 +40,7 @@ class AppUpdate {
     required this.apkUrl,
     required this.fileName,
     required this.size,
+    this.source = 'api',
   });
 }
 
@@ -109,6 +114,47 @@ class UpdateCheck {
 }
 
 Future<UpdateCheck> checkAppUpdate({String repo = kUpdateRepo}) async {
+  // 第一条：正式接口。信息最全（说明、体积），但匿名调用每小时只有 60 次，
+  // 手机走运营商出口时经常被别人用光 → 403。所以后面必须留备用通道。
+  final api = await _checkViaApi(repo);
+  if (api.update != null) return api;
+
+  // 第二条：不碰 api.github.com，直接问 github.com 的跳转地址。
+  // `/releases/latest` 会 302 到 `/releases/tag/V4.6.1`，从 Location 里就能读出最新标签。
+  // 这条路是普通网页请求，没有 60 次/小时的限制，缺点是没有说明和体积。
+  final alt = await _checkViaRedirect(repo);
+  if (alt.update != null) {
+    return UpdateCheck(alt.update, '');
+  }
+
+  return UpdateCheck(null, '${api.error}；换通道也不行（${alt.error}）');
+}
+
+/// 非 200 时翻译成人话。抽成纯函数，好在测试里直接喂状态码。
+String updateErrorHint(int code, String body) {
+  final low = body.toLowerCase();
+  if (low.contains('rate limit')) {
+    return '接口被限流（$code，匿名每小时 60 次）';
+  }
+  if (code == 404) return '仓库里还没有 Release';
+  if (code == 403) return '接口返回 403（被限流或被拦）';
+  return '接口返回 $code';
+}
+
+/// 从 `https://github.com/o/r/releases/tag/V4.6.1` 里取出 `V4.6.1`。
+String? tagFromReleaseLocation(String location) {
+  final m = RegExp(r'/releases/tag/([^/?#]+)').firstMatch(location);
+  if (m == null) return null;
+  final raw = m.group(1)!;
+  try {
+    return Uri.decodeComponent(raw);
+  } catch (_) {
+    return raw;
+  }
+}
+
+/// 正式接口：GET /repos/{repo}/releases/latest
+Future<UpdateCheck> _checkViaApi(String repo) async {
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
   try {
     final req = await client.getUrl(
@@ -117,7 +163,11 @@ Future<UpdateCheck> checkAppUpdate({String repo = kUpdateRepo}) async {
     req.headers.set('User-Agent', 'daily-tracker');
     final resp = await req.close().timeout(const Duration(seconds: 20));
     if (resp.statusCode != 200) {
-      return UpdateCheck(null, '接口返回 ${resp.statusCode}');
+      var body = '';
+      try {
+        body = await resp.transform(utf8.decoder).join();
+      } catch (_) {}
+      return UpdateCheck(null, updateErrorHint(resp.statusCode, body));
     }
     final body = await resp.transform(utf8.decoder).join();
     final m = jsonDecode(body) as Map<String, dynamic>;
@@ -149,9 +199,52 @@ Future<UpdateCheck> checkAppUpdate({String repo = kUpdateRepo}) async {
       '',
     );
   } on TimeoutException {
-    return UpdateCheck(null, '连不上 GitHub（超时），可以过会儿再试');
+    return UpdateCheck(null, '连不上 GitHub（超时）');
   } catch (e) {
     return UpdateCheck(null, '连不上 GitHub：$e');
+  } finally {
+    client.close(force: true);
+  }
+}
+
+/// 备用通道：看 `/releases/latest` 的 302 落在哪个 tag 上。
+Future<UpdateCheck> _checkViaRedirect(String repo) async {
+  final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+  try {
+    final req = await client
+        .getUrl(Uri.parse('https://github.com/$repo/releases/latest'));
+    req.followRedirects = false;
+    req.headers.set('User-Agent', 'daily-tracker');
+    final resp = await req.close().timeout(const Duration(seconds: 20));
+    final loc = resp.headers.value('location') ?? '';
+    await resp.drain<void>().catchError((_) {});
+    final tag = tagFromReleaseLocation(loc);
+    if (tag == null) {
+      return UpdateCheck(
+          null,
+          resp.statusCode == 200
+              ? '仓库里还没有 Release'
+              : '网页返回 ${resp.statusCode}');
+    }
+    final ver = tag.replaceAll(RegExp(r'^[vV]'), '');
+    // 资产名是固定的：CI 和本地出包都叫 app-release.apk。
+    const file = 'app-release.apk';
+    return UpdateCheck(
+      AppUpdate(
+        version: ver,
+        tag: tag,
+        notes: '',
+        apkUrl: 'https://github.com/$repo/releases/download/$tag/$file',
+        fileName: file,
+        size: 0,
+        source: 'redirect',
+      ),
+      '',
+    );
+  } on TimeoutException {
+    return UpdateCheck(null, '超时');
+  } catch (e) {
+    return UpdateCheck(null, '$e');
   } finally {
     client.close(force: true);
   }
@@ -375,6 +468,15 @@ class _UpdateDialogState extends State<_UpdateDialog> {
           _line('当前版本', _cur.display),
           const SizedBox(height: 6),
           Text(_msg, style: const TextStyle(fontSize: 11, color: Color(0xFFFCA5A5))),
+          if (_msg.contains('限流'))
+            const Padding(
+              padding: EdgeInsets.only(top: 6),
+              child: Text(
+                'GitHub 对没登录的请求只给每小时 60 次，运营商出口经常被别人用光。'
+                '点「重试」会换一条网页通道再试；还不行就去网页直接下 APK。',
+                style: TextStyle(fontSize: 10.5, height: 1.6, color: Colors.white54),
+              ),
+            ),
         ]);
         actions = [
           TextButton(onPressed: () => Navigator.pop(context), child: const Text('关闭')),
@@ -396,6 +498,9 @@ class _UpdateDialogState extends State<_UpdateDialog> {
           _line('最新版本', u?.version ?? '', c: const Color(0xFF7DD3FC)),
           if ((u?.size ?? 0) > 0)
             _line('安装包', '${((u!.size) / 1024 / 1024).toStringAsFixed(1)} MB'),
+          if (u?.source == 'redirect')
+            _line('来源', '网页通道（接口被限流，说明暂缺）',
+                c: const Color(0xFFFBBF24)),
           const SizedBox(height: 8),
           Container(
             padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
@@ -405,7 +510,9 @@ class _UpdateDialogState extends State<_UpdateDialog> {
             ),
             child: Text(
               (u?.notes ?? '').trim().isEmpty
-                  ? '（这一版没写说明）'
+                  ? (u?.source == 'redirect'
+                      ? '接口被限流，这一版的更新说明没取到。直接下载安装即可，装完在「关于」里能看到版本。'
+                      : '（这一版没写说明）')
                   : (u!.notes.length > 600
                       ? '${u.notes.substring(0, 600)}…'
                       : u.notes),

@@ -1,29 +1,21 @@
-# Empire-V4.6 覆盖清单（4.6.0）
+# Empire-V4.6.1 覆盖清单（4.6.1）
 
 整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml` + `.android-inject/`。
 
-> 这一版把「库」收紧到规划里的科技树，原生部分没有改动：
+> 这一版只修「检查更新报 403」，其余全部沿用 4.6.0：
 >
-> 1. **新文件 `lib/culture_techtree.dart`**：从 `mindmaps.root_json` 里找 `科技树` 分支，
->    取它的直接子节点当库（顺序照导图）；节点名做归一，允许「健身 / 健身常态化」前缀匹配。
->    同时负责库表收敛：树上的保留/补建，树外空库删除，树外有内容的隐藏（`hidden=1`）。
-> 2. **新文件 `lib/culture_focus.dart`**：不在科技树里的库的收容页，支持逐条归位、
->    整库并到某节点、连内容删除。
-> 3. `lib/culture_feed.dart`：信息流只读 `hidden=0` 的库与这些库的条目；
->    侧栏「新建库」换成「同步科技树」；新增隐藏库入口；导入前统一走 `_ensureTree()`。
-> 4. `lib/culture_library.dart`：长按菜单补「编辑 / 换个库 / 删掉这条」；隐藏库顶部加提示条。
-> 5. `lib/culture_page.dart` / `lib/content_intake.dart` / `lib/main.dart`：
->    导入三处都不再默认落第一个库或「其他」，必须选科技树节点。
-> 6. 数据库 15 → **16**：`culture_libraries` 补 `hidden` / `tree_key` 两列。
-> 7. 版本号 4.5.0+16 → 4.6.0+17；依赖不变；`.android-inject/` 与 4.5.0 完全一致。
-> 8. 测试 93 条全绿；`flutter analyze` 无 error（只剩既有 info）。
+> 1. **`lib/app_update.dart`**：更新检查改成两条通道。先问 `api.github.com`（信息全，但匿名每小时只有 60 次，常见 403）；失败就退到 `github.com/<repo>/releases/latest` 的 302 跳转，从 `Location` 里取 tag，直接拼 `/releases/download/<tag>/app-release.apk`。第二条是普通网页请求，不吃限流，代价是没有说明和体积。
+> 2. 错误文案分档：正文含 `rate limit` → 「接口被限流（403，匿名每小时 60 次）」；404 → 「仓库里还没有 Release」；其余带状态码。弹窗里多一段解释为什么会 403。
+> 3. 抽出 `updateErrorHint()` / `tagFromReleaseLocation()` 两个纯函数，新增 `test/update_test.dart` 7 条。
+> 4. 版本号 4.6.0+17 → **4.6.1+18**；原生注入、数据库（v16）、科技树规则一行没改。
+> 5. 测试 100 条全绿；`flutter analyze` 无 error。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
-| `pubspec.yaml` | 558 | `5d6a9c80e95393a2dc42d76aff334f4b` |
-| `README.md` | 41,982 | `90d224a1e0c4eed3df6f2312ea0668f5` |
+| `pubspec.yaml` | 558 | `e00f9a720d752fef9ed2a65cec06389a` |
+| `README.md` | 43,992 | `9acbe8d3240e8bf72fe9cefacb5794b8` |
 | `.github/workflows/build.yml` | 9,510 | `8bf57bcb3475baac480584878f35875b` |
-| `lib/app_update.dart` | 14,455 | `a931e3cabb03f54bf7d81073af50427b` |
+| `lib/app_update.dart` | 18,672 | `0c18c3df1a51e5588059dd4b94e3063f` |
 | `lib/content_feed.dart` | 14,941 | `c477ce3b9f98a85a1099be539f3337a1` |
 | `lib/content_fetch.dart` | 23,847 | `d4d49bbb91d7c81f4fcd25dfa38d32e0` |
 | `lib/content_intake.dart` | 24,009 | `2a32372206f7d35d0e717b34681c04e9` |
@@ -52,11 +44,10 @@
 ## 覆盖后自检
 
 ```bash
-grep -c '^  assets:' pubspec.yaml                  # 期望 0
-grep -c '_kRealmL09Webp' lib/empire_assets.dart    # 期望 2（常量定义 + map 引用）
-grep -c 'buildReal' lib/empire_data.dart           # 期望 ≥ 1
-grep -c 'POST_NOTIFICATIONS' .android-inject/patch.py   # 期望 1
-grep -c '科技树' lib/culture_techtree.dart          # 期望 ≥ 1
-grep -c 'hidden = 0' lib/culture_feed.dart         # 期望 ≥ 1
-md5sum lib/culture_techtree.dart                   # 应等于上表
+grep -c '^  assets:' pubspec.yaml                        # 期望 0
+grep -c 'releases/latest' lib/app_update.dart            # 期望 ≥ 2（API 与网页两条通道）
+grep -c 'tagFromReleaseLocation' lib/app_update.dart     # 期望 2（定义 + 调用）
+grep -c '科技树' lib/culture_techtree.dart                # 期望 ≥ 1
+grep -n '^version' pubspec.yaml                          # 期望 4.6.1+18
+md5sum lib/app_update.dart                               # 应等于上表
 ```

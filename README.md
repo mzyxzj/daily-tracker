@@ -2,6 +2,37 @@
 
 本仓库只放源码（lib / pubspec / CI），Android 工程由 CI 里的 `flutter create` 生成。
 
+## 4.6.1 · 更新检查：接口限流就走网页通道（Empire-V4.6.1）
+
+4.6.0 装上去后点「检查更新」直接弹 **「接口返回 403」**，这不是包坏了，是 GitHub 把请求挡了：
+`api.github.com` 对**没登录的匿名请求只给每小时 60 次**（按出口 IP 算），手机走运营商 NAT 时
+那个 IP 常被别的应用用光，于是 403。旧代码只认 200，一见 403 就死给你看。
+
+### 现在怎么查
+
+```
+第一条  api.github.com/repos/…/releases/latest     信息全（说明 + 体积），可能 403
+   ↓ 失败
+第二条  github.com/…/releases/latest  的 302 跳转    普通网页，没有 60 次限制
+        从 Location 里取出 tag → 直接拼 /releases/download/<tag>/app-release.apk
+```
+
+第二条是纯网页请求，不碰 API，所以限流打不到它；代价是拿不到更新说明和安装包体积
+（弹窗里会标一行「来源：网页通道」）。两条都失败时，提示会同时给出两边的原因，
+并且明说是「限流」而不是甩一个 403 数字。
+
+### 顺带
+
+- 错误文案分档：`rate limit` 正文 → 「接口被限流（403，匿名每小时 60 次）」；404 → 「仓库里还没有 Release」；其余原样带状态码。
+- 错误弹窗多一段解释，说清为什么会 403、重试会换通道、实在不行去网页下。
+- 解析逻辑抽成 `updateErrorHint()` / `tagFromReleaseLocation()` 两个纯函数，`test/update_test.dart` 覆盖 7 条（含 `V4.6.1?x=1#top` 这种带尾巴的 Location）。
+- 只动 `lib/app_update.dart` 与版本号，原生注入、数据库、科技树规则全不变。
+- 测试 100 条全绿；`flutter analyze` 无 error。
+
+> 已经在 4.5.0 上的人，因为旧代码没有备用通道，**这一次要手动装**：
+> 直接下 [app-release.apk](https://github.com/mzyxzj/daily-tracker/releases/download/V4.6.1/app-release.apk)，
+> 覆盖安装即可（签名一致，数据不动）。装完 4.6.1 之后就不会再卡在 403 了。
+
 ## 4.6.0 · 库只从科技树长出来（Empire-V4.6）
 
 这一版不再让「库」自由生长：**唯一来源是「规划」最上层导图里的 `科技树` 分支**。
