@@ -1,31 +1,30 @@
-# Empire-V4.3 覆盖清单（4.3.1）
+# Empire-V4.4 覆盖清单（4.4.0）
 
 整包必须**全量覆盖**：`lib/` + `pubspec.yaml` + `.github/workflows/build.yml` + `.android-inject/`。
 
-> 这一版是 4.3.0 的修补，三件事：
+> 这一版只加了一个页面和一个入口，原生部分没有改动：
 >
-> 1. **清晰度按钮补到独立播放器页**。4.3.0 只加在信息流内嵌播放器，
->    而「在这里看」打开的是 `CulturePlayerPage`（另一套 WebView），那一页看不到按钮。
->    现在右上角常驻一个档位胶囊，不跟浮层一起隐藏。
-> 2. **点了「整理」进 App 又弹一次**。App 渲染页面产生的 `WINDOW_CONTENT_CHANGED`
->    落在 15 秒的「内容类 App 上下文」里，于是又读一次剪贴板、又弹。
->    现在：自己包名的事件一律 return；点「整理」/「略过」后 30 秒内不再弹（`consumedAt`）。
-> 3. **只在复制外链时弹**。复制动作按置信度分级：
->    「复制链接」= 2（任何 App 都算）；仅「复制」= 1（只在 B站/抖音/小红书等短视频平台算）。
->    微信/QQ 的「复制」是复制聊天文字，不在白名单里。
+> 1. **新增 `lib/culture_library.dart`**：库索引页。侧栏点库名进得去，
+>    顶部排序 + 平台/分级/类型/状态四行筛选 + 封面网格，包含**所有**收录条目（含已看完）。
+>    点卡片进站内播放器；长按可标记看完/收藏。
+> 2. **侧栏的库改成可点**（`culture_feed.dart` 的 `_SidePanel` 增加 `onOpenLib`，
+>    行尾加了 `>`）。原来只是一行计数，现在点一下进索引页。
+> 3. 版本号 4.3.1+14 → 4.4.0+15。
 >
-> 数据库不动（仍是 15）；依赖不变。`flutter analyze` 无 error。
+> 数据库不动（仍是 15）；依赖不变；`.android-inject/` 与 4.3.1 完全一致。
+> `flutter analyze` 无 error（只剩两条既有的 info）。
 
 | 文件 | 字节 | MD5 |
 |---|---|---|
-| `pubspec.yaml` | 558 | `5cf71c4ca614c02618cf95c0669afd5b` |
-| `README.md` | 33,284 | `30e0d9f5f0338721b8ff5c7da43420c4` |
+| `pubspec.yaml` | 558 | `b0bb695742383cf564a137936e9a024a` |
+| `README.md` | 36,188 | `ddc69b23b49e21597b9f1d3307e4f66e` |
 | `.github/workflows/build.yml` | 9,510 | `8bf57bcb3475baac480584878f35875b` |
 | `lib/app_update.dart` | 14,455 | `a931e3cabb03f54bf7d81073af50427b` |
 | `lib/content_feed.dart` | 14,941 | `c477ce3b9f98a85a1099be539f3337a1` |
 | `lib/content_fetch.dart` | 23,847 | `d4d49bbb91d7c81f4fcd25dfa38d32e0` |
 | `lib/content_intake.dart` | 23,270 | `e1546f54fcd91d758601a4b4701710b2` |
-| `lib/culture_feed.dart` | 126,104 | `18479401dae185d96fcceac522c41e36` |
+| `lib/culture_feed.dart` | 127,428 | `c517c1e4fbe21a3da82bdb430623f72f` |
+| `lib/culture_library.dart` | 29,624 | `f0b4d0058a442c94bfea4d53e0757d47` |
 | `lib/culture_page.dart` | 51,430 | `fe3166f67eb69afd8ea792a02828ae82` |
 | `lib/deepseek_service.dart` | 12,063 | `8a4d9a670b3a9378ceeda3e3ba7d4210` |
 | `lib/deepseek_sheet.dart` | 72,621 | `ccd3d91379d101cfbbc0ada026a813e3` |

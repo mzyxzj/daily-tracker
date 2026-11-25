@@ -19,6 +19,7 @@ import 'app_update.dart';
 import 'content_feed.dart';
 import 'content_fetch.dart';
 import 'content_intake.dart';
+import 'culture_library.dart';
 import 'culture_page.dart';
 import 'deepseek_service.dart';
 import 'native_clip.dart';
@@ -207,6 +208,25 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
   Future<void> _openKitStudio(FeedEntry e) async {
     await Navigator.of(context).push(MaterialPageRoute(
       builder: (_) => KitStudioPage(db: widget.db, item: e.item),
+    ));
+    _load();
+  }
+
+  /// 点侧栏的库名 → 这个库的索引页（B站索引那种一页看完所有）。
+  ///
+  /// 侧栏是 Drawer，push 之前要先收起来，否则新页面在抽屉底下。
+  Future<void> _openLibPage(Map lib) async {
+    _scaffold.currentState?.closeEndDrawer();
+    // 等抽屉滑完再 push，不然返回时会看到抽屉还开着。
+    await Future.delayed(const Duration(milliseconds: 220));
+    if (!mounted) return;
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => CultureLibraryPage(
+        db: widget.db,
+        lib: Map<String, dynamic>.from(lib),
+        grades: _grades,
+        items: _items,
+      ),
     ));
     _load();
   }
@@ -841,6 +861,7 @@ class _CultureFeedPageState extends State<CultureFeedPage> {
           Navigator.pop(context);
           _newLib();
         },
+        onOpenLib: (l) => _openLibPage(Map<String, dynamic>.from(l)),
         onNewGrade: () {
           Navigator.pop(context);
           _newGrade();
@@ -1400,6 +1421,7 @@ class _SidePanel extends StatelessWidget {
   final VoidCallback onIntakeClip;
   final VoidCallback onManualAdd;
   final VoidCallback onNewLib;
+  final void Function(Map lib) onOpenLib;
   final VoidCallback onNewGrade;
   final void Function(Map g) onEditGrade;
   final VoidCallback onOpenKits;
@@ -1420,6 +1442,7 @@ class _SidePanel extends StatelessWidget {
     required this.onIntakeClip,
     required this.onManualAdd,
     required this.onNewLib,
+    required this.onOpenLib,
     required this.onNewGrade,
     required this.onEditGrade,
     required this.onOpenKits,
@@ -1608,22 +1631,32 @@ class _SidePanel extends StatelessWidget {
             const SizedBox(height: 14),
             _sectionTitle('库 · ${libs.length} 个'),
             for (final l in libs)
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                child: Row(children: [
-                  Text('${l['icon'] ?? '📚'}', style: const TextStyle(fontSize: 13)),
-                  const SizedBox(width: 7),
-                  Expanded(
-                    child: Text('${l['name'] ?? ''}',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 12, color: kFeedInk)),
-                  ),
-                  Text(
-                    '${items.where((e) => e['lib_id'] == l['id']).length}',
-                    style: const TextStyle(fontSize: 10, color: Colors.white38),
-                  ),
-                ]),
+              InkWell(
+                borderRadius: BorderRadius.circular(8),
+                onTap: () => onOpenLib(Map<String, dynamic>.from(l as Map)),
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(vertical: 8, horizontal: 2),
+                  child: Row(children: [
+                    Text('${l['icon'] ?? '📚'}',
+                        style: const TextStyle(fontSize: 13)),
+                    const SizedBox(width: 7),
+                    Expanded(
+                      child: Text('${l['name'] ?? ''}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style:
+                              const TextStyle(fontSize: 12, color: kFeedInk)),
+                    ),
+                    Text(
+                      '${items.where((e) => e['lib_id'] == l['id']).length}',
+                      style: const TextStyle(fontSize: 10, color: Colors.white38),
+                    ),
+                    const SizedBox(width: 2),
+                    const Icon(Icons.chevron_right,
+                        size: 14, color: Colors.white24),
+                  ]),
+                ),
               ),
             TextButton.icon(
               onPressed: onNewLib,
